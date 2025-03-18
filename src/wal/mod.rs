@@ -8,6 +8,7 @@ pub enum Operation {
     Delete,
 }
 
+#[allow(clippy::upper_case_acronyms)]
 pub struct WAL {
     path: PathBuf,
     file: File,

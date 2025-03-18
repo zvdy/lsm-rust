@@ -1,5 +1,4 @@
 use super::SSTable;
-use crate::{Key, Value};
 use std::collections::BTreeMap;
 use std::io;
 
@@ -37,13 +36,14 @@ impl CompactionManager {
 
     pub fn compact(&self, tables: &[SSTable]) -> io::Result<SSTable> {
         println!("Compacting {} tables", tables.len());
-        let mut merged_data: BTreeMap<Key, Value> = BTreeMap::new();
+        // Merge all SSTables into a single sorted map
+        let mut merged_data = BTreeMap::new();
 
-        // Merge all SSTables, newer entries override older ones
-        for table in tables.iter().rev() {
-            for (key, value) in table.read()? {
-                if !merged_data.contains_key(&key) {
-                    merged_data.insert(key, value);
+        // Read and merge data from all tables
+        for table in tables {
+            if let Ok(entries) = table.read() {
+                for (key, value) in entries {
+                    merged_data.entry(key).or_insert(value);
                 }
             }
         }
@@ -51,14 +51,13 @@ impl CompactionManager {
         println!("Merged {} unique keys", merged_data.len());
 
         // Create a new SSTable with merged data
-        let mut new_table = SSTable::new(tables[0].get_path().with_file_name(
-            format!("compact_{}.sst", 
+        let mut new_table = SSTable::new(tables[0].get_path().with_file_name(format!(
+            "compact_{}.sst",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs()
-        ),
-        ))?;
+        )))?;
 
         // Write merged data to new SSTable
         let entries: Vec<_> = merged_data.into_iter().collect();
