@@ -314,4 +314,196 @@ impl Storage {
         }
         Ok(())
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    use std::fs;
+    use std::thread;
+    use std::time::Duration;
+
+    fn create_test_storage() -> (TempDir, Storage) {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = Storage::new(temp_dir.path(), false).unwrap();
+        (temp_dir, storage)
+    }
+
+    #[test]
+    fn test_basic_operations() {
+        let (_temp_dir, mut storage) = create_test_storage();
+
+        // Test put and get
+        let key1 = b"key1".to_vec();
+        let value1 = b"value1".to_vec();
+        let value2 = b"value2".to_vec();
+        
+        storage.put(key1.clone(), value1.clone()).unwrap();
+        assert_eq!(
+            storage.get(&key1).unwrap(),
+            Some(value1)
+        );
+
+        // Test update
+        storage.put(key1.clone(), value2.clone()).unwrap();
+        assert_eq!(
+            storage.get(&key1).unwrap(),
+            Some(value2)
+        );
+
+        // Test delete
+        storage.delete(&key1).unwrap();
+        assert_eq!(storage.get(&key1).unwrap(), None);
+
+        // Test get non-existent key
+        let nonexistent = b"nonexistent".to_vec();
+        assert_eq!(storage.get(&nonexistent).unwrap(), None);
+    }
+
+    #[test]
+    fn test_memtable_flush() {
+        let (temp_dir, mut storage) = create_test_storage();
+        let data_dir = temp_dir.path();
+
+        // Write enough data to trigger a flush
+        let value = vec![b'x'; 1024]; // 1KB value
+        for i in 0..1000 {
+            let key = format!("key{}", i).into_bytes();
+            storage.put(key, value.clone()).unwrap();
+        }
+
+        // Give some time for async operations
+        thread::sleep(Duration::from_millis(100));
+
+        // Verify SSTable was created
+        let sstable_count = fs::read_dir(data_dir)
+            .unwrap()
+            .filter(|entry| {
+                entry.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_str()
+                    .unwrap()
+                    .ends_with(".sst")
+            })
+            .count();
+        assert!(sstable_count > 0);
+
+        // Verify data is still accessible
+        let test_key = b"key0".to_vec();
+        assert_eq!(storage.get(&test_key).unwrap(), Some(value));
+    }
+
+    #[test]
+    fn test_concurrent_operations() {
+        let (_temp_dir, mut storage) = create_test_storage();
+
+        // Perform rapid operations
+        for i in 0..100 {
+            let key = format!("key{}", i).into_bytes();
+            let value = format!("value{}", i).into_bytes();
+            
+            storage.put(key.clone(), value.clone()).unwrap();
+            assert_eq!(storage.get(&key).unwrap(), Some(value.clone()));
+            
+            if i % 2 == 0 {
+                storage.delete(&key).unwrap();
+            }
+        }
+
+        // Verify final state
+        for i in 0..100 {
+            let key = format!("key{}", i).into_bytes();
+            let value = format!("value{}", i).into_bytes();
+            
+            if i % 2 == 0 {
+                assert_eq!(storage.get(&key).unwrap(), None);
+            } else {
+                assert_eq!(storage.get(&key).unwrap(), Some(value));
+            }
+        }
+    }
+
+    #[test]
+    fn test_recovery() {
+        let (temp_dir, mut storage) = create_test_storage();
+        
+        // Write some data
+        let test_data = vec![
+            (b"key1".to_vec(), b"value1".to_vec()),
+            (b"key2".to_vec(), b"value2".to_vec()),
+            (b"key3".to_vec(), b"value3".to_vec()),
+        ];
+
+        for (key, value) in test_data.iter() {
+            storage.put(key.clone(), value.clone()).unwrap();
+        }
+
+        // Create new storage instance with same path
+        drop(storage);
+        let recovered_storage = Storage::new(temp_dir.path(), false).unwrap();
+
+        // Verify all data is accessible
+        for (key, value) in test_data.iter() {
+            assert_eq!(recovered_storage.get(key).unwrap(), Some(value.clone()));
+        }
+    }
+
+    #[test]
+    fn test_compaction() {
+        let (temp_dir, mut storage) = create_test_storage();
+        let data_dir = temp_dir.path();
+
+        // Write enough data to trigger multiple flushes and compaction
+        let value = vec![b'x'; 2048]; // 2KB value
+        for i in 0..2000 {
+            let key = format!("key{}", i).into_bytes();
+            storage.put(key, value.clone()).unwrap();
+        }
+
+        // Give time for compaction to occur
+        thread::sleep(Duration::from_millis(200));
+
+        // Count SSTable files
+        let sstable_files: Vec<_> = fs::read_dir(data_dir)
+            .unwrap()
+            .filter(|entry| {
+                entry.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_str()
+                    .unwrap()
+                    .ends_with(".sst")
+            })
+            .collect();
+
+        // Verify compaction occurred by checking file count and levels
+        let mut level_counts = vec![0; 4]; // Count files in levels 0-3
+        for entry in sstable_files {
+            let filename = entry.unwrap().file_name();
+            let name = filename.to_str().unwrap();
+            if let Some(level) = name.chars().find(|c| c.is_digit(10)) {
+                let level_num = level.to_digit(10).unwrap() as usize;
+                if level_num < level_counts.len() {
+                    level_counts[level_num] += 1;
+                }
+            }
+        }
+
+        // Verify data distribution across levels
+        assert!(level_counts[0] <= 4); // Level 0 should not have too many files
+        assert!(level_counts.iter().sum::<i32>() > 0); // Should have some files
+
+        // Verify all data is still accessible
+        let test_keys = vec![
+            format!("key0").into_bytes(),
+            format!("key500").into_bytes(),
+            format!("key1999").into_bytes(),
+        ];
+        
+        for key in &test_keys {
+            assert_eq!(storage.get(key).unwrap(), Some(value.clone()));
+        }
+    }
 } 
