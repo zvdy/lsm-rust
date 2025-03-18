@@ -1,0 +1,27 @@
+# Git
+.git
+.gitignore
+
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data files
+data/
+*.sst
+wal
+
+# Docker
+Dockerfile
+.dockerignore
+
+# Documentation
+README.md
+LICENSE 

@@ -1,0 +1,8 @@
+[package]
+name = "lsm-rust"
+version = "0.1.0"
+edition = "2021"
+authors = ["zvdy"]
+description = "A Log-Structured Merge Tree implementation in Rust"
+
+[dependencies]
