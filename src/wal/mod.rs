@@ -1,7 +1,7 @@
-use std::fs::{File, OpenOptions};
-use std::io::{self, Write, Read, Seek};
-use std::path::PathBuf;
 use crate::{Key, Value};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, Write};
+use std::path::PathBuf;
 
 pub enum Operation {
     Put,
@@ -47,7 +47,7 @@ impl WAL {
     pub fn replay(&mut self) -> io::Result<Vec<(Operation, Key, Option<Value>)>> {
         let mut entries = Vec::new();
         let mut buffer = Vec::new();
-        
+
         // Reset file pointer to start
         self.file.seek(io::SeekFrom::Start(0))?;
         self.file.read_to_end(&mut buffer)?;
@@ -58,7 +58,12 @@ impl WAL {
             let op = match buffer[pos] {
                 0 => Operation::Put,
                 1 => Operation::Delete,
-                _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid operation type")),
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Invalid operation type",
+                    ))
+                }
             };
             pos += 1;
 
@@ -70,7 +75,8 @@ impl WAL {
 
             // Read value if present
             let value = if matches!(op, Operation::Put) {
-                let value_size = u32::from_le_bytes(buffer[pos..pos + 4].try_into().unwrap()) as usize;
+                let value_size =
+                    u32::from_le_bytes(buffer[pos..pos + 4].try_into().unwrap()) as usize;
                 pos += 4;
                 let value = buffer[pos..pos + value_size].to_vec();
                 pos += value_size;
@@ -99,8 +105,8 @@ impl WAL {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     use std::fs;
+    use tempfile::TempDir;
 
     #[test]
     fn test_new_wal() {
@@ -122,7 +128,7 @@ mod tests {
 
         let entries = wal.replay().unwrap();
         assert_eq!(entries.len(), 1);
-        
+
         match &entries[0] {
             (Operation::Put, k, Some(v)) => {
                 assert_eq!(k, &key);
@@ -143,7 +149,7 @@ mod tests {
 
         let entries = wal.replay().unwrap();
         assert_eq!(entries.len(), 1);
-        
+
         match &entries[0] {
             (Operation::Delete, k, None) => {
                 assert_eq!(k, &key);
@@ -213,11 +219,12 @@ mod tests {
         let mut wal = WAL::new(path).unwrap();
 
         let large_value = vec![b'x'; 1024 * 1024]; // 1MB value
-        wal.append(Operation::Put, b"large_key", Some(&large_value)).unwrap();
+        wal.append(Operation::Put, b"large_key", Some(&large_value))
+            .unwrap();
 
         let entries = wal.replay().unwrap();
         assert_eq!(entries.len(), 1);
-        
+
         match &entries[0] {
             (Operation::Put, k, Some(v)) => {
                 assert_eq!(k, b"large_key");
@@ -226,4 +233,4 @@ mod tests {
             _ => panic!("Expected Put operation with large value"),
         }
     }
-} 
+}

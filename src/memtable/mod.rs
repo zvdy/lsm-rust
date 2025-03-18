@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
 use crate::{Key, Value};
+use std::collections::BTreeMap;
 
 pub struct MemTable {
     data: BTreeMap<Key, Value>,
@@ -22,7 +22,7 @@ impl MemTable {
         if let Some(old_value) = self.data.get(&key) {
             self.size = self.size.saturating_sub(key_len + old_value.len());
         }
-        
+
         self.size += key_len + value_len;
         self.data.insert(key, value)
     }
@@ -138,9 +138,7 @@ mod tests {
             table.insert(key.clone(), value.clone());
         }
 
-        let mut iter_entries: Vec<_> = table.iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        let mut iter_entries: Vec<_> = table.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         iter_entries.sort();
 
         let mut expected = entries.clone();
@@ -171,4 +169,4 @@ mod tests {
 
         assert_eq!(table.size(), expected_size);
     }
-} 
+}

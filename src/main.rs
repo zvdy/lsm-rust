@@ -1,6 +1,6 @@
+use std::env;
 use std::fs;
 use std::io;
-use std::env;
 
 mod memtable;
 mod sstable;

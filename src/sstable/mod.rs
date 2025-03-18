@@ -1,7 +1,7 @@
+use crate::{Key, Value};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
-use crate::{Key, Value};
 
 mod compaction;
 pub use compaction::CompactionManager;
@@ -18,11 +18,8 @@ impl SSTable {
         } else {
             0
         };
-        
-        Ok(SSTable {
-            path,
-            size,
-        })
+
+        Ok(SSTable { path, size })
     }
 
     pub fn write(&mut self, data: &[(Key, Value)]) -> io::Result<()> {
@@ -34,7 +31,7 @@ impl SSTable {
             // Write key size and key
             file.write_all(&(key.len() as u32).to_le_bytes())?;
             file.write_all(key)?;
-            
+
             // Write value size and value
             file.write_all(&(value.len() as u32).to_le_bytes())?;
             file.write_all(value)?;
@@ -51,7 +48,7 @@ impl SSTable {
         let mut data = Vec::new();
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
-        
+
         let mut pos = 0;
         while pos < buffer.len() {
             // Read key
@@ -110,7 +107,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("test.sst");
         let table = SSTable::new(path).unwrap();
-        
+
         assert_eq!(table.size(), 0);
     }
 
@@ -119,7 +116,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("test.sst");
         let mut table = SSTable::new(path).unwrap();
-        
+
         let test_data = create_test_data();
         table.write(&test_data).unwrap();
 
@@ -136,7 +133,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("test.sst");
         let mut table = SSTable::new(path.clone()).unwrap();
-        
+
         let test_data = create_test_data();
         table.write(&test_data).unwrap();
 
@@ -149,7 +146,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("empty.sst");
         let mut table = SSTable::new(path).unwrap();
-        
+
         table.write(&[]).unwrap();
         let read_data = table.read().unwrap();
         assert!(read_data.is_empty());
@@ -160,13 +157,13 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("large.sst");
         let mut table = SSTable::new(path).unwrap();
-        
+
         let large_value = vec![b'x'; 1024 * 1024]; // 1MB value
         let test_data = vec![(b"large_key".to_vec(), large_value.clone())];
-        
+
         table.write(&test_data).unwrap();
         let read_data = table.read().unwrap();
-        
+
         assert_eq!(read_data[0].1, large_value);
     }
 
@@ -176,7 +173,7 @@ mod tests {
         let path = temp_dir.path().join("test.sst");
         let path_clone = path.clone();
         let table = SSTable::new(path).unwrap();
-        
+
         assert_eq!(table.get_path(), &path_clone);
     }
 
@@ -185,13 +182,15 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("to_delete.sst");
         let path_clone = path.clone();
-        
+
         // Create and write some data to ensure the file exists
         let mut table = SSTable::new(path).unwrap();
-        table.write(&[(b"key".to_vec(), b"value".to_vec())]).unwrap();
-        
+        table
+            .write(&[(b"key".to_vec(), b"value".to_vec())])
+            .unwrap();
+
         assert!(path_clone.exists());
         table.delete().unwrap();
         assert!(!path_clone.exists());
     }
-} 
+}

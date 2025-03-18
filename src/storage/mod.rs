@@ -1,12 +1,12 @@
-use std::path::{Path, PathBuf};
-use std::io;
-use std::fs;
 use std::collections::HashMap;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::memtable::MemTable;
-use crate::sstable::{SSTable, CompactionManager};
-use crate::wal::{WAL, Operation};
+use crate::sstable::{CompactionManager, SSTable};
+use crate::wal::{Operation, WAL};
 use crate::{Key, Value};
 
 const MEMTABLE_SIZE_THRESHOLD: usize = 512 * 1024; // 512KB (smaller for more frequent flushes)
@@ -32,7 +32,7 @@ impl Storage {
             println!("Initializing storage at {:?}", data_dir.as_ref());
         }
         fs::create_dir_all(&data_dir)?;
-        
+
         let wal_path = data_dir.as_ref().join("wal");
         let mut wal = WAL::new(wal_path)?;
         let mut memtable = MemTable::new();
@@ -70,7 +70,9 @@ impl Storage {
                     // Parse level and sequence number from filename (L{level}_{seq}.sst)
                     if let Some(level_str) = filename.strip_prefix('L') {
                         if let Some((level, seq_str)) = level_str.split_once('_') {
-                            if let (Ok(level), Ok(seq)) = (level.parse::<usize>(), seq_str.parse::<u64>()) {
+                            if let (Ok(level), Ok(seq)) =
+                                (level.parse::<usize>(), seq_str.parse::<u64>())
+                            {
                                 counter = counter.max(seq + 1);
                                 sstables.entry(level).or_default().push(SSTable::new(path)?);
                                 total_sstables += 1;
@@ -82,21 +84,24 @@ impl Storage {
         }
 
         if verbose {
-            println!("Loaded {} SSTables across {} levels", 
+            println!(
+                "Loaded {} SSTables across {} levels",
                 total_sstables,
                 sstables.len()
             );
             for (level, tables) in &sstables {
                 let total_size: usize = tables.iter().map(|t| t.size()).sum();
-                println!("  Level {}: {} files, {} bytes total", 
-                    level, 
+                println!(
+                    "  Level {}: {} files, {} bytes total",
+                    level,
                     tables.len(),
                     total_size
                 );
             }
         }
 
-        let compaction_manager = CompactionManager::new(LEVEL_MULTIPLIER, COMPACTION_SIZE_THRESHOLD);
+        let compaction_manager =
+            CompactionManager::new(LEVEL_MULTIPLIER, COMPACTION_SIZE_THRESHOLD);
 
         Ok(Storage {
             memtable,
@@ -152,14 +157,18 @@ impl Storage {
     pub fn put(&mut self, key: Key, value: Value) -> io::Result<()> {
         if self.verbose {
             let count = PUT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-            let bytes = TOTAL_BYTES.fetch_add(key.len() + value.len(), Ordering::Relaxed) + key.len() + value.len();
-            
+            let bytes = TOTAL_BYTES.fetch_add(key.len() + value.len(), Ordering::Relaxed)
+                + key.len()
+                + value.len();
+
             if count % 1000 == 0 {
-                println!("\nProgress: {} operations ({:.2} MB written)", 
+                println!(
+                    "\nProgress: {} operations ({:.2} MB written)",
                     count,
                     bytes as f64 / 1_048_576.0
                 );
-                println!("Average value size: {:.2} KB", 
+                println!(
+                    "Average value size: {:.2} KB",
                     (bytes as f64 / count as f64) / 1024.0
                 );
             }
@@ -176,9 +185,11 @@ impl Storage {
         if memtable_size >= MEMTABLE_SIZE_THRESHOLD {
             if self.verbose {
                 println!("\n=== Memtable Flush ===");
-                println!("Size: {:.2} MB (threshold: {:.2} MB)",
+                println!(
+                    "Size: {:.2} MB (threshold: {:.2} MB)",
                     memtable_size as f64 / 1_048_576.0,
-                    MEMTABLE_SIZE_THRESHOLD as f64 / 1_048_576.0);
+                    MEMTABLE_SIZE_THRESHOLD as f64 / 1_048_576.0
+                );
             }
             self.flush_memtable()?;
         }
@@ -207,25 +218,33 @@ impl Storage {
 
         if self.verbose {
             println!("Entries: {}", self.memtable.len());
-            println!("Average entry size: {:.2} KB", 
-                (self.memtable.size() as f64 / self.memtable.len() as f64) / 1024.0);
+            println!(
+                "Average entry size: {:.2} KB",
+                (self.memtable.size() as f64 / self.memtable.len() as f64) / 1024.0
+            );
         }
 
         // Create new SSTable at level 0
-        let sstable_path = self.data_dir.join(format!("L0_{}.sst", self.sstable_counter));
+        let sstable_path = self
+            .data_dir
+            .join(format!("L0_{}.sst", self.sstable_counter));
         let mut sstable = SSTable::new(sstable_path)?;
-        
+
         // Write memtable data to SSTable
-        let entries: Vec<_> = self.memtable.iter()
+        let entries: Vec<_> = self
+            .memtable
+            .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        
+
         sstable.write(&entries)?;
-        
+
         if self.verbose {
-            println!("Created SSTable: L0_{}.sst ({:.2} MB)", 
+            println!(
+                "Created SSTable: L0_{}.sst ({:.2} MB)",
                 self.sstable_counter,
-                sstable.size() as f64 / 1_048_576.0);
+                sstable.size() as f64 / 1_048_576.0
+            );
         }
 
         // Add new SSTable to level 0
@@ -245,7 +264,7 @@ impl Storage {
     fn maybe_compact(&mut self, level: usize) -> io::Result<()> {
         if let Some(tables) = self.sstables.get(&level) {
             let total_size: usize = tables.iter().map(|t| t.size()).sum();
-            
+
             if self.verbose {
                 println!("\n=== Compaction Check: Level {} ===", level);
                 println!("Files: {}", tables.len());
@@ -261,36 +280,37 @@ impl Storage {
                         println!("  {}: {:.2} MB", idx, table.size() as f64 / 1_048_576.0);
                     }
                 }
-                
+
                 // Perform compaction
                 let compacted = self.compaction_manager.compact(tables)?;
-                
+
                 // Get paths of tables to delete
                 let table_paths: Vec<_> = tables.iter().map(|t| t.get_path().clone()).collect();
-                
+
                 // Move compacted SSTable to next level
                 let next_level = level + 1;
-                let new_path = self.data_dir.join(format!("L{}_{}.sst", 
-                    next_level, 
-                    self.sstable_counter
-                ));
-                
+                let new_path = self
+                    .data_dir
+                    .join(format!("L{}_{}.sst", next_level, self.sstable_counter));
+
                 let mut new_table = SSTable::new(new_path)?;
                 let entries = compacted.read()?;
-                
+
                 if self.verbose {
                     println!("\n=== Compaction Results ===");
                     println!("Unique entries: {}", entries.len());
                 }
 
                 new_table.write(&entries)?;
-                
+
                 let new_table_size = new_table.size();
                 if self.verbose {
-                    println!("New SSTable size: {:.2} MB", 
-                        new_table_size as f64 / 1_048_576.0);
+                    println!(
+                        "New SSTable size: {:.2} MB",
+                        new_table_size as f64 / 1_048_576.0
+                    );
                 }
-                
+
                 // Update sstables collection
                 self.sstables.get_mut(&level).unwrap().clear();
                 self.sstables.entry(next_level).or_default().push(new_table);
@@ -303,9 +323,14 @@ impl Storage {
 
                 if self.verbose {
                     let space_saved = total_size.saturating_sub(new_table_size);
-                    println!("Space reclaimed: {:.2} MB", space_saved as f64 / 1_048_576.0);
-                    println!("Compression ratio: {:.2}%", 
-                        (1.0 - (new_table_size as f64 / total_size as f64)) * 100.0);
+                    println!(
+                        "Space reclaimed: {:.2} MB",
+                        space_saved as f64 / 1_048_576.0
+                    );
+                    println!(
+                        "Compression ratio: {:.2}%",
+                        (1.0 - (new_table_size as f64 / total_size as f64)) * 100.0
+                    );
                 }
 
                 // Check if next level needs compaction
@@ -319,10 +344,10 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     use std::fs;
     use std::thread;
     use std::time::Duration;
+    use tempfile::TempDir;
 
     fn create_test_storage() -> (TempDir, Storage) {
         let temp_dir = TempDir::new().unwrap();
@@ -338,19 +363,13 @@ mod tests {
         let key1 = b"key1".to_vec();
         let value1 = b"value1".to_vec();
         let value2 = b"value2".to_vec();
-        
+
         storage.put(key1.clone(), value1.clone()).unwrap();
-        assert_eq!(
-            storage.get(&key1).unwrap(),
-            Some(value1)
-        );
+        assert_eq!(storage.get(&key1).unwrap(), Some(value1));
 
         // Test update
         storage.put(key1.clone(), value2.clone()).unwrap();
-        assert_eq!(
-            storage.get(&key1).unwrap(),
-            Some(value2)
-        );
+        assert_eq!(storage.get(&key1).unwrap(), Some(value2));
 
         // Test delete
         storage.delete(&key1).unwrap();
@@ -380,7 +399,8 @@ mod tests {
         let sstable_count = fs::read_dir(data_dir)
             .unwrap()
             .filter(|entry| {
-                entry.as_ref()
+                entry
+                    .as_ref()
                     .unwrap()
                     .file_name()
                     .to_str()
@@ -403,10 +423,10 @@ mod tests {
         for i in 0..100 {
             let key = format!("key{}", i).into_bytes();
             let value = format!("value{}", i).into_bytes();
-            
+
             storage.put(key.clone(), value.clone()).unwrap();
             assert_eq!(storage.get(&key).unwrap(), Some(value.clone()));
-            
+
             if i % 2 == 0 {
                 storage.delete(&key).unwrap();
             }
@@ -416,7 +436,7 @@ mod tests {
         for i in 0..100 {
             let key = format!("key{}", i).into_bytes();
             let value = format!("value{}", i).into_bytes();
-            
+
             if i % 2 == 0 {
                 assert_eq!(storage.get(&key).unwrap(), None);
             } else {
@@ -428,7 +448,7 @@ mod tests {
     #[test]
     fn test_recovery() {
         let (temp_dir, mut storage) = create_test_storage();
-        
+
         // Write some data
         let test_data = vec![
             (b"key1".to_vec(), b"value1".to_vec()),
@@ -469,7 +489,8 @@ mod tests {
         let sstable_files: Vec<_> = fs::read_dir(data_dir)
             .unwrap()
             .filter(|entry| {
-                entry.as_ref()
+                entry
+                    .as_ref()
                     .unwrap()
                     .file_name()
                     .to_str()
@@ -501,9 +522,9 @@ mod tests {
             format!("key500").into_bytes(),
             format!("key1999").into_bytes(),
         ];
-        
+
         for key in &test_keys {
             assert_eq!(storage.get(key).unwrap(), Some(value.clone()));
         }
     }
-} 
+}
