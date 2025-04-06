@@ -18,7 +18,7 @@ A minimal implementation of a Log-Structured Merge Tree (LSM Tree) with Sorted S
 ```
 ┌─────────┐     ┌─────────────┐     ┌──────────┐     ┌───────────┐
 │  Write  │────▶│ Write-Ahead │────▶│ MemTable │────▶│  SSTable  │
-│ Request │     │     Log     │     │(in-memory)│     │ (Level 0) │
+│ Request │     │     Log     │     │          │     │ (Level 0) │
 └─────────┘     └─────────────┘     └──────────┘     └───────────┘
                                          │                 │
                                          │                 ▼
