@@ -10,6 +10,107 @@ A minimal implementation of a Log-Structured Merge Tree (LSM Tree) with Sorted S
 - **Verbose Logging**: Detailed insights into operations with `-v` flag
 - **Memory-Efficient**: Automatic flushing of MemTable when size threshold is reached
 - **Data Integrity**: Verified through comprehensive testing
+- **Bloom Filters**: Faster lookups with probabilistic filtering
+
+## Architecture and Data Flow
+
+### Write Path
+```
+┌─────────┐     ┌─────────────┐     ┌──────────┐     ┌───────────┐
+│  Write  │────▶│ Write-Ahead │────▶│ MemTable │────▶│  SSTable  │
+│ Request │     │     Log     │     │          │     │ (Level 0) │
+└─────────┘     └─────────────┘     └──────────┘     └───────────┘
+                                         │                 │
+                                         │                 ▼
+                                         │           ┌───────────┐
+                                         │           │ Compaction│
+                                         │           │  Process  │
+                                         │           └───────────┘
+                                         │                 │
+                                         │                 ▼
+                                         │           ┌───────────┐
+                                         │           │  SSTable  │
+                                         │           │ (Level N) │
+                                         │           └───────────┘
+                                         ▼
+                                    ┌──────────┐
+                                    │   Flush  │
+                                    │(if size >│
+                                    │threshold)│
+                                    └──────────┘
+```
+
+1. Each write is first recorded in the Write-Ahead Log (WAL)
+2. Then the data is inserted into the in-memory MemTable
+3. When MemTable reaches the size threshold (512KB), it's flushed to disk as a Level 0 SSTable
+4. Periodically, compaction merges SSTables from one level to the next
+
+### Read Path
+```
+┌─────────┐     ┌──────────┐
+│  Read   │────▶│ MemTable │────┐
+│ Request │     │  Check   │    │
+└─────────┘     └──────────┘    │
+                     │          │
+                 Not Found      │ Found
+                     │          │
+                     ▼          │
+             ┌──────────────┐   │
+             │ Level 0      │   │
+             │ SSTables     │   │
+             │ (with Bloom  │   │
+             │  filters)    │   │
+             └──────────────┘   │
+                     │          │
+                 Not Found      │ Found
+                     │          │
+                     ▼          │
+             ┌──────────────┐   │
+             │ Level 1...N  │   │
+             │ SSTables     │   │
+             │ (with Bloom  │   │
+             │  filters)    │   │
+             └──────────────┘   │
+                     │          │
+                     ▼          ▼
+               ┌─────────┐    ┌─────────┐
+               │ Return  │    │ Return  │
+               │  Null   │    │  Value  │
+               └─────────┘    └─────────┘
+```
+
+1. First check the MemTable for the most recent data
+2. If not found, check Level 0 SSTables from newest to oldest
+3. Continue checking higher levels if needed
+4. Bloom filters quickly skip SSTables that definitely don't contain the key
+5. Return the value if found, or null if not present in any location
+
+### Compaction Process
+```
+┌────────────┐     ┌────────────┐     ┌────────────┐      
+│  SSTable   │     │  SSTable   │     │  SSTable   │      
+│  (Level N) │     │  (Level N) │     │  (Level N) │      
+└────────────┘     └────────────┘     └────────────┘      
+       │                 │                  │             
+       └─────────────────┼──────────────────┘             
+                         ▼                               
+                  ┌────────────┐                          
+                  │   Merge    │  ┌─ Deduplication        
+                  │   Process  │  ├─ Sort by key          
+                  └────────────┘  └─ Remove tombstones    
+                         │                                
+                         ▼                                
+                  ┌────────────┐                          
+                  │  SSTable   │                          
+                  │ (Level N+1)│                          
+                  └────────────┘                          
+```
+
+1. When a level reaches its threshold, compaction is triggered
+2. Multiple SSTables from the same level are merged
+3. During the merge, keys are deduplicated (keeping the newest values)
+4. The result is written to the next level
+5. This process continues as needed through multiple levels
 
 ## Performance Characteristics
 
@@ -20,7 +121,8 @@ A minimal implementation of a Log-Structured Merge Tree (LSM Tree) with Sorted S
   
 - **Read Performance**:
   - MemTable lookup: O(log n)
-  - SSTable lookup: O(n) per level
+  - SSTable lookup: O(1) Bloom filter check + O(n) if potentially present
+  - Bloom filters eliminate unnecessary disk I/O for non-existent keys
   - Reads check MemTable first, then traverse levels
 
 - **Compaction**:
@@ -41,6 +143,7 @@ The implementation has been tested with:
 - Large dataset operations (5000 entries)
 - Compaction triggers and level management
 - Data integrity verification
+- Bloom filter false positive tests
 
 Sample test output with verbose logging:
 ```
@@ -63,17 +166,45 @@ Sample test output with verbose logging:
 2. **SSTable (Sorted String Table)**
    - Immutable on-disk storage
    - Level-based organization
-   - Format: `[key_size][key][value_size][value]`
+   - Format: `[bloom_size][bloom_filter][key_size][key][value_size][value]...`
+   - Includes Bloom filter for efficient lookups
 
-3. **WAL (Write-Ahead Log)**
+3. **Bloom Filter**
+   - Probabilistic data structure for testing set membership
+   - Eliminates unnecessary disk reads for non-existent keys
+   - Configurable false positive rate (default: 1%)
+
+4. **WAL (Write-Ahead Log)**
    - Ensures durability
    - Records all write operations
    - Format: `[op_type][key_size][key][value_size?][value?]`
 
-4. **Storage**
+5. **Storage**
    - Main database interface
    - Manages MemTable, SSTables, and WAL
    - Handles compaction and level management
+
+## Project Structure
+
+```ascii
+lsm-rust/
+├── src/
+│   ├── main.rs           # Example usage and tests
+│   ├── memtable/        
+│   │   └── mod.rs       # In-memory storage
+│   ├── sstable/
+│   │   ├── mod.rs       # On-disk storage
+│   │   └── compaction.rs # Compaction logic
+│   ├── storage/
+│   │   └── mod.rs       # Main interface
+│   ├── bloom/
+│   │   └── mod.rs       # Bloom filter implementation
+│   └── wal/
+│       └── mod.rs       # Write-ahead log
+├── Cargo.toml
+├── Dockerfile
+└── README.md
+```
 
 ## Setup
 
@@ -131,30 +262,10 @@ fn main() -> io::Result<()> {
 }
 ```
 
-## Project Structure
-
-```ascii
-lsm-rust/
-├── src/
-│   ├── main.rs           # Example usage and tests
-│   ├── memtable/        
-│   │   └── mod.rs       # In-memory storage
-│   ├── sstable/
-│   │   ├── mod.rs       # On-disk storage
-│   │   └── compaction.rs # Compaction logic
-│   ├── storage/
-│   │   └── mod.rs       # Main interface
-│   └── wal/
-│       └── mod.rs       # Write-ahead log
-├── Cargo.toml
-├── Dockerfile
-└── README.md
-```
-
 ## Future Improvements
 
 - [X] SSTable compaction
-- [ ] Bloom filters for faster lookups
+- [X] Bloom filters for faster lookups
 - [ ] Index blocks in SSTables
 - [ ] Concurrent access support
 - [ ] Configuration options
@@ -165,4 +276,4 @@ lsm-rust/
 
 ## License
 
-MIT License 
+MIT License

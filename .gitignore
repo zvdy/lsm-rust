@@ -21,3 +21,8 @@ Cargo.lock
 .env
 *.swp
 *.swo
+
+# test files
+*.log
+cobertura.xml
+

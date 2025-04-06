@@ -134,15 +134,23 @@ impl Storage {
                     println!("  Searching level {} ({} files)", level, tables.len());
                 }
                 for (idx, sstable) in tables.iter().rev().enumerate() {
-                    if let Ok(entries) = sstable.read() {
-                        for (k, v) in entries {
-                            if k == *key {
-                                if self.verbose {
-                                    println!("  Found in SSTable {} at level {}", idx, level);
-                                }
-                                return Ok(Some(v));
-                            }
+                    // Use bloom filter to avoid unnecessary disk reads
+                    if !sstable.might_contain_key(key) {
+                        if self.verbose {
+                            println!(
+                                "  Skipped SSTable {} at level {} (Bloom filter negative)",
+                                idx, level
+                            );
                         }
+                        continue;
+                    }
+
+                    // Key might be in this SSTable, do a full check
+                    if let Ok(Some(value)) = sstable.get(key) {
+                        if self.verbose {
+                            println!("  Found in SSTable {} at level {}", idx, level);
+                        }
+                        return Ok(Some(value));
                     }
                 }
             }

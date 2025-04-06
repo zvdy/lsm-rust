@@ -1,14 +1,19 @@
+use crate::bloom::BloomFilter;
 use crate::{Key, Value};
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 mod compaction;
 pub use compaction::CompactionManager;
 
+const BLOOM_FALSE_POSITIVE_RATE: f64 = 0.01;
+const EXPECTED_ENTRIES_PER_SSTABLE: usize = 1000;
+
 pub struct SSTable {
     path: PathBuf,
     size: usize,
+    bloom_filter: Option<BloomFilter>,
 }
 
 impl SSTable {
@@ -19,12 +24,40 @@ impl SSTable {
             0
         };
 
-        Ok(SSTable { path, size })
+        let bloom_filter = if path.exists() {
+            // Try to load bloom filter from file
+            Self::read_bloom_filter(&path).ok()
+        } else {
+            None
+        };
+
+        Ok(SSTable {
+            path,
+            size,
+            bloom_filter,
+        })
     }
 
     pub fn write(&mut self, data: &[(Key, Value)]) -> io::Result<()> {
         let mut file = File::create(&self.path)?;
         let mut size = 0;
+
+        // Create a new bloom filter for this SSTable
+        let mut bloom = BloomFilter::new(
+            data.len().max(EXPECTED_ENTRIES_PER_SSTABLE),
+            BLOOM_FALSE_POSITIVE_RATE,
+        );
+
+        // Add all keys to the bloom filter
+        for (key, _) in data {
+            bloom.insert(key.as_slice());
+        }
+
+        // Write bloom filter to the start of the file
+        let bloom_bytes = bloom.to_bytes();
+        file.write_all(&(bloom_bytes.len() as u32).to_le_bytes())?;
+        file.write_all(&bloom_bytes)?;
+        size += bloom_bytes.len() + 4; // 4 bytes for size
 
         // Write format: [key_size][key][value_size][value]
         for (key, value) in data {
@@ -40,12 +73,36 @@ impl SSTable {
         }
 
         self.size = size;
+        self.bloom_filter = Some(bloom);
         Ok(())
+    }
+
+    fn read_bloom_filter(path: &PathBuf) -> io::Result<BloomFilter> {
+        let mut file = File::open(path)?;
+
+        // Read bloom filter size
+        let mut size_bytes = [0u8; 4];
+        file.read_exact(&mut size_bytes)?;
+        let bloom_size = u32::from_le_bytes(size_bytes) as usize;
+
+        // Read bloom filter data
+        let mut bloom_bytes = vec![0u8; bloom_size];
+        file.read_exact(&mut bloom_bytes)?;
+
+        BloomFilter::from_bytes(&bloom_bytes)
     }
 
     pub fn read(&self) -> io::Result<Vec<(Key, Value)>> {
         let mut file = File::open(&self.path)?;
         let mut data = Vec::new();
+
+        // Skip the bloom filter
+        let mut size_bytes = [0u8; 4];
+        file.read_exact(&mut size_bytes)?;
+        let bloom_size = u32::from_le_bytes(size_bytes) as usize;
+        file.seek(SeekFrom::Current(bloom_size as i64))?;
+
+        // Read the rest of the file
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
 
@@ -67,6 +124,61 @@ impl SSTable {
         }
 
         Ok(data)
+    }
+
+    pub fn might_contain_key(&self, key: &[u8]) -> bool {
+        if let Some(filter) = &self.bloom_filter {
+            filter.might_contain(key)
+        } else {
+            // If no bloom filter, conservatively return true
+            true
+        }
+    }
+
+    pub fn get(&self, key: &[u8]) -> io::Result<Option<Value>> {
+        // First check the bloom filter
+        if let Some(filter) = &self.bloom_filter {
+            if !filter.might_contain(key) {
+                // Definitely not in this SSTable
+                return Ok(None);
+            }
+        }
+
+        // Key might be present, search through file
+        let mut file = File::open(&self.path)?;
+
+        // Skip bloom filter
+        let mut size_bytes = [0u8; 4];
+        file.read_exact(&mut size_bytes)?;
+        let bloom_size = u32::from_le_bytes(size_bytes) as usize;
+        file.seek(SeekFrom::Current(bloom_size as i64))?;
+
+        let mut buffer = Vec::new();
+        file.read_to_end(&mut buffer)?;
+
+        let mut pos = 0;
+        while pos < buffer.len() {
+            // Read key
+            let key_size = u32::from_le_bytes(buffer[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            let current_key = &buffer[pos..pos + key_size];
+            pos += key_size;
+
+            // Read value size
+            let value_size = u32::from_le_bytes(buffer[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+
+            // Check if key matches
+            if current_key == key {
+                // Found the key, return the value
+                return Ok(Some(buffer[pos..pos + value_size].to_vec()));
+            }
+
+            // Skip this value
+            pos += value_size;
+        }
+
+        Ok(None)
     }
 
     pub fn size(&self) -> usize {
@@ -192,5 +304,30 @@ mod tests {
         assert!(path_clone.exists());
         table.delete().unwrap();
         assert!(!path_clone.exists());
+    }
+
+    #[test]
+    fn test_bloom_filter() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("bloom_test.sst");
+        let mut table = SSTable::new(path).unwrap();
+
+        let test_data = vec![
+            (b"key1".to_vec(), b"value1".to_vec()),
+            (b"key2".to_vec(), b"value2".to_vec()),
+            (b"key3".to_vec(), b"value3".to_vec()),
+        ];
+
+        table.write(&test_data).unwrap();
+
+        // Keys in the set should return true from might_contain_key
+        assert!(table.might_contain_key(b"key1"));
+        assert!(table.might_contain_key(b"key2"));
+        assert!(table.might_contain_key(b"key3"));
+
+        // Test actual get operations
+        assert_eq!(table.get(b"key1").unwrap(), Some(b"value1".to_vec()));
+        assert_eq!(table.get(b"key2").unwrap(), Some(b"value2".to_vec()));
+        assert_eq!(table.get(b"nonexistent").unwrap(), None);
     }
 }
