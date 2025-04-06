@@ -26,10 +26,7 @@ impl SSTable {
 
         let bloom_filter = if path.exists() {
             // Try to load bloom filter from file
-            match Self::read_bloom_filter(&path) {
-                Ok(filter) => Some(filter),
-                Err(_) => None,
-            }
+            Self::read_bloom_filter(&path).ok()
         } else {
             None
         };
