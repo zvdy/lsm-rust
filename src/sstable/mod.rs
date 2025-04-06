@@ -1,7 +1,7 @@
-use crate::{Key, Value};
 use crate::bloom::BloomFilter;
+use crate::{Key, Value};
 use std::fs::{self, File};
-use std::io::{self, Read, Write, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 mod compaction;
@@ -28,23 +28,27 @@ impl SSTable {
             // Try to load bloom filter from file
             match Self::read_bloom_filter(&path) {
                 Ok(filter) => Some(filter),
-                Err(_) => None
+                Err(_) => None,
             }
         } else {
             None
         };
 
-        Ok(SSTable { path, size, bloom_filter })
+        Ok(SSTable {
+            path,
+            size,
+            bloom_filter,
+        })
     }
 
     pub fn write(&mut self, data: &[(Key, Value)]) -> io::Result<()> {
         let mut file = File::create(&self.path)?;
         let mut size = 0;
-        
+
         // Create a new bloom filter for this SSTable
         let mut bloom = BloomFilter::new(
-            data.len().max(EXPECTED_ENTRIES_PER_SSTABLE), 
-            BLOOM_FALSE_POSITIVE_RATE
+            data.len().max(EXPECTED_ENTRIES_PER_SSTABLE),
+            BLOOM_FALSE_POSITIVE_RATE,
         );
 
         // Add all keys to the bloom filter
@@ -78,29 +82,29 @@ impl SSTable {
 
     fn read_bloom_filter(path: &PathBuf) -> io::Result<BloomFilter> {
         let mut file = File::open(path)?;
-        
+
         // Read bloom filter size
         let mut size_bytes = [0u8; 4];
         file.read_exact(&mut size_bytes)?;
         let bloom_size = u32::from_le_bytes(size_bytes) as usize;
-        
+
         // Read bloom filter data
         let mut bloom_bytes = vec![0u8; bloom_size];
         file.read_exact(&mut bloom_bytes)?;
-        
+
         BloomFilter::from_bytes(&bloom_bytes)
     }
 
     pub fn read(&self) -> io::Result<Vec<(Key, Value)>> {
         let mut file = File::open(&self.path)?;
         let mut data = Vec::new();
-        
+
         // Skip the bloom filter
         let mut size_bytes = [0u8; 4];
         file.read_exact(&mut size_bytes)?;
         let bloom_size = u32::from_le_bytes(size_bytes) as usize;
         file.seek(SeekFrom::Current(bloom_size as i64))?;
-        
+
         // Read the rest of the file
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
@@ -133,7 +137,7 @@ impl SSTable {
             true
         }
     }
-    
+
     pub fn get(&self, key: &[u8]) -> io::Result<Option<Value>> {
         // First check the bloom filter
         if let Some(filter) = &self.bloom_filter {
@@ -142,19 +146,19 @@ impl SSTable {
                 return Ok(None);
             }
         }
-        
+
         // Key might be present, search through file
         let mut file = File::open(&self.path)?;
-        
+
         // Skip bloom filter
         let mut size_bytes = [0u8; 4];
         file.read_exact(&mut size_bytes)?;
         let bloom_size = u32::from_le_bytes(size_bytes) as usize;
         file.seek(SeekFrom::Current(bloom_size as i64))?;
-        
+
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
-        
+
         let mut pos = 0;
         while pos < buffer.len() {
             // Read key
@@ -162,21 +166,21 @@ impl SSTable {
             pos += 4;
             let current_key = &buffer[pos..pos + key_size];
             pos += key_size;
-            
+
             // Read value size
             let value_size = u32::from_le_bytes(buffer[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
-            
+
             // Check if key matches
             if current_key == key {
                 // Found the key, return the value
                 return Ok(Some(buffer[pos..pos + value_size].to_vec()));
             }
-            
+
             // Skip this value
             pos += value_size;
         }
-        
+
         Ok(None)
     }
 
@@ -310,20 +314,20 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("bloom_test.sst");
         let mut table = SSTable::new(path).unwrap();
-        
+
         let test_data = vec![
             (b"key1".to_vec(), b"value1".to_vec()),
             (b"key2".to_vec(), b"value2".to_vec()),
             (b"key3".to_vec(), b"value3".to_vec()),
         ];
-        
+
         table.write(&test_data).unwrap();
-        
+
         // Keys in the set should return true from might_contain_key
         assert!(table.might_contain_key(b"key1"));
         assert!(table.might_contain_key(b"key2"));
         assert!(table.might_contain_key(b"key3"));
-        
+
         // Test actual get operations
         assert_eq!(table.get(b"key1").unwrap(), Some(b"value1".to_vec()));
         assert_eq!(table.get(b"key2").unwrap(), Some(b"value2".to_vec()));

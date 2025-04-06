@@ -1,6 +1,6 @@
-use std::io;
-use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::io;
 
 /// A simple Bloom filter implementation
 pub struct BloomFilter {
@@ -65,20 +65,20 @@ impl BloomFilter {
     /// Serialize the Bloom filter to a byte vector
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
-        
+
         // Write size and hash function count
         bytes.extend_from_slice(&(self.size as u32).to_le_bytes());
         bytes.extend_from_slice(&(self.num_hash_functions as u32).to_le_bytes());
-        
+
         // Convert bits to bytes
         let mut current_byte = 0u8;
         let mut bit_count = 0;
-        
+
         for &bit in &self.bits {
             if bit {
                 current_byte |= 1 << bit_count;
             }
-            
+
             bit_count += 1;
             if bit_count == 8 {
                 bytes.push(current_byte);
@@ -86,45 +86,49 @@ impl BloomFilter {
                 bit_count = 0;
             }
         }
-        
+
         // Push the last byte if there are remaining bits
         if bit_count > 0 {
             bytes.push(current_byte);
         }
-        
+
         bytes
     }
 
     /// Deserialize a Bloom filter from bytes
     pub fn from_bytes(bytes: &[u8]) -> io::Result<Self> {
         if bytes.len() < 8 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid Bloom filter data"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid Bloom filter data",
+            ));
         }
-        
+
         // Read size and hash function count
         let size = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-        let num_hash_functions = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
-        
+        let num_hash_functions =
+            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+
         // Read bit array
         let mut bits = vec![false; size];
         let mut byte_index = 8; // Start after the header
         let mut bit_index = 0;
-        
+
         while bit_index < size && byte_index < bytes.len() {
             let byte = bytes[byte_index];
-            
+
             for i in 0..8 {
                 if bit_index >= size {
                     break;
                 }
-                
+
                 bits[bit_index] = (byte & (1 << i)) != 0;
                 bit_index += 1;
             }
-            
+
             byte_index += 1;
         }
-        
+
         Ok(BloomFilter {
             bits,
             num_hash_functions,
@@ -140,40 +144,40 @@ mod tests {
     #[test]
     fn test_bloom_filter_basic() {
         let mut filter = BloomFilter::new(100, 0.01);
-        
+
         // Insert some elements
         filter.insert("apple");
         filter.insert("banana");
         filter.insert("cherry");
-        
+
         // Check containment
         assert!(filter.might_contain("apple"));
         assert!(filter.might_contain("banana"));
         assert!(filter.might_contain("cherry"));
-        
+
         // Check false negatives (should never happen)
         assert!(filter.might_contain("apple"));
-        
+
         // Check something not in the set (might get false positive)
         let _not_present = filter.might_contain("dragonfruit");
         // Note: We can't assert !not_present because of false positives
     }
-    
+
     #[test]
     fn test_bloom_filter_serialization() {
         let mut filter = BloomFilter::new(100, 0.01);
-        
+
         // Insert some elements
         filter.insert("apple");
         filter.insert("banana");
         filter.insert("cherry");
-        
+
         // Serialize
         let bytes = filter.to_bytes();
-        
+
         // Deserialize
         let restored_filter = BloomFilter::from_bytes(&bytes).unwrap();
-        
+
         // Verify the restored filter works correctly
         assert!(restored_filter.might_contain("apple"));
         assert!(restored_filter.might_contain("banana"));
