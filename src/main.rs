@@ -2,16 +2,7 @@ use std::env;
 use std::fs;
 use std::io;
 
-mod bloom;
-mod memtable;
-mod sstable;
-mod storage;
-mod wal;
-
-pub type Key = Vec<u8>;
-pub type Value = Vec<u8>;
-
-use storage::Storage;
+use lsm_rust::Storage;
 
 fn main() -> io::Result<()> {
     let verbose = env::args().any(|arg| arg == "-v" || arg == "--verbose");

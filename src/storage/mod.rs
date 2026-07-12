@@ -9,13 +9,45 @@ use crate::sstable::{CompactionManager, SSTable, SSTableLookup};
 use crate::wal::{Operation, WAL};
 use crate::{Key, Value};
 
-const MEMTABLE_SIZE_THRESHOLD: usize = 512 * 1024; // 512KB (smaller for more frequent flushes)
-const COMPACTION_SIZE_THRESHOLD: usize = 1024 * 1024; // 1MB
-const LEVEL_MULTIPLIER: u32 = 4; // More aggressive compaction
-
 static PUT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static TOTAL_BYTES: AtomicUsize = AtomicUsize::new(0);
 
+/// Tuning knobs for a [`Storage`] instance.
+///
+/// The defaults match the engine's historical behavior and are deliberately
+/// small so that flushes and compactions are easy to observe; production-like
+/// workloads will usually want larger thresholds.
+#[derive(Debug, Clone)]
+pub struct StorageConfig {
+    /// Flush the memtable to a level-0 SSTable once it holds this many bytes.
+    pub memtable_size_threshold: usize,
+    /// Base size threshold for level compaction; level N compacts when it
+    /// exceeds `compaction_size_threshold * level_multiplier^N` bytes.
+    pub compaction_size_threshold: usize,
+    /// Growth factor between consecutive level size thresholds.
+    pub level_multiplier: u32,
+    /// Compact level 0 once it holds this many SSTable files.
+    pub level0_file_limit: usize,
+    /// Print detailed progress information to stdout.
+    pub verbose: bool,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        StorageConfig {
+            memtable_size_threshold: 512 * 1024,    // 512KB
+            compaction_size_threshold: 1024 * 1024, // 1MB
+            level_multiplier: 4,
+            level0_file_limit: 4,
+            verbose: false,
+        }
+    }
+}
+
+/// The main LSM-tree key-value store.
+///
+/// See the [crate-level documentation](crate) for an overview of the write,
+/// read, and compaction paths.
 pub struct Storage {
     memtable: MemTable,
     wal: WAL,
@@ -23,11 +55,27 @@ pub struct Storage {
     data_dir: PathBuf,
     sstable_counter: u64,
     compaction_manager: CompactionManager,
-    verbose: bool,
+    config: StorageConfig,
 }
 
 impl Storage {
+    /// Open (or create) a store at `data_dir` with default tuning.
+    ///
+    /// Existing SSTables are loaded and any pending write-ahead-log entries
+    /// are replayed into the memtable.
     pub fn new<P: AsRef<Path>>(data_dir: P, verbose: bool) -> io::Result<Self> {
+        Self::with_config(
+            data_dir,
+            StorageConfig {
+                verbose,
+                ..StorageConfig::default()
+            },
+        )
+    }
+
+    /// Open (or create) a store at `data_dir` with explicit tuning options.
+    pub fn with_config<P: AsRef<Path>>(data_dir: P, config: StorageConfig) -> io::Result<Self> {
+        let verbose = config.verbose;
         if verbose {
             println!("Initializing storage at {:?}", data_dir.as_ref());
         }
@@ -110,8 +158,11 @@ impl Storage {
             }
         }
 
-        let compaction_manager =
-            CompactionManager::new(LEVEL_MULTIPLIER, COMPACTION_SIZE_THRESHOLD);
+        let compaction_manager = CompactionManager::new(
+            config.level_multiplier,
+            config.compaction_size_threshold,
+            config.level0_file_limit,
+        );
 
         Ok(Storage {
             memtable,
@@ -120,12 +171,14 @@ impl Storage {
             data_dir: data_dir.as_ref().to_path_buf(),
             sstable_counter: counter,
             compaction_manager,
-            verbose,
+            config,
         })
     }
 
+    /// Look up the current value for `key`, or `None` if the key does not
+    /// exist or has been deleted.
     pub fn get(&self, key: &Key) -> io::Result<Option<Value>> {
-        if self.verbose {
+        if self.config.verbose {
             println!("GET {:?}", String::from_utf8_lossy(key));
         }
 
@@ -133,13 +186,13 @@ impl Storage {
         // and must shadow any older value in the SSTables
         match self.memtable.get(key) {
             Some(Some(value)) => {
-                if self.verbose {
+                if self.config.verbose {
                     println!("  Found in memtable");
                 }
                 return Ok(Some(value.clone()));
             }
             Some(None) => {
-                if self.verbose {
+                if self.config.verbose {
                     println!("  Deleted (tombstone in memtable)");
                 }
                 return Ok(None);
@@ -150,13 +203,13 @@ impl Storage {
         // Then check SSTables from newest to oldest, level by level
         for level in 0..=self.sstables.keys().max().copied().unwrap_or(0) {
             if let Some(tables) = self.sstables.get(&level) {
-                if self.verbose {
+                if self.config.verbose {
                     println!("  Searching level {} ({} files)", level, tables.len());
                 }
                 for (idx, sstable) in tables.iter().rev().enumerate() {
                     // Use bloom filter to avoid unnecessary disk reads
                     if !sstable.might_contain_key(key) {
-                        if self.verbose {
+                        if self.config.verbose {
                             println!(
                                 "  Skipped SSTable {} at level {} (Bloom filter negative)",
                                 idx, level
@@ -168,13 +221,13 @@ impl Storage {
                     // Key might be in this SSTable, do a full check
                     match sstable.get(key)? {
                         SSTableLookup::Found(value) => {
-                            if self.verbose {
+                            if self.config.verbose {
                                 println!("  Found in SSTable {} at level {}", idx, level);
                             }
                             return Ok(Some(value));
                         }
                         SSTableLookup::Deleted => {
-                            if self.verbose {
+                            if self.config.verbose {
                                 println!(
                                     "  Deleted (tombstone in SSTable {} at level {})",
                                     idx, level
@@ -188,14 +241,16 @@ impl Storage {
             }
         }
 
-        if self.verbose {
+        if self.config.verbose {
             println!("  Key not found");
         }
         Ok(None)
     }
 
+    /// Insert or update `key` with `value`. The write is durable (recorded
+    /// in the write-ahead log) once this returns.
     pub fn put(&mut self, key: Key, value: Value) -> io::Result<()> {
-        if self.verbose {
+        if self.config.verbose {
             let count = PUT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
             let bytes = TOTAL_BYTES.fetch_add(key.len() + value.len(), Ordering::Relaxed)
                 + key.len()
@@ -223,8 +278,10 @@ impl Storage {
         self.maybe_flush_memtable()
     }
 
+    /// Delete `key`. The deletion is durable once this returns and shadows
+    /// any older value still stored in SSTables.
     pub fn delete(&mut self, key: &Key) -> io::Result<()> {
-        if self.verbose {
+        if self.config.verbose {
             println!("DELETE {:?}", String::from_utf8_lossy(key));
         }
 
@@ -241,13 +298,13 @@ impl Storage {
 
     fn maybe_flush_memtable(&mut self) -> io::Result<()> {
         let memtable_size = self.memtable.size();
-        if memtable_size >= MEMTABLE_SIZE_THRESHOLD {
-            if self.verbose {
+        if memtable_size >= self.config.memtable_size_threshold {
+            if self.config.verbose {
                 println!("\n=== Memtable Flush ===");
                 println!(
                     "Size: {:.2} MB (threshold: {:.2} MB)",
                     memtable_size as f64 / 1_048_576.0,
-                    MEMTABLE_SIZE_THRESHOLD as f64 / 1_048_576.0
+                    self.config.memtable_size_threshold as f64 / 1_048_576.0
                 );
             }
             self.flush_memtable()?;
@@ -260,7 +317,7 @@ impl Storage {
             return Ok(());
         }
 
-        if self.verbose {
+        if self.config.verbose {
             println!("Entries: {}", self.memtable.len());
             println!(
                 "Average entry size: {:.2} KB",
@@ -283,7 +340,7 @@ impl Storage {
 
         sstable.write(&entries)?;
 
-        if self.verbose {
+        if self.config.verbose {
             println!(
                 "Created SSTable: L0_{}.sst ({:.2} MB)",
                 self.sstable_counter,
@@ -312,7 +369,7 @@ impl Storage {
 
         let total_size: usize = tables.iter().map(|t| t.size()).sum();
 
-        if self.verbose {
+        if self.config.verbose {
             println!("\n=== Compaction Check: Level {} ===", level);
             println!("Files: {}", tables.len());
             println!("Total size: {:.2} MB", total_size as f64 / 1_048_576.0);
@@ -322,7 +379,7 @@ impl Storage {
             return Ok(());
         }
 
-        if self.verbose {
+        if self.config.verbose {
             println!("\n=== Starting Compaction ===");
             println!("Level: {} -> {}", level, level + 1);
             println!("Files to compact: {}", tables.len());
@@ -354,7 +411,7 @@ impl Storage {
 
         let mut new_table = SSTable::new(new_path)?;
 
-        if self.verbose {
+        if self.config.verbose {
             println!("\n=== Compaction Results ===");
             println!("Unique entries: {}", entries.len());
         }
@@ -362,7 +419,7 @@ impl Storage {
         new_table.write(&entries)?;
 
         let new_table_size = new_table.size();
-        if self.verbose {
+        if self.config.verbose {
             println!(
                 "New SSTable size: {:.2} MB",
                 new_table_size as f64 / 1_048_576.0
@@ -379,7 +436,7 @@ impl Storage {
             fs::remove_file(path)?;
         }
 
-        if self.verbose {
+        if self.config.verbose {
             let space_saved = total_size.saturating_sub(new_table_size);
             println!(
                 "Space reclaimed: {:.2} MB",
@@ -428,7 +485,8 @@ mod tests {
     /// Write enough filler data to force at least one memtable flush.
     fn force_flush(storage: &mut Storage, tag: &str) {
         let filler = vec![b'x'; 4096];
-        for i in 0..(MEMTABLE_SIZE_THRESHOLD / filler.len() + 2) {
+        let threshold = StorageConfig::default().memtable_size_threshold;
+        for i in 0..(threshold / filler.len() + 2) {
             let key = format!("filler_{}_{}", tag, i).into_bytes();
             storage.put(key, filler.clone()).unwrap();
         }
@@ -621,5 +679,23 @@ mod tests {
             let key = format!("key{}", i).into_bytes();
             assert_eq!(storage.get(&key).unwrap(), Some(value.clone()));
         }
+    }
+
+    #[test]
+    fn test_custom_config_flush_threshold() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = StorageConfig {
+            memtable_size_threshold: 1024, // tiny threshold: flush almost immediately
+            ..StorageConfig::default()
+        };
+        let mut storage = Storage::with_config(temp_dir.path(), config).unwrap();
+
+        // A single 2KB write exceeds the threshold and must trigger a flush
+        storage.put(b"key".to_vec(), vec![b'x'; 2048]).unwrap();
+        assert_eq!(count_sst_files(temp_dir.path()), 1);
+        assert_eq!(
+            storage.get(&b"key".to_vec()).unwrap(),
+            Some(vec![b'x'; 2048])
+        );
     }
 }
