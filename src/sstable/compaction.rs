@@ -3,23 +3,26 @@ use crate::{Key, Value};
 use std::collections::BTreeMap;
 use std::io;
 
+/// Decides when a level needs compaction and merges its SSTables.
 pub struct CompactionManager {
     level_multiplier: u32,
     size_threshold: usize,
+    level0_file_limit: usize,
 }
 
 impl CompactionManager {
-    pub fn new(level_multiplier: u32, size_threshold: usize) -> Self {
+    pub fn new(level_multiplier: u32, size_threshold: usize, level0_file_limit: usize) -> Self {
         CompactionManager {
             level_multiplier,
             size_threshold,
+            level0_file_limit,
         }
     }
 
     pub fn should_compact(&self, level: usize, tables: &[SSTable]) -> bool {
-        // Level 0 is special - compact when we have more than 4 files
+        // Level 0 is special - compact based on file count
         if level == 0 {
-            return tables.len() >= 4;
+            return tables.len() >= self.level0_file_limit;
         }
 
         // For other levels, use size-based threshold with multiplier
@@ -84,7 +87,7 @@ mod tests {
             &[(b"key".to_vec(), Some(b"new_value".to_vec()))],
         );
 
-        let manager = CompactionManager::new(4, 1024);
+        let manager = CompactionManager::new(4, 1024, 4);
         let merged = manager.compact(&[old, new], false).unwrap();
 
         assert_eq!(merged, vec![(b"key".to_vec(), Some(b"new_value".to_vec()))]);
@@ -100,7 +103,7 @@ mod tests {
         );
         let new = write_table(&temp_dir, "new.sst", &[(b"key".to_vec(), None)]);
 
-        let manager = CompactionManager::new(4, 1024);
+        let manager = CompactionManager::new(4, 1024, 4);
 
         // With older data possibly below, the tombstone must survive
         let merged = manager.compact(&[old, new], false).unwrap();
@@ -120,7 +123,7 @@ mod tests {
         );
         let new = write_table(&temp_dir, "new.sst", &[(b"deleted".to_vec(), None)]);
 
-        let manager = CompactionManager::new(4, 1024);
+        let manager = CompactionManager::new(4, 1024, 4);
         let merged = manager.compact(&[old, new], true).unwrap();
 
         assert_eq!(merged, vec![(b"kept".to_vec(), Some(b"value".to_vec()))]);

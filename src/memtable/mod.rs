@@ -10,6 +10,12 @@ pub struct MemTable {
     size: usize,
 }
 
+impl Default for MemTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MemTable {
     pub fn new() -> Self {
         MemTable {
