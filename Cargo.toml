@@ -7,5 +7,20 @@ description = "A Log-Structured Merge Tree implementation in Rust"
 
 [dependencies]
 
+# Disable the default libtest bench harness so `cargo bench -- <criterion args>`
+# only reaches the criterion benches
+[lib]
+bench = false
+
+[[bin]]
+name = "lsm-rust"
+path = "src/main.rs"
+bench = false
+
 [dev-dependencies]
+criterion = "0.5"
 tempfile = "3.8.1"
+
+[[bench]]
+name = "storage"
+harness = false
