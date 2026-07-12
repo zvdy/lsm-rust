@@ -274,6 +274,16 @@ fn main() -> io::Result<()> {
 - [ ] Recovery testing
 - [ ] Custom serialization formats
 
+## Community and Contributing
+
+Contributions of all kinds are welcome — bug reports, documentation, and
+code. Please read:
+
+- [CONTRIBUTING.md](CONTRIBUTING.md) — development setup and PR process
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) — community standards
+- [SECURITY.md](SECURITY.md) — how to report vulnerabilities privately
+- [GOVERNANCE.md](GOVERNANCE.md) and [MAINTAINERS.md](MAINTAINERS.md) — how the project is run
+
 ## License
 
 MIT License
