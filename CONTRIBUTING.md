@@ -1,0 +1,78 @@
+# Contributing to lsm-rust
+
+Thank you for your interest in contributing! This document explains how to
+propose changes and what we expect from contributions.
+
+## Ways to Contribute
+
+- Report bugs or request features through [GitHub issues](https://github.com/zvdy/lsm-rust/issues)
+- Improve documentation
+- Submit bug fixes or new features via pull requests
+- Review open pull requests
+
+## Development Setup
+
+You need a recent stable Rust toolchain (install via [rustup](https://rustup.rs/)).
+
+```bash
+git clone https://github.com/zvdy/lsm-rust.git
+cd lsm-rust
+cargo build
+cargo test
+```
+
+## Before Submitting a Pull Request
+
+All pull requests must pass CI, which enforces:
+
+```bash
+cargo fmt -- --check      # formatting
+cargo clippy -- -D warnings  # lints
+cargo test                # test suite
+```
+
+Please also:
+
+1. **Add tests** for any behavior change. Bug fixes should include a
+   regression test that fails without the fix.
+2. **Keep changes focused.** One logical change per pull request makes
+   review faster and history clearer.
+3. **Write clear commit messages.** Use a short imperative summary line
+   (optionally with a [Conventional Commits](https://www.conventionalcommits.org/)
+   prefix like `feat:`, `fix:`, or `docs:`), followed by a body explaining
+   *why* the change is needed.
+4. **Update documentation** (README, rustdoc) when behavior or public API
+   changes.
+
+## Pull Request Process
+
+1. Fork the repository and create a branch from `main`.
+2. Make your changes, following the guidelines above.
+3. Open a pull request against `main`, filling in the pull request template.
+4. A maintainer will review your PR. Address review feedback by pushing new
+   commits to your branch.
+5. Once approved and CI is green, a maintainer will merge it.
+
+## Reporting Bugs
+
+Use the bug report issue template. Include:
+
+- What you did (ideally a minimal reproduction)
+- What you expected to happen
+- What actually happened
+- Your platform and Rust version
+
+## Reporting Security Issues
+
+Please do **not** open public issues for security vulnerabilities. See
+[SECURITY.md](SECURITY.md) for the private reporting process.
+
+## Code of Conduct
+
+This project follows the [Contributor Covenant Code of Conduct](CODE_OF_CONDUCT.md).
+By participating, you agree to uphold it.
+
+## License
+
+By contributing, you agree that your contributions will be licensed under the
+[MIT License](LICENSE) that covers this project.
