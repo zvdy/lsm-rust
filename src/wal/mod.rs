@@ -42,9 +42,17 @@ impl WAL {
         }
 
         self.file.flush()?;
+        // fsync so the operation is durable even if the process or machine
+        // crashes right after append() returns
+        self.file.sync_data()?;
         Ok(())
     }
 
+    /// Replay all complete entries in the log.
+    ///
+    /// A crash can leave a partially written entry at the end of the file;
+    /// such a truncated tail is silently discarded rather than failing
+    /// recovery of all the preceding complete entries.
     pub fn replay(&mut self) -> io::Result<Vec<(Operation, Key, Option<Value>)>> {
         let mut entries = Vec::new();
         let mut buffer = Vec::new();
@@ -69,18 +77,15 @@ impl WAL {
             pos += 1;
 
             // Read key
-            let key_size = u32::from_le_bytes(buffer[pos..pos + 4].try_into().unwrap()) as usize;
-            pos += 4;
-            let key = buffer[pos..pos + key_size].to_vec();
-            pos += key_size;
+            let Some(key) = Self::read_chunk(&buffer, &mut pos) else {
+                break;
+            };
 
             // Read value if present
             let value = if matches!(op, Operation::Put) {
-                let value_size =
-                    u32::from_le_bytes(buffer[pos..pos + 4].try_into().unwrap()) as usize;
-                pos += 4;
-                let value = buffer[pos..pos + value_size].to_vec();
-                pos += value_size;
+                let Some(value) = Self::read_chunk(&buffer, &mut pos) else {
+                    break;
+                };
                 Some(value)
             } else {
                 None
@@ -92,6 +97,16 @@ impl WAL {
         Ok(entries)
     }
 
+    /// Read a length-prefixed chunk, returning None if the buffer ends
+    /// before the chunk is complete (a truncated tail).
+    fn read_chunk(buffer: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
+        let len_bytes = buffer.get(*pos..*pos + 4)?;
+        let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+        let chunk = buffer.get(*pos + 4..*pos + 4 + len)?.to_vec();
+        *pos += 4 + len;
+        Some(chunk)
+    }
+
     pub fn clear(&mut self) -> io::Result<()> {
         self.file = OpenOptions::new()
             .create(true)
@@ -99,6 +114,7 @@ impl WAL {
             .truncate(true)
             .read(true)
             .open(&self.path)?;
+        self.file.sync_data()?;
         Ok(())
     }
 }
@@ -174,8 +190,8 @@ mod tests {
 
         for (op, key, value) in &operations {
             match op {
-                Operation::Put => wal.append(Operation::Put, &key, value.as_deref()).unwrap(),
-                Operation::Delete => wal.append(Operation::Delete, &key, None).unwrap(),
+                Operation::Put => wal.append(Operation::Put, key, value.as_deref()).unwrap(),
+                Operation::Delete => wal.append(Operation::Delete, key, None).unwrap(),
             }
         }
 
@@ -184,13 +200,10 @@ mod tests {
         assert_eq!(entries.len(), operations.len());
 
         for (i, (op, key, value)) in operations.iter().enumerate() {
-            match (&entries[i].0, &entries[i].1, &entries[i].2) {
-                (replay_op, replay_key, replay_value) => {
-                    assert!(matches!(op, Operation::Put) == matches!(replay_op, Operation::Put));
-                    assert_eq!(replay_key, key);
-                    assert_eq!(replay_value, value);
-                }
-            }
+            let (replay_op, replay_key, replay_value) = &entries[i];
+            assert!(matches!(op, Operation::Put) == matches!(replay_op, Operation::Put));
+            assert_eq!(replay_key, key);
+            assert_eq!(replay_value, value);
         }
     }
 
@@ -232,6 +245,37 @@ mod tests {
                 assert_eq!(v, &large_value);
             }
             _ => panic!("Expected Put operation with large value"),
+        }
+    }
+
+    #[test]
+    fn test_replay_ignores_truncated_tail() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("test.wal");
+        let mut wal = WAL::new(path.clone()).unwrap();
+
+        wal.append(Operation::Put, b"key1", Some(b"value1"))
+            .unwrap();
+        wal.append(Operation::Put, b"key2", Some(b"value2"))
+            .unwrap();
+
+        // Simulate a crash mid-append: truncate the last few bytes
+        let len = fs::metadata(&path).unwrap().len();
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(len - 3).unwrap();
+        drop(file);
+
+        let mut wal = WAL::new(path).unwrap();
+        let entries = wal.replay().unwrap();
+
+        // Only the first, complete entry is recovered
+        assert_eq!(entries.len(), 1);
+        match &entries[0] {
+            (Operation::Put, k, Some(v)) => {
+                assert_eq!(k, b"key1");
+                assert_eq!(v, b"value1");
+            }
+            _ => panic!("Expected Put operation"),
         }
     }
 }
