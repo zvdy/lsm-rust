@@ -1,4 +1,5 @@
 use super::SSTable;
+use crate::{Key, Value};
 use std::collections::BTreeMap;
 use std::io;
 
@@ -16,54 +17,112 @@ impl CompactionManager {
     }
 
     pub fn should_compact(&self, level: usize, tables: &[SSTable]) -> bool {
-        // Get total size of all SSTables at this level
-        let level_size: usize = tables.iter().map(|t| t.size()).sum();
-
         // Level 0 is special - compact when we have more than 4 files
         if level == 0 {
             return tables.len() >= 4;
         }
 
         // For other levels, use size-based threshold with multiplier
+        let level_size: usize = tables.iter().map(|t| t.size()).sum();
         let level_threshold =
             self.size_threshold * (self.level_multiplier as usize).pow(level as u32);
-        println!(
-            "Level {} size: {} bytes, threshold: {} bytes",
-            level, level_size, level_threshold
-        );
         level_size >= level_threshold
     }
 
-    pub fn compact(&self, tables: &[SSTable]) -> io::Result<SSTable> {
-        println!("Compacting {} tables", tables.len());
-        // Merge all SSTables into a single sorted map
-        let mut merged_data = BTreeMap::new();
+    /// Merge the given SSTables into a single sorted entry list.
+    ///
+    /// `tables` must be ordered from oldest to newest (the order in which
+    /// they were created): when the same key appears in several tables, the
+    /// newest value wins.
+    ///
+    /// Tombstones are kept so that deletions keep shadowing older values,
+    /// unless `drop_tombstones` is set — which is only safe when no SSTable
+    /// below the compaction output level could still contain the key.
+    pub fn compact(
+        &self,
+        tables: &[SSTable],
+        drop_tombstones: bool,
+    ) -> io::Result<Vec<(Key, Option<Value>)>> {
+        let mut merged_data: BTreeMap<Key, Option<Value>> = BTreeMap::new();
 
-        // Read and merge data from all tables
+        // Later (newer) tables overwrite earlier (older) ones
         for table in tables {
-            if let Ok(entries) = table.read() {
-                for (key, value) in entries {
-                    merged_data.entry(key).or_insert(value);
-                }
+            for (key, value) in table.read()? {
+                merged_data.insert(key, value);
             }
         }
 
-        println!("Merged {} unique keys", merged_data.len());
+        Ok(merged_data
+            .into_iter()
+            .filter(|(_, value)| !(drop_tombstones && value.is_none()))
+            .collect())
+    }
+}
 
-        // Create a new SSTable with merged data
-        let mut new_table = SSTable::new(tables[0].get_path().with_file_name(format!(
-            "compact_{}.sst",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-        )))?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
 
-        // Write merged data to new SSTable
-        let entries: Vec<_> = merged_data.into_iter().collect();
-        new_table.write(&entries)?;
+    fn write_table(dir: &TempDir, name: &str, data: &[(Key, Option<Value>)]) -> SSTable {
+        let mut table = SSTable::new(dir.path().join(name)).unwrap();
+        table.write(data).unwrap();
+        table
+    }
 
-        println!("Created new SSTable of size {} bytes", new_table.size());
-        Ok(new_table)
+    #[test]
+    fn test_compact_newest_value_wins() {
+        let temp_dir = TempDir::new().unwrap();
+        let old = write_table(
+            &temp_dir,
+            "old.sst",
+            &[(b"key".to_vec(), Some(b"old_value".to_vec()))],
+        );
+        let new = write_table(
+            &temp_dir,
+            "new.sst",
+            &[(b"key".to_vec(), Some(b"new_value".to_vec()))],
+        );
+
+        let manager = CompactionManager::new(4, 1024);
+        let merged = manager.compact(&[old, new], false).unwrap();
+
+        assert_eq!(merged, vec![(b"key".to_vec(), Some(b"new_value".to_vec()))]);
+    }
+
+    #[test]
+    fn test_compact_keeps_tombstones() {
+        let temp_dir = TempDir::new().unwrap();
+        let old = write_table(
+            &temp_dir,
+            "old.sst",
+            &[(b"key".to_vec(), Some(b"value".to_vec()))],
+        );
+        let new = write_table(&temp_dir, "new.sst", &[(b"key".to_vec(), None)]);
+
+        let manager = CompactionManager::new(4, 1024);
+
+        // With older data possibly below, the tombstone must survive
+        let merged = manager.compact(&[old, new], false).unwrap();
+        assert_eq!(merged, vec![(b"key".to_vec(), None)]);
+    }
+
+    #[test]
+    fn test_compact_drops_tombstones_at_last_level() {
+        let temp_dir = TempDir::new().unwrap();
+        let old = write_table(
+            &temp_dir,
+            "old.sst",
+            &[
+                (b"deleted".to_vec(), Some(b"value".to_vec())),
+                (b"kept".to_vec(), Some(b"value".to_vec())),
+            ],
+        );
+        let new = write_table(&temp_dir, "new.sst", &[(b"deleted".to_vec(), None)]);
+
+        let manager = CompactionManager::new(4, 1024);
+        let merged = manager.compact(&[old, new], true).unwrap();
+
+        assert_eq!(merged, vec![(b"kept".to_vec(), Some(b"value".to_vec()))]);
     }
 }

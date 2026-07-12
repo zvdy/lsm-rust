@@ -1,8 +1,12 @@
 use crate::{Key, Value};
 use std::collections::BTreeMap;
 
+/// In-memory sorted table of key -> entry, where an entry of `None` is a
+/// tombstone recording that the key was deleted. Tombstones must be kept (and
+/// later flushed to SSTables) so that deletes shadow older values that may
+/// still live on disk.
 pub struct MemTable {
-    data: BTreeMap<Key, Value>,
+    data: BTreeMap<Key, Option<Value>>,
     size: usize,
 }
 
@@ -14,30 +18,35 @@ impl MemTable {
         }
     }
 
-    pub fn insert(&mut self, key: Key, value: Value) -> Option<Value> {
+    pub fn insert(&mut self, key: Key, value: Value) -> Option<Option<Value>> {
+        self.insert_entry(key, Some(value))
+    }
+
+    /// Record a deletion for `key` as a tombstone entry.
+    pub fn delete(&mut self, key: Key) -> Option<Option<Value>> {
+        self.insert_entry(key, None)
+    }
+
+    fn insert_entry(&mut self, key: Key, value: Option<Value>) -> Option<Option<Value>> {
         let key_len = key.len();
-        let value_len = value.len();
+        let value_len = value.as_ref().map_or(0, |v| v.len());
 
         // If key exists, subtract its size before adding new one
         if let Some(old_value) = self.data.get(&key) {
-            self.size = self.size.saturating_sub(key_len + old_value.len());
+            let old_len = old_value.as_ref().map_or(0, |v| v.len());
+            self.size = self.size.saturating_sub(key_len + old_len);
         }
 
         self.size += key_len + value_len;
         self.data.insert(key, value)
     }
 
-    pub fn get(&self, key: &[u8]) -> Option<&Value> {
+    /// Look up a key. Returns:
+    /// - `Some(Some(value))` if the key has a live value
+    /// - `Some(None)` if the key was deleted (tombstone)
+    /// - `None` if the memtable has no entry for the key
+    pub fn get(&self, key: &[u8]) -> Option<&Option<Value>> {
         self.data.get(key)
-    }
-
-    pub fn remove(&mut self, key: &[u8]) -> Option<Value> {
-        if let Some(value) = self.data.remove(key) {
-            self.size -= key.len() + value.len();
-            Some(value)
-        } else {
-            None
-        }
     }
 
     pub fn size(&self) -> usize {
@@ -52,7 +61,7 @@ impl MemTable {
         self.data.len()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&Key, &Value)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&Key, &Option<Value>)> {
         self.data.iter()
     }
 }
@@ -83,7 +92,7 @@ mod tests {
         assert_eq!(table.size(), key_len + value_len);
 
         // Test get
-        assert_eq!(table.get(&key), Some(&value));
+        assert_eq!(table.get(&key), Some(&Some(value)));
     }
 
     #[test]
@@ -96,33 +105,36 @@ mod tests {
         table.insert(key.clone(), value1.clone());
         let old_value = table.insert(key.clone(), value2.clone());
 
-        assert_eq!(old_value, Some(value1));
-        assert_eq!(table.get(&key), Some(&value2));
+        assert_eq!(old_value, Some(Some(value1)));
+        assert_eq!(table.get(&key), Some(&Some(value2.clone())));
         assert_eq!(table.len(), 1);
         assert_eq!(table.size(), key.len() + value2.len());
     }
 
     #[test]
-    fn test_remove() {
+    fn test_delete_leaves_tombstone() {
         let mut table = MemTable::new();
         let key = b"test_key".to_vec();
         let value = b"test_value".to_vec();
-        let total_size = key.len() + value.len();
 
         table.insert(key.clone(), value.clone());
-        assert_eq!(table.size(), total_size);
+        let old = table.delete(key.clone());
 
-        let removed = table.remove(&key);
-        assert_eq!(removed, Some(value));
-        assert!(table.is_empty());
-        assert_eq!(table.size(), 0);
-        assert_eq!(table.get(&key), None);
+        assert_eq!(old, Some(Some(value)));
+        // The tombstone is still an entry: get returns Some(None)
+        assert_eq!(table.get(&key), Some(&None));
+        assert_eq!(table.len(), 1);
+        // Only the key contributes to size after deletion
+        assert_eq!(table.size(), key.len());
     }
 
     #[test]
-    fn test_remove_nonexistent() {
+    fn test_delete_nonexistent_creates_tombstone() {
         let mut table = MemTable::new();
-        assert!(table.remove(b"nonexistent").is_none());
+        assert!(table.delete(b"nonexistent".to_vec()).is_none());
+        // Deleting an unknown key still records a tombstone, since the key
+        // may exist in an SSTable on disk.
+        assert_eq!(table.get(b"nonexistent"), Some(&None));
     }
 
     #[test]
@@ -138,13 +150,13 @@ mod tests {
             table.insert(key.clone(), value.clone());
         }
 
-        let mut iter_entries: Vec<_> = table.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        iter_entries.sort();
+        let iter_entries: Vec<_> = table
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone().unwrap()))
+            .collect();
 
-        let mut expected = entries.clone();
-        expected.sort();
-
-        assert_eq!(iter_entries, expected);
+        // BTreeMap iteration is already sorted by key
+        assert_eq!(iter_entries, entries);
     }
 
     #[test]
@@ -162,10 +174,10 @@ mod tests {
 
         assert_eq!(table.size(), expected_size);
 
-        // Remove some entries
+        // Deleting an entry replaces its value with a tombstone
         let key = b"key0".to_vec();
-        let removed_value = table.remove(&key).unwrap();
-        expected_size -= key.len() + removed_value.len();
+        let removed_value = table.delete(key.clone()).unwrap().unwrap();
+        expected_size -= removed_value.len();
 
         assert_eq!(table.size(), expected_size);
     }
