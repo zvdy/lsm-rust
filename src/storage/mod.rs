@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::memtable::MemTable;
-use crate::sstable::{CompactionManager, SSTable};
+use crate::sstable::{CompactionManager, SSTable, SSTableLookup};
 use crate::wal::{Operation, WAL};
 use crate::{Key, Value};
 
@@ -48,7 +48,7 @@ impl Storage {
                     }
                 }
                 Operation::Delete => {
-                    memtable.remove(&key);
+                    memtable.delete(key);
                     replay_count += 1;
                 }
             }
@@ -62,6 +62,7 @@ impl Storage {
         let mut counter = 0;
         let mut total_sstables = 0;
 
+        let mut found: Vec<(usize, u64, PathBuf)> = Vec::new();
         for entry in fs::read_dir(&data_dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -74,13 +75,22 @@ impl Storage {
                                 (level.parse::<usize>(), seq_str.parse::<u64>())
                             {
                                 counter = counter.max(seq + 1);
-                                sstables.entry(level).or_default().push(SSTable::new(path)?);
-                                total_sstables += 1;
+                                found.push((level, seq, path));
                             }
                         }
                     }
                 }
             }
+        }
+
+        // Within a level, tables must be ordered oldest to newest so that
+        // reads (which scan newest first) and compaction (where the newest
+        // value wins) see them consistently. Directory order is arbitrary,
+        // so sort by sequence number.
+        found.sort_by_key(|(level, seq, _)| (*level, *seq));
+        for (level, _, path) in found {
+            sstables.entry(level).or_default().push(SSTable::new(path)?);
+            total_sstables += 1;
         }
 
         if verbose {
@@ -119,12 +129,22 @@ impl Storage {
             println!("GET {:?}", String::from_utf8_lossy(key));
         }
 
-        // First check memtable
-        if let Some(value) = self.memtable.get(key) {
-            if self.verbose {
-                println!("  Found in memtable");
+        // First check memtable; a tombstone there means the key was deleted
+        // and must shadow any older value in the SSTables
+        match self.memtable.get(key) {
+            Some(Some(value)) => {
+                if self.verbose {
+                    println!("  Found in memtable");
+                }
+                return Ok(Some(value.clone()));
             }
-            return Ok(Some(value.clone()));
+            Some(None) => {
+                if self.verbose {
+                    println!("  Deleted (tombstone in memtable)");
+                }
+                return Ok(None);
+            }
+            None => {}
         }
 
         // Then check SSTables from newest to oldest, level by level
@@ -146,11 +166,23 @@ impl Storage {
                     }
 
                     // Key might be in this SSTable, do a full check
-                    if let Ok(Some(value)) = sstable.get(key) {
-                        if self.verbose {
-                            println!("  Found in SSTable {} at level {}", idx, level);
+                    match sstable.get(key)? {
+                        SSTableLookup::Found(value) => {
+                            if self.verbose {
+                                println!("  Found in SSTable {} at level {}", idx, level);
+                            }
+                            return Ok(Some(value));
                         }
-                        return Ok(Some(value));
+                        SSTableLookup::Deleted => {
+                            if self.verbose {
+                                println!(
+                                    "  Deleted (tombstone in SSTable {} at level {})",
+                                    idx, level
+                                );
+                            }
+                            return Ok(None);
+                        }
+                        SSTableLookup::NotFound => {}
                     }
                 }
             }
@@ -169,7 +201,7 @@ impl Storage {
                 + key.len()
                 + value.len();
 
-            if count % 1000 == 0 {
+            if count.is_multiple_of(1000) {
                 println!(
                     "\nProgress: {} operations ({:.2} MB written)",
                     count,
@@ -188,7 +220,26 @@ impl Storage {
         // Then update memtable
         self.memtable.insert(key, value);
 
-        // Check if we need to flush memtable to SSTable
+        self.maybe_flush_memtable()
+    }
+
+    pub fn delete(&mut self, key: &Key) -> io::Result<()> {
+        if self.verbose {
+            println!("DELETE {:?}", String::from_utf8_lossy(key));
+        }
+
+        // Write to WAL first
+        self.wal.append(Operation::Delete, key, None)?;
+
+        // Then record a tombstone in the memtable. The tombstone (not a plain
+        // removal) is what shadows older values still living in SSTables and
+        // is flushed to disk alongside regular entries.
+        self.memtable.delete(key.clone());
+
+        self.maybe_flush_memtable()
+    }
+
+    fn maybe_flush_memtable(&mut self) -> io::Result<()> {
         let memtable_size = self.memtable.size();
         if memtable_size >= MEMTABLE_SIZE_THRESHOLD {
             if self.verbose {
@@ -201,21 +252,6 @@ impl Storage {
             }
             self.flush_memtable()?;
         }
-
-        Ok(())
-    }
-
-    pub fn delete(&mut self, key: &Key) -> io::Result<()> {
-        if self.verbose {
-            println!("DELETE {:?}", String::from_utf8_lossy(key));
-        }
-
-        // Write to WAL first
-        self.wal.append(Operation::Delete, key, None)?;
-
-        // Then update memtable
-        self.memtable.remove(key);
-
         Ok(())
     }
 
@@ -238,7 +274,7 @@ impl Storage {
             .join(format!("L0_{}.sst", self.sstable_counter));
         let mut sstable = SSTable::new(sstable_path)?;
 
-        // Write memtable data to SSTable
+        // Write memtable data (including tombstones) to SSTable
         let entries: Vec<_> = self
             .memtable
             .iter()
@@ -270,81 +306,94 @@ impl Storage {
     }
 
     fn maybe_compact(&mut self, level: usize) -> io::Result<()> {
-        if let Some(tables) = self.sstables.get(&level) {
-            let total_size: usize = tables.iter().map(|t| t.size()).sum();
+        let Some(tables) = self.sstables.get(&level) else {
+            return Ok(());
+        };
 
-            if self.verbose {
-                println!("\n=== Compaction Check: Level {} ===", level);
-                println!("Files: {}", tables.len());
-                println!("Total size: {:.2} MB", total_size as f64 / 1_048_576.0);
-            }
+        let total_size: usize = tables.iter().map(|t| t.size()).sum();
 
-            if self.compaction_manager.should_compact(level, tables) {
-                if self.verbose {
-                    println!("\n=== Starting Compaction ===");
-                    println!("Level: {} -> {}", level, level + 1);
-                    println!("Files to compact: {}", tables.len());
-                    for (idx, table) in tables.iter().enumerate() {
-                        println!("  {}: {:.2} MB", idx, table.size() as f64 / 1_048_576.0);
-                    }
-                }
+        if self.verbose {
+            println!("\n=== Compaction Check: Level {} ===", level);
+            println!("Files: {}", tables.len());
+            println!("Total size: {:.2} MB", total_size as f64 / 1_048_576.0);
+        }
 
-                // Perform compaction
-                let compacted = self.compaction_manager.compact(tables)?;
+        if !self.compaction_manager.should_compact(level, tables) {
+            return Ok(());
+        }
 
-                // Get paths of tables to delete
-                let table_paths: Vec<_> = tables.iter().map(|t| t.get_path().clone()).collect();
-
-                // Move compacted SSTable to next level
-                let next_level = level + 1;
-                let new_path = self
-                    .data_dir
-                    .join(format!("L{}_{}.sst", next_level, self.sstable_counter));
-
-                let mut new_table = SSTable::new(new_path)?;
-                let entries = compacted.read()?;
-
-                if self.verbose {
-                    println!("\n=== Compaction Results ===");
-                    println!("Unique entries: {}", entries.len());
-                }
-
-                new_table.write(&entries)?;
-
-                let new_table_size = new_table.size();
-                if self.verbose {
-                    println!(
-                        "New SSTable size: {:.2} MB",
-                        new_table_size as f64 / 1_048_576.0
-                    );
-                }
-
-                // Update sstables collection
-                self.sstables.get_mut(&level).unwrap().clear();
-                self.sstables.entry(next_level).or_default().push(new_table);
-                self.sstable_counter += 1;
-
-                // Now delete the old files
-                for path in table_paths {
-                    fs::remove_file(path)?;
-                }
-
-                if self.verbose {
-                    let space_saved = total_size.saturating_sub(new_table_size);
-                    println!(
-                        "Space reclaimed: {:.2} MB",
-                        space_saved as f64 / 1_048_576.0
-                    );
-                    println!(
-                        "Compression ratio: {:.2}%",
-                        (1.0 - (new_table_size as f64 / total_size as f64)) * 100.0
-                    );
-                }
-
-                // Check if next level needs compaction
-                self.maybe_compact(next_level)?;
+        if self.verbose {
+            println!("\n=== Starting Compaction ===");
+            println!("Level: {} -> {}", level, level + 1);
+            println!("Files to compact: {}", tables.len());
+            for (idx, table) in tables.iter().enumerate() {
+                println!("  {}: {:.2} MB", idx, table.size() as f64 / 1_048_576.0);
             }
         }
+
+        let next_level = level + 1;
+
+        // Tombstones can only be dropped when no table at or below the
+        // output level could still hold an older value for the key;
+        // otherwise dropping the tombstone would resurrect that value.
+        let drop_tombstones = self
+            .sstables
+            .iter()
+            .all(|(l, tables)| *l <= level || tables.is_empty());
+
+        // Perform compaction (merge in memory, newest value wins)
+        let entries = self.compaction_manager.compact(tables, drop_tombstones)?;
+
+        // Get paths of tables to delete
+        let table_paths: Vec<_> = tables.iter().map(|t| t.get_path().clone()).collect();
+
+        // Write merged entries as a single SSTable at the next level
+        let new_path = self
+            .data_dir
+            .join(format!("L{}_{}.sst", next_level, self.sstable_counter));
+
+        let mut new_table = SSTable::new(new_path)?;
+
+        if self.verbose {
+            println!("\n=== Compaction Results ===");
+            println!("Unique entries: {}", entries.len());
+        }
+
+        new_table.write(&entries)?;
+
+        let new_table_size = new_table.size();
+        if self.verbose {
+            println!(
+                "New SSTable size: {:.2} MB",
+                new_table_size as f64 / 1_048_576.0
+            );
+        }
+
+        // Update sstables collection
+        self.sstables.get_mut(&level).unwrap().clear();
+        self.sstables.entry(next_level).or_default().push(new_table);
+        self.sstable_counter += 1;
+
+        // Now delete the old files
+        for path in table_paths {
+            fs::remove_file(path)?;
+        }
+
+        if self.verbose {
+            let space_saved = total_size.saturating_sub(new_table_size);
+            println!(
+                "Space reclaimed: {:.2} MB",
+                space_saved as f64 / 1_048_576.0
+            );
+            println!(
+                "Compression ratio: {:.2}%",
+                (1.0 - (new_table_size as f64 / total_size as f64)) * 100.0
+            );
+        }
+
+        // Check if next level needs compaction
+        self.maybe_compact(next_level)?;
+
         Ok(())
     }
 }
@@ -353,14 +402,36 @@ impl Storage {
 mod tests {
     use super::*;
     use std::fs;
-    use std::thread;
-    use std::time::Duration;
     use tempfile::TempDir;
 
     fn create_test_storage() -> (TempDir, Storage) {
         let temp_dir = TempDir::new().unwrap();
         let storage = Storage::new(temp_dir.path(), false).unwrap();
         (temp_dir, storage)
+    }
+
+    fn count_sst_files(dir: &Path) -> usize {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    == Some("sst")
+            })
+            .count()
+    }
+
+    /// Write enough filler data to force at least one memtable flush.
+    fn force_flush(storage: &mut Storage, tag: &str) {
+        let filler = vec![b'x'; 4096];
+        for i in 0..(MEMTABLE_SIZE_THRESHOLD / filler.len() + 2) {
+            let key = format!("filler_{}_{}", tag, i).into_bytes();
+            storage.put(key, filler.clone()).unwrap();
+        }
     }
 
     #[test]
@@ -400,23 +471,8 @@ mod tests {
             storage.put(key, value.clone()).unwrap();
         }
 
-        // Give some time for async operations
-        thread::sleep(Duration::from_millis(100));
-
         // Verify SSTable was created
-        let sstable_count = fs::read_dir(data_dir)
-            .unwrap()
-            .filter(|entry| {
-                entry
-                    .as_ref()
-                    .unwrap()
-                    .file_name()
-                    .to_str()
-                    .unwrap()
-                    .ends_with(".sst")
-            })
-            .count();
-        assert!(sstable_count > 0);
+        assert!(count_sst_files(data_dir) > 0);
 
         // Verify data is still accessible
         let test_key = b"key0".to_vec();
@@ -424,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_operations() {
+    fn test_interleaved_operations() {
         let (_temp_dir, mut storage) = create_test_storage();
 
         // Perform rapid operations
@@ -458,7 +514,7 @@ mod tests {
         let (temp_dir, mut storage) = create_test_storage();
 
         // Write some data
-        let test_data = vec![
+        let test_data = [
             (b"key1".to_vec(), b"value1".to_vec()),
             (b"key2".to_vec(), b"value2".to_vec()),
             (b"key3".to_vec(), b"value3".to_vec()),
@@ -479,6 +535,56 @@ mod tests {
     }
 
     #[test]
+    fn test_delete_persists_after_flush() {
+        let (_temp_dir, mut storage) = create_test_storage();
+
+        let key = b"victim".to_vec();
+        storage.put(key.clone(), b"value".to_vec()).unwrap();
+
+        // Force the key into an SSTable, then delete it
+        force_flush(&mut storage, "a");
+        storage.delete(&key).unwrap();
+        assert_eq!(storage.get(&key).unwrap(), None);
+
+        // Force the tombstone itself into an SSTable; the delete must still
+        // shadow the older on-disk value
+        force_flush(&mut storage, "b");
+        assert_eq!(storage.get(&key).unwrap(), None);
+    }
+
+    #[test]
+    fn test_delete_persists_after_restart() {
+        let (temp_dir, mut storage) = create_test_storage();
+
+        let key = b"victim".to_vec();
+        storage.put(key.clone(), b"value".to_vec()).unwrap();
+        force_flush(&mut storage, "a");
+        storage.delete(&key).unwrap();
+
+        drop(storage);
+        let recovered = Storage::new(temp_dir.path(), false).unwrap();
+        assert_eq!(recovered.get(&key).unwrap(), None);
+    }
+
+    #[test]
+    fn test_compaction_keeps_newest_value() {
+        let (_temp_dir, mut storage) = create_test_storage();
+
+        let key = b"contested".to_vec();
+
+        // Write the key, flush, overwrite it, and flush enough times to
+        // trigger a level-0 compaction (4 files)
+        for round in 0..5 {
+            let value = format!("value_round_{}", round).into_bytes();
+            storage.put(key.clone(), value).unwrap();
+            force_flush(&mut storage, &format!("round{}", round));
+        }
+
+        // After flushes and compaction, the newest value must win
+        assert_eq!(storage.get(&key).unwrap(), Some(b"value_round_4".to_vec()));
+    }
+
+    #[test]
     fn test_compaction() {
         let (temp_dir, mut storage) = create_test_storage();
         let data_dir = temp_dir.path();
@@ -490,29 +596,15 @@ mod tests {
             storage.put(key, value.clone()).unwrap();
         }
 
-        // Give time for compaction to occur
-        thread::sleep(Duration::from_millis(200));
-
-        // Count SSTable files
-        let sstable_files: Vec<_> = fs::read_dir(data_dir)
-            .unwrap()
-            .filter(|entry| {
-                entry
-                    .as_ref()
-                    .unwrap()
-                    .file_name()
-                    .to_str()
-                    .unwrap()
-                    .ends_with(".sst")
-            })
-            .collect();
-
-        // Verify compaction occurred by checking file count and levels
-        let mut level_counts = vec![0; 4]; // Count files in levels 0-3
-        for entry in sstable_files {
+        // Count SSTable files per level
+        let mut level_counts = [0; 4]; // Count files in levels 0-3
+        for entry in fs::read_dir(data_dir).unwrap() {
             let filename = entry.unwrap().file_name();
             let name = filename.to_str().unwrap();
-            if let Some(level) = name.chars().find(|c| c.is_digit(10)) {
+            if !name.ends_with(".sst") {
+                continue;
+            }
+            if let Some(level) = name.chars().find(|c| c.is_ascii_digit()) {
                 let level_num = level.to_digit(10).unwrap() as usize;
                 if level_num < level_counts.len() {
                     level_counts[level_num] += 1;
@@ -525,14 +617,9 @@ mod tests {
         assert!(level_counts.iter().sum::<i32>() > 0); // Should have some files
 
         // Verify all data is still accessible
-        let test_keys = vec![
-            format!("key0").into_bytes(),
-            format!("key500").into_bytes(),
-            format!("key1999").into_bytes(),
-        ];
-
-        for key in &test_keys {
-            assert_eq!(storage.get(key).unwrap(), Some(value.clone()));
+        for i in [0, 500, 1999] {
+            let key = format!("key{}", i).into_bytes();
+            assert_eq!(storage.get(&key).unwrap(), Some(value.clone()));
         }
     }
 }
