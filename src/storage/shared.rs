@@ -64,6 +64,19 @@ impl SharedStorage {
     pub fn delete(&self, key: &Key) -> io::Result<()> {
         self.inner.write().map_err(|_| poisoned())?.delete(key)
     }
+
+    /// Range scan (`start <= key < end`). Concurrent with other reads.
+    pub fn scan(&self, start: &[u8], end: &[u8]) -> io::Result<Vec<(Key, Value)>> {
+        self.inner.read().map_err(|_| poisoned())?.scan(start, end)
+    }
+
+    /// Prefix scan. Concurrent with other reads.
+    pub fn scan_prefix(&self, prefix: &[u8]) -> io::Result<Vec<(Key, Value)>> {
+        self.inner
+            .read()
+            .map_err(|_| poisoned())?
+            .scan_prefix(prefix)
+    }
 }
 
 impl Storage {
