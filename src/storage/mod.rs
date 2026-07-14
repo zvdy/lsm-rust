@@ -1,3 +1,6 @@
+mod shared;
+pub use shared::SharedStorage;
+
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -5,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::memtable::MemTable;
-use crate::sstable::{CompactionManager, SSTable, SSTableLookup};
+use crate::sstable::{CompactionManager, Compression, SSTable, SSTableLookup};
 use crate::wal::{Operation, WAL};
 use crate::{Key, Value};
 
@@ -28,6 +31,8 @@ pub struct StorageConfig {
     pub level_multiplier: u32,
     /// Compact level 0 once it holds this many SSTable files.
     pub level0_file_limit: usize,
+    /// Compression applied to SSTable data blocks.
+    pub compression: Compression,
     /// Print detailed progress information to stdout.
     pub verbose: bool,
 }
@@ -39,6 +44,7 @@ impl Default for StorageConfig {
             compaction_size_threshold: 1024 * 1024, // 1MB
             level_multiplier: 4,
             level0_file_limit: 4,
+            compression: Compression::None,
             verbose: false,
         }
     }
@@ -338,7 +344,7 @@ impl Storage {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
-        sstable.write(&entries)?;
+        sstable.write_with(&entries, self.config.compression)?;
 
         if self.config.verbose {
             println!(
@@ -416,7 +422,7 @@ impl Storage {
             println!("Unique entries: {}", entries.len());
         }
 
-        new_table.write(&entries)?;
+        new_table.write_with(&entries, self.config.compression)?;
 
         let new_table_size = new_table.size();
         if self.config.verbose {
@@ -697,5 +703,39 @@ mod tests {
             storage.get(&b"key".to_vec()).unwrap(),
             Some(vec![b'x'; 2048])
         );
+    }
+
+    #[test]
+    fn test_compressed_storage_roundtrip() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = StorageConfig {
+            memtable_size_threshold: 8 * 1024, // force several flushes
+            compression: Compression::Lz4,
+            ..StorageConfig::default()
+        };
+        let mut storage = Storage::with_config(temp_dir.path(), config.clone()).unwrap();
+
+        for i in 0..500 {
+            let key = format!("key{:04}", i).into_bytes();
+            let value = format!("value{}", i).repeat(20).into_bytes();
+            storage.put(key, value).unwrap();
+        }
+        storage.delete(&b"key0100".to_vec()).unwrap();
+
+        // Everything readable through compressed SSTables
+        assert_eq!(
+            storage.get(&b"key0000".to_vec()).unwrap(),
+            Some(b"value0".repeat(20).to_vec())
+        );
+        assert_eq!(storage.get(&b"key0100".to_vec()).unwrap(), None);
+
+        // And after a restart (compression flag read back from headers)
+        drop(storage);
+        let recovered = Storage::with_config(temp_dir.path(), config).unwrap();
+        assert_eq!(
+            recovered.get(&b"key0499".to_vec()).unwrap(),
+            Some(format!("value{}", 499).repeat(20).into_bytes())
+        );
+        assert_eq!(recovered.get(&b"key0100".to_vec()).unwrap(), None);
     }
 }

@@ -35,4 +35,5 @@ pub type Key = Vec<u8>;
 /// Values are arbitrary byte strings.
 pub type Value = Vec<u8>;
 
-pub use storage::{Storage, StorageConfig};
+pub use sstable::Compression;
+pub use storage::{SharedStorage, Storage, StorageConfig};
