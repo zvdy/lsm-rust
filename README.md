@@ -1,278 +1,245 @@
 # LSM Tree + SSTable Database in Rust
 
-A minimal implementation of a Log-Structured Merge Tree (LSM Tree) with Sorted String Tables (SSTable) in Rust. This implementation features automatic compaction, multi-level storage, and detailed logging capabilities.
+[![Rust CI](https://github.com/zvdy/lsm-rust/actions/workflows/rust.yml/badge.svg)](https://github.com/zvdy/lsm-rust/actions/workflows/rust.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+An educational, batteries-included implementation of a Log-Structured Merge
+Tree (LSM tree) storage engine in Rust — usable as a library or through the
+demo binary. It features a durable write-ahead log, tombstone-based deletes,
+multi-level compaction, Bloom filters, sparse index blocks, and optional LZ4
+block compression.
 
 ## Features
 
-- **Log-Structured Storage**: All writes are sequential, optimizing write performance
-- **Multi-Level Compaction**: Automatic compaction when level size thresholds are reached
-- **Write-Ahead Logging**: Ensures durability of operations
-- **Verbose Logging**: Detailed insights into operations with `-v` flag
-- **Memory-Efficient**: Automatic flushing of MemTable when size threshold is reached
-- **Data Integrity**: Verified through comprehensive testing
-- **Bloom Filters**: Faster lookups with probabilistic filtering
+- **Durable writes** — every operation is appended to a write-ahead log and
+  fsynced before it is acknowledged; torn tail entries are discarded on
+  recovery
+- **Tombstone deletes** — deletions persist across flushes, compaction, and
+  restarts, and shadow older values on disk
+- **Multi-level compaction** — newest-value-wins merging with deduplication;
+  tombstones are garbage-collected once no older data can be shadowed
+- **Bloom filters** — per-table probabilistic filters skip SSTables that
+  cannot contain a key
+- **Sparse index blocks** — point lookups binary-search a block index and
+  read a single block instead of scanning the file
+- **Optional LZ4 compression** — per-block compression keeps point reads
+  cheap while shrinking tables
+- **Concurrent access** — a cloneable `SharedStorage` handle with concurrent
+  reads and serialized writes
+- **Configurable** — flush/compaction thresholds, level growth, and
+  compression are tunable via `StorageConfig`
+- **Benchmarked and tested** — a criterion suite covers the hot paths, and a
+  dedicated crash-recovery test suite (including model-based random
+  workloads across restarts) guards correctness
 
-## Architecture and Data Flow
+## Architecture
 
-### Write Path
-```
-┌─────────┐     ┌─────────────┐     ┌──────────┐     ┌───────────┐
-│  Write  │────▶│ Write-Ahead │────▶│ MemTable │────▶│  SSTable  │
-│ Request │     │     Log     │     │          │     │ (Level 0) │
-└─────────┘     └─────────────┘     └──────────┘     └───────────┘
-                                         │                 │
-                                         │                 ▼
-                                         │           ┌───────────┐
-                                         │           │ Compaction│
-                                         │           │  Process  │
-                                         │           └───────────┘
-                                         │                 │
-                                         │                 ▼
-                                         │           ┌───────────┐
-                                         │           │  SSTable  │
-                                         │           │ (Level N) │
-                                         │           └───────────┘
-                                         ▼
-                                    ┌──────────┐
-                                    │   Flush  │
-                                    │(if size >│
-                                    │threshold)│
-                                    └──────────┘
-```
+### Write path
 
-1. Each write is first recorded in the Write-Ahead Log (WAL)
-2. Then the data is inserted into the in-memory MemTable
-3. When MemTable reaches the size threshold (512KB), it's flushed to disk as a Level 0 SSTable
-4. Periodically, compaction merges SSTables from one level to the next
-
-### Read Path
-```
-┌─────────┐     ┌──────────┐
-│  Read   │────▶│ MemTable │────┐
-│ Request │     │  Check   │    │
-└─────────┘     └──────────┘    │
-                     │          │
-                 Not Found      │ Found
-                     │          │
-                     ▼          │
-             ┌──────────────┐   │
-             │ Level 0      │   │
-             │ SSTables     │   │
-             │ (with Bloom  │   │
-             │  filters)    │   │
-             └──────────────┘   │
-                     │          │
-                 Not Found      │ Found
-                     │          │
-                     ▼          │
-             ┌──────────────┐   │
-             │ Level 1...N  │   │
-             │ SSTables     │   │
-             │ (with Bloom  │   │
-             │  filters)    │   │
-             └──────────────┘   │
-                     │          │
-                     ▼          ▼
-               ┌─────────┐    ┌─────────┐
-               │ Return  │    │ Return  │
-               │  Null   │    │  Value  │
-               └─────────┘    └─────────┘
+```mermaid
+flowchart LR
+    W([PUT / DELETE]) --> WAL["WAL<br/>append + fsync"]
+    WAL --> MT["MemTable<br/>(sorted, in memory)"]
+    MT -- "size ≥ threshold" --> FL["Flush"]
+    FL --> L0["Level 0 SSTable"]
+    L0 -- "≥ 4 files at L0" --> CP["Compaction"]
+    CP --> LN["Level N+1 SSTable"]
+    FL -. "clear WAL + MemTable" .-> WAL
 ```
 
-1. First check the MemTable for the most recent data
-2. If not found, check Level 0 SSTables from newest to oldest
-3. Continue checking higher levels if needed
-4. Bloom filters quickly skip SSTables that definitely don't contain the key
-5. Return the value if found, or null if not present in any location
+1. Each write is appended to the write-ahead log and fsynced, so it survives
+   a crash the moment the call returns.
+2. The entry (or a tombstone, for deletes) is inserted into the in-memory
+   MemTable.
+3. When the MemTable exceeds its size threshold, it is flushed to disk as an
+   immutable Level 0 SSTable, and the WAL is cleared.
+4. When a level fills up, compaction merges its tables into the next level.
 
-### Compaction Process
-```
-┌────────────┐     ┌────────────┐     ┌────────────┐      
-│  SSTable   │     │  SSTable   │     │  SSTable   │      
-│  (Level N) │     │  (Level N) │     │  (Level N) │      
-└────────────┘     └────────────┘     └────────────┘      
-       │                 │                  │             
-       └─────────────────┼──────────────────┘             
-                         ▼                               
-                  ┌────────────┐                          
-                  │   Merge    │  ┌─ Deduplication        
-                  │   Process  │  ├─ Sort by key          
-                  └────────────┘  └─ Remove tombstones    
-                         │                                
-                         ▼                                
-                  ┌────────────┐                          
-                  │  SSTable   │                          
-                  │ (Level N+1)│                          
-                  └────────────┘                          
+### Read path
+
+```mermaid
+flowchart TD
+    G([GET key]) --> MT{"MemTable<br/>entry?"}
+    MT -- "value" --> RV([Return value])
+    MT -- "tombstone" --> RN([Return None])
+    MT -- "absent" --> IT["Next SSTable<br/>newest → oldest, L0 → LN"]
+    IT --> BF{"Bloom filter:<br/>might contain?"}
+    BF -- "no" --> IT
+    BF -- "yes" --> IX["Binary-search sparse index,<br/>read + scan one block"]
+    IX -- "value" --> RV
+    IX -- "tombstone" --> RN
+    IX -- "absent" --> IT
+    IT -- "no tables left" --> RN
 ```
 
-1. When a level reaches its threshold, compaction is triggered
-2. Multiple SSTables from the same level are merged
-3. During the merge, keys are deduplicated (keeping the newest values)
-4. The result is written to the next level
-5. This process continues as needed through multiple levels
+The MemTable always has the freshest state, so it is consulted first; a
+tombstone found anywhere along the way ends the search immediately, which is
+what keeps deleted keys deleted even when older SSTables still hold values
+for them.
 
-## Performance Characteristics
+### Compaction
 
-- **Write Performance**:
-  - Sequential writes to MemTable: O(log n)
-  - MemTable flush threshold: 512KB
-  - Average write size: ~0.86KB per entry
-  
-- **Read Performance**:
-  - MemTable lookup: O(log n)
-  - SSTable lookup: O(1) Bloom filter check + O(n) if potentially present
-  - Bloom filters eliminate unnecessary disk I/O for non-existent keys
-  - Reads check MemTable first, then traverse levels
-
-- **Compaction**:
-  - Level 0 compaction trigger: 4 files or 2MB total size
-  - Size multiplier between levels: 4x
-  - Level N threshold: base_threshold * (multiplier^N)
-  - Compaction reduces space through deduplication
-  
-- **Space Efficiency**:
-  - Automatic garbage collection during compaction
-  - Deduplication of entries during compaction
-  - Multi-level storage for better space utilization
-
-## Test Results
-
-The implementation has been tested with:
-- Basic operations (PUT/GET/DELETE)
-- Large dataset operations (5000 entries)
-- Compaction triggers and level management
-- Data integrity verification
-- Bloom filter false positive tests
-
-Sample test output with verbose logging:
-```
-=== Test Statistics ===
-- Operations: 5000
-- Total Data Written: 4.22 MB
-- Average Value Size: 0.86 KB
-- Compaction Events: 3
-- Final SSTable Count: 2
-- Maximum Level Reached: 2
+```mermaid
+flowchart LR
+    subgraph LN["Level N"]
+        T1["SSTable (oldest)"]
+        T2["SSTable"]
+        T3["SSTable (newest)"]
+    end
+    T1 --> M
+    T2 --> M
+    T3 --> M
+    M["Merge:<br/>• newest value wins<br/>• deduplicate keys<br/>• drop tombstones at last level"]
+    M --> OUT["Level N+1 SSTable"]
 ```
 
-## Components
+Level 0 compacts once it holds 4 files; deeper levels compact on a size
+threshold that grows by a configurable multiplier per level. Tombstones are
+only dropped when no level at or below the output could still contain an
+older value for the key.
 
-1. **MemTable**
-   - In-memory sorted key-value store using BTreeMap
-   - Size-based flushing (512KB threshold)
-   - Fast read/write operations
+## On-disk formats
 
-2. **SSTable (Sorted String Table)**
-   - Immutable on-disk storage
-   - Level-based organization
-   - Format: `[bloom_size][bloom_filter][key_size][key][value_size][value]...`
-   - Includes Bloom filter for efficient lookups
+**SSTable (versioned, v2)** — files written by older versions (without the
+magic header) remain readable through a legacy fallback path:
 
-3. **Bloom Filter**
-   - Probabilistic data structure for testing set membership
-   - Eliminates unnecessary disk reads for non-existent keys
-   - Configurable false positive rate (default: 1%)
+```text
+┌───────┬─────────┬───────┬─────────────┬─────────────┬───────────────────┐
+│ magic │ version │ flags │ bloom       │ sparse      │ data blocks       │
+│ LSMT  │ u8 = 2  │ u8    │ len + bytes │ index       │ ≤16 entries each, │
+│       │         │       │             │ len + bytes │ LZ4 if flag set   │
+└───────┴─────────┴───────┴─────────────┴─────────────┴───────────────────┘
 
-4. **WAL (Write-Ahead Log)**
-   - Ensures durability
-   - Records all write operations
-   - Format: `[op_type][key_size][key][value_size?][value?]`
-
-5. **Storage**
-   - Main database interface
-   - Manages MemTable, SSTables, and WAL
-   - Handles compaction and level management
-
-## Project Structure
-
-```ascii
-lsm-rust/
-├── src/
-│   ├── main.rs           # Example usage and tests
-│   ├── memtable/        
-│   │   └── mod.rs       # In-memory storage
-│   ├── sstable/
-│   │   ├── mod.rs       # On-disk storage
-│   │   └── compaction.rs # Compaction logic
-│   ├── storage/
-│   │   └── mod.rs       # Main interface
-│   ├── bloom/
-│   │   └── mod.rs       # Bloom filter implementation
-│   └── wal/
-│       └── mod.rs       # Write-ahead log
-├── Cargo.toml
-├── Dockerfile
-└── README.md
+index entry:  [first_key_len u32][first_key][block_offset u64][block_len u32]
+data entry:   [key_len u32][key][value_len u32][value]
+tombstone:    [key_len u32][key][0xFFFFFFFF]
 ```
 
-## Setup
+**WAL** — `[op u8][key_len u32][key][value_len u32][value]` per entry, where
+`op` is 0 for put (with value) and 1 for delete (without). Replay tolerates a
+truncated final entry.
 
-### Local Setup
+## Usage
 
-1. Clone the repository:
-```bash
-git clone https://github.com/zvdy/lsm-rust.git
-cd lsm-rust
-```
-
-2. Build the project:
-```bash
-cargo build --release
-```
-
-3. Run with verbose logging:
-```bash
-cargo run --release -- -v
-```
-
-### Docker Setup
-
-1. Build the Docker image:
-```bash
-docker build -t lsm-rust .
-```
-
-2. Run the container:
-```bash
-docker run -it lsm-rust
-```
-
-## Usage Example
+### As a library
 
 ```rust
-use storage::Storage;
+use lsm_rust::{Compression, SharedStorage, Storage, StorageConfig};
 
-fn main() -> io::Result<()> {
-    // Create a new database instance with verbose logging
-    let mut db = Storage::new("./data", true)?;
+fn main() -> std::io::Result<()> {
+    // Simple: defaults + verbosity flag
+    let mut db = Storage::new("./data", false)?;
+    db.put(b"name".to_vec(), b"Jane Doe".to_vec())?;
+    assert_eq!(db.get(&b"name".to_vec())?, Some(b"Jane Doe".to_vec()));
+    db.delete(&b"name".to_vec())?;
 
-    // Insert data
-    db.put(b"name".to_vec(), b"John Doe".to_vec())?;
+    // Tuned: explicit configuration
+    let db = Storage::with_config(
+        "./data2",
+        StorageConfig {
+            memtable_size_threshold: 4 * 1024 * 1024, // 4 MB
+            compression: Compression::Lz4,
+            ..StorageConfig::default()
+        },
+    )?;
 
-    // Retrieve data
-    if let Ok(Some(name)) = db.get(b"name") {
-        println!("name: {}", String::from_utf8_lossy(&name));
-    }
-
-    // Delete data
-    db.delete(b"name")?;
+    // Concurrent: cloneable handle, safe to share across threads
+    let shared = db.into_shared();
+    let handle = shared.clone();
+    std::thread::spawn(move || handle.get(&b"key".to_vec())).join().unwrap()?;
+    let _ = SharedStorage::new("./data3", false)?; // or construct directly
 
     Ok(())
 }
 ```
 
-## Future Improvements
+### Demo binary
 
-- [X] SSTable compaction
-- [X] Bloom filters for faster lookups
-- [ ] Index blocks in SSTables
-- [ ] Concurrent access support
-- [ ] Configuration options
-- [ ] Benchmarking suite
-- [ ] Compression support
-- [ ] Recovery testing
-- [ ] Custom serialization formats
+```bash
+cargo run --release        # scripted demo: basic ops + compaction run
+cargo run --release -- -v  # with verbose engine logging
+```
+
+### Docker
+
+```bash
+docker build -t lsm-rust .
+docker run -it lsm-rust
+```
+
+## Configuration
+
+| `StorageConfig` field | Default | Meaning |
+| --- | --- | --- |
+| `memtable_size_threshold` | 512 KB | Flush the MemTable to a Level 0 SSTable at this size |
+| `compaction_size_threshold` | 1 MB | Base size threshold for level compaction |
+| `level_multiplier` | 4 | Growth factor of the threshold per level (`base * multiplier^N`) |
+| `level0_file_limit` | 4 | Compact Level 0 at this many files |
+| `compression` | `None` | `Compression::Lz4` enables per-block LZ4 |
+| `verbose` | `false` | Engine progress logging to stdout |
+
+## Performance
+
+Indicative numbers from the criterion suite on a Linux container (release
+build, 128-byte values; run `cargo bench` for your own hardware):
+
+| Operation | Time | Notes |
+| --- | --- | --- |
+| `put` / `delete` | ~0.9 ms | Dominated by the per-write WAL fsync |
+| `get` (MemTable hit) | ~210 ns | Pure in-memory BTreeMap lookup |
+| `get` (SSTable hit) | ~4 µs | Index binary search + one block read |
+| `get` (missing key) | ~400 ns | Bloom filters avoid disk almost always |
+
+Criterion writes HTML reports to `target/criterion/` and compares against
+previous runs, so regressions in the hot paths show up in review.
+
+## Testing
+
+```bash
+cargo test              # unit + integration + doc tests
+cargo test --test recovery  # crash-recovery suite only
+cargo bench             # criterion benchmarks
+```
+
+The recovery suite exercises restarts with multi-level data, torn WAL tails,
+delete persistence at every lifecycle stage, compressed stores, and a
+deterministic model-based random workload verified across restarts.
+
+## Project structure
+
+```text
+lsm-rust/
+├── src/
+│   ├── lib.rs            # Crate root: public API and docs
+│   ├── main.rs           # Demo binary
+│   ├── storage/
+│   │   ├── mod.rs        # Engine: WAL + MemTable + levels + compaction
+│   │   └── shared.rs     # SharedStorage: thread-safe handle
+│   ├── memtable/mod.rs   # Sorted in-memory table with tombstones
+│   ├── sstable/
+│   │   ├── mod.rs        # Versioned on-disk tables: bloom, index, blocks
+│   │   └── compaction.rs # Level merge policy and merging
+│   ├── bloom/mod.rs      # Bloom filter
+│   └── wal/mod.rs        # Write-ahead log
+├── benches/storage.rs    # Criterion benchmarks
+└── tests/recovery.rs     # Crash-recovery integration tests
+```
+
+## Roadmap
+
+- [x] SSTable compaction
+- [x] Bloom filters for faster lookups
+- [x] Index blocks in SSTables
+- [x] Concurrent access support
+- [x] Configuration options
+- [x] Benchmarking suite
+- [x] Compression support (LZ4)
+- [x] Recovery testing
+- [x] Versioned on-disk format
+- [ ] Range scans / iterators
+- [ ] Background (off-thread) compaction
+- [ ] WAL group commit / batched fsync
+- [ ] Block cache for hot reads
 
 ## Community and Contributing
 
