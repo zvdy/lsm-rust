@@ -1,5 +1,6 @@
 use crate::{Key, Value};
 use std::collections::BTreeMap;
+use std::ops::Bound;
 
 /// In-memory sorted table of key -> entry, where an entry of `None` is a
 /// tombstone recording that the key was deleted. Tombstones must be kept (and
@@ -69,6 +70,18 @@ impl MemTable {
 
     pub fn iter(&self) -> impl Iterator<Item = (&Key, &Option<Value>)> {
         self.data.iter()
+    }
+
+    /// Iterate entries with `start <= key < end` in key order.
+    /// `end = None` means unbounded above.
+    pub fn range<'a>(
+        &'a self,
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> impl Iterator<Item = (&'a Key, &'a Option<Value>)> {
+        let lower = Bound::Included(start);
+        let upper = end.map_or(Bound::Unbounded, Bound::Excluded);
+        self.data.range::<[u8], _>((lower, upper))
     }
 }
 
@@ -186,5 +199,23 @@ mod tests {
         expected_size -= removed_value.len();
 
         assert_eq!(table.size(), expected_size);
+    }
+
+    #[test]
+    fn test_range() {
+        let mut table = MemTable::new();
+        for k in ["a", "b", "c", "d"] {
+            table.insert(k.as_bytes().to_vec(), b"v".to_vec());
+        }
+        table.delete(b"c".to_vec());
+
+        let keys: Vec<_> = table
+            .range(b"b", Some(b"d"))
+            .map(|(k, _)| k.clone())
+            .collect();
+        assert_eq!(keys, vec![b"b".to_vec(), b"c".to_vec()]); // tombstone included
+
+        let keys: Vec<_> = table.range(b"c", None).map(|(k, _)| k.clone()).collect();
+        assert_eq!(keys, vec![b"c".to_vec(), b"d".to_vec()]);
     }
 }

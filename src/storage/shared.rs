@@ -2,7 +2,10 @@ use super::{Storage, StorageConfig};
 use crate::{Key, Value};
 use std::io;
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock, Weak};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 /// A cloneable, thread-safe handle to a [`Storage`] instance.
 ///
@@ -63,6 +66,102 @@ impl SharedStorage {
     /// Delete `key`, durable once this returns.
     pub fn delete(&self, key: &Key) -> io::Result<()> {
         self.inner.write().map_err(|_| poisoned())?.delete(key)
+    }
+
+    /// Range scan (`start <= key < end`). Concurrent with other reads.
+    pub fn scan(&self, start: &[u8], end: &[u8]) -> io::Result<Vec<(Key, Value)>> {
+        self.inner.read().map_err(|_| poisoned())?.scan(start, end)
+    }
+
+    /// Prefix scan. Concurrent with other reads.
+    pub fn scan_prefix(&self, prefix: &[u8]) -> io::Result<Vec<(Key, Value)>> {
+        self.inner
+            .read()
+            .map_err(|_| poisoned())?
+            .scan_prefix(prefix)
+    }
+
+    /// Run any pending compactions now, under the write lock.
+    pub fn compact_now(&self) -> io::Result<()> {
+        self.inner.write().map_err(|_| poisoned())?.compact_now()
+    }
+
+    /// Spawn a background thread that runs pending compactions every
+    /// `interval`, taking compaction off the write path (pair with
+    /// `StorageConfig::inline_compaction = false`).
+    ///
+    /// The thread stops when the returned handle is dropped, or when every
+    /// `SharedStorage` clone has been dropped (it holds only a weak
+    /// reference and never keeps the store alive).
+    pub fn spawn_compactor(&self, interval: Duration) -> CompactorHandle {
+        let weak = Arc::downgrade(&self.inner);
+        let stop = Arc::new(AtomicBool::new(false));
+        let errors = Arc::new(AtomicUsize::new(0));
+
+        let thread_stop = Arc::clone(&stop);
+        let thread_errors = Arc::clone(&errors);
+        let thread =
+            thread::spawn(move || compactor_loop(weak, interval, &thread_stop, &thread_errors));
+
+        CompactorHandle {
+            stop,
+            errors,
+            thread: Some(thread),
+        }
+    }
+}
+
+fn compactor_loop(
+    storage: Weak<RwLock<Storage>>,
+    interval: Duration,
+    stop: &AtomicBool,
+    errors: &AtomicUsize,
+) {
+    while !stop.load(Ordering::Relaxed) {
+        // Sleep in short slices so dropping the handle joins promptly
+        let mut slept = Duration::ZERO;
+        while slept < interval && !stop.load(Ordering::Relaxed) {
+            let step = (interval - slept).min(Duration::from_millis(20));
+            thread::sleep(step);
+            slept += step;
+        }
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+
+        // The store has been dropped: nothing left to compact
+        let Some(inner) = storage.upgrade() else {
+            return;
+        };
+        let Ok(mut storage) = inner.write() else {
+            return; // poisoned by a panicked writer
+        };
+        if storage.compact_now().is_err() {
+            errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Guard for a background compaction thread; dropping it stops the thread.
+pub struct CompactorHandle {
+    stop: Arc<AtomicBool>,
+    errors: Arc<AtomicUsize>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl CompactorHandle {
+    /// Number of background compaction runs that returned an error.
+    pub fn error_count(&self) -> usize {
+        self.errors.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for CompactorHandle {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -196,5 +295,53 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
+    }
+
+    #[test]
+    fn test_background_compactor_drains_level0() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = StorageConfig {
+            memtable_size_threshold: 8 * 1024,
+            inline_compaction: false,
+            ..StorageConfig::default()
+        };
+        let db = SharedStorage::with_config(temp_dir.path(), config).unwrap();
+        let compactor = db.spawn_compactor(Duration::from_millis(30));
+
+        for i in 0..800 {
+            db.put(format!("key{:04}", i).into_bytes(), vec![b'v'; 64])
+                .unwrap();
+        }
+
+        // Wait for the background thread to bring level 0 under its limit
+        let l0_count = |dir: &Path| {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("L0_")
+                })
+                .count()
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while l0_count(temp_dir.path()) >= 4 && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            l0_count(temp_dir.path()) < 4,
+            "background compactor never drained level 0"
+        );
+        assert_eq!(compactor.error_count(), 0);
+
+        // Data intact while/after compaction ran concurrently
+        for i in [0usize, 400, 799] {
+            let key = format!("key{:04}", i).into_bytes();
+            assert_eq!(db.get(&key).unwrap(), Some(vec![b'v'; 64]));
+        }
+
+        drop(compactor); // stops and joins the thread
     }
 }

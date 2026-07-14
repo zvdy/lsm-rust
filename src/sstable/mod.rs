@@ -3,8 +3,11 @@ use crate::{Key, Value};
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+mod cache;
 mod compaction;
+pub use cache::BlockCache;
 pub use compaction::CompactionManager;
 
 const BLOOM_FALSE_POSITIVE_RATE: f64 = 0.01;
@@ -74,6 +77,7 @@ pub struct SSTable {
     size: usize,
     bloom_filter: Option<BloomFilter>,
     layout: Layout,
+    cache: Option<Arc<BlockCache>>,
 }
 
 fn invalid_data(msg: &str) -> io::Error {
@@ -143,12 +147,19 @@ fn encode_entries(data: &[(Key, Option<Value>)], out: &mut Vec<u8>) {
 
 impl SSTable {
     pub fn new(path: PathBuf) -> io::Result<Self> {
+        Self::with_cache(path, None)
+    }
+
+    /// Open an SSTable that serves block reads through the given shared
+    /// block cache.
+    pub fn with_cache(path: PathBuf, cache: Option<Arc<BlockCache>>) -> io::Result<Self> {
         if !path.exists() {
             return Ok(SSTable {
                 path,
                 size: 0,
                 bloom_filter: None,
                 layout: Layout::Empty,
+                cache,
             });
         }
 
@@ -159,6 +170,7 @@ impl SSTable {
                 size: 0,
                 bloom_filter: None,
                 layout: Layout::Empty,
+                cache,
             });
         }
 
@@ -168,6 +180,7 @@ impl SSTable {
             size,
             bloom_filter,
             layout,
+            cache,
         })
     }
 
@@ -308,6 +321,11 @@ impl SSTable {
         let bloom_bytes = bloom.to_bytes();
         let index_bytes = Self::serialize_index(&index);
 
+        if let Some(cache) = &self.cache {
+            // The file is being (re)written: drop any cached blocks for it
+            cache.purge_file(&self.path);
+        }
+
         let flags = match compression {
             Compression::None => 0,
             Compression::Lz4 => FLAG_LZ4,
@@ -334,18 +352,30 @@ impl SSTable {
     }
 
     /// Read one data block, decompressing it if the table is compressed.
+    /// Served from the shared block cache when one is configured.
     fn read_block(
         &self,
         data_start: u64,
         entry: &IndexEntry,
         compression: Compression,
-    ) -> io::Result<Vec<u8>> {
-        let raw = self.read_range(data_start + entry.offset, entry.len as usize)?;
-        match compression {
-            Compression::None => Ok(raw),
-            Compression::Lz4 => lz4_flex::decompress_size_prepended(&raw)
-                .map_err(|e| invalid_data(&format!("failed to decompress block: {}", e))),
+    ) -> io::Result<Arc<Vec<u8>>> {
+        if let Some(cache) = &self.cache {
+            if let Some(block) = cache.get(&self.path, entry.offset) {
+                return Ok(block);
+            }
         }
+
+        let raw = self.read_range(data_start + entry.offset, entry.len as usize)?;
+        let block = Arc::new(match compression {
+            Compression::None => raw,
+            Compression::Lz4 => lz4_flex::decompress_size_prepended(&raw)
+                .map_err(|e| invalid_data(&format!("failed to decompress block: {}", e)))?,
+        });
+
+        if let Some(cache) = &self.cache {
+            cache.insert(&self.path, entry.offset, Arc::clone(&block));
+        }
+        Ok(block)
     }
 
     /// Read `len` bytes at `offset` from the start of the file.
@@ -385,6 +415,51 @@ impl SSTable {
                     data.extend(parse_entries(&block)?);
                 }
                 Ok(data)
+            }
+        }
+    }
+
+    /// Return all entries (including tombstones) with `start <= key < end`
+    /// in key order. `end = None` means unbounded above. On the versioned
+    /// format only the blocks that can intersect the range are read.
+    pub fn scan_range(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> io::Result<Vec<(Key, Option<Value>)>> {
+        let in_range = |k: &[u8]| k >= start && end.is_none_or(|e| k < e);
+        match &self.layout {
+            Layout::Empty => Ok(Vec::new()),
+            Layout::Legacy { data_start } => {
+                let buffer = self.read_to_end_from(*data_start)?;
+                Ok(parse_entries(&buffer)?
+                    .into_iter()
+                    .filter(|(k, _)| in_range(k))
+                    .collect())
+            }
+            Layout::V2 {
+                data_start,
+                index,
+                compression,
+            } => {
+                // Blocks before the candidate hold only keys < start; blocks
+                // whose first key is >= end hold only keys past the range.
+                let first = index
+                    .partition_point(|e| e.first_key.as_slice() <= start)
+                    .saturating_sub(1);
+                let mut out = Vec::new();
+                for entry in &index[first..] {
+                    if end.is_some_and(|e| entry.first_key.as_slice() >= e) {
+                        break;
+                    }
+                    let block = self.read_block(*data_start, entry, *compression)?;
+                    for (k, v) in parse_entries(&block)? {
+                        if in_range(&k) {
+                            out.push((k, v));
+                        }
+                    }
+                }
+                Ok(out)
             }
         }
     }
@@ -823,5 +898,84 @@ mod tests {
             packed.size(),
             plain.size()
         );
+    }
+
+    #[test]
+    fn test_scan_range_multi_block() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("scan.sst");
+        let mut table = SSTable::new(path).unwrap();
+
+        // 100 entries spanning several blocks; one tombstone inside the range
+        let data: Vec<_> = (0..100)
+            .map(|i| {
+                (
+                    format!("key{:04}", i).into_bytes(),
+                    if i == 42 {
+                        None
+                    } else {
+                        Some(format!("value{}", i).into_bytes())
+                    },
+                )
+            })
+            .collect();
+        table.write(&data).unwrap();
+
+        // Mid-range scan crossing block boundaries
+        let hits = table.scan_range(b"key0040", Some(b"key0045")).unwrap();
+        let keys: Vec<_> = hits.iter().map(|(k, _)| k.clone()).collect();
+        assert_eq!(
+            keys,
+            (40..45)
+                .map(|i| format!("key{:04}", i).into_bytes())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(hits[2].1, None); // the tombstone is reported
+
+        // Unbounded above
+        let tail = table.scan_range(b"key0098", None).unwrap();
+        assert_eq!(tail.len(), 2);
+
+        // Before the first key and after the last key
+        assert_eq!(table.scan_range(b"a", Some(b"key0000")).unwrap().len(), 0);
+        assert_eq!(table.scan_range(b"z", None).unwrap().len(), 0);
+
+        // Whole-table scan matches read()
+        assert_eq!(table.scan_range(b"", None).unwrap(), data);
+    }
+
+    #[test]
+    fn test_block_cache_serves_repeated_reads() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache = Arc::new(BlockCache::new(1024 * 1024));
+        let path = temp_dir.path().join("cached.sst");
+        let mut table = SSTable::with_cache(path, Some(Arc::clone(&cache))).unwrap();
+
+        let data: Vec<_> = (0..50)
+            .map(|i| {
+                (
+                    format!("key{:03}", i).into_bytes(),
+                    Some(format!("value{}", i).into_bytes()),
+                )
+            })
+            .collect();
+        table.write_with(&data, Compression::Lz4).unwrap();
+
+        // First read misses and fills the cache; repeats hit
+        assert_eq!(
+            table.get(b"key010").unwrap(),
+            SSTableLookup::Found(b"value10".to_vec())
+        );
+        let (_, misses_after_first) = cache.stats();
+        for _ in 0..5 {
+            assert_eq!(
+                table.get(b"key010").unwrap(),
+                SSTableLookup::Found(b"value10".to_vec())
+            );
+        }
+        let (hits, misses) = cache.stats();
+        assert_eq!(misses, misses_after_first, "repeat reads must not miss");
+        assert!(hits >= 5);
+        assert!(cache.used_bytes() > 0);
     }
 }

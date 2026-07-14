@@ -1,16 +1,32 @@
 mod shared;
-pub use shared::SharedStorage;
+pub use shared::{CompactorHandle, SharedStorage};
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use crate::memtable::MemTable;
-use crate::sstable::{CompactionManager, Compression, SSTable, SSTableLookup};
-use crate::wal::{Operation, WAL};
+use crate::sstable::{BlockCache, CompactionManager, Compression, SSTable, SSTableLookup};
+use crate::wal::{Operation, WalSync, WAL};
 use crate::{Key, Value};
+
+/// Smallest byte string strictly greater than every string with this
+/// prefix, or `None` if no such bound exists (prefix is empty or all 0xFF).
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    while let Some(&last) = end.last() {
+        if last == 0xFF {
+            end.pop();
+        } else {
+            *end.last_mut().unwrap() = last + 1;
+            return Some(end);
+        }
+    }
+    None
+}
 
 static PUT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static TOTAL_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -33,6 +49,16 @@ pub struct StorageConfig {
     pub level0_file_limit: usize,
     /// Compression applied to SSTable data blocks.
     pub compression: Compression,
+    /// When the write-ahead log fsyncs (per write, or batched group commit).
+    pub wal_sync: WalSync,
+    /// Capacity in bytes of the shared block cache for SSTable reads
+    /// (0 disables caching).
+    pub block_cache_size: usize,
+    /// Run compaction inline on the write path when a flush fills a level
+    /// (default). Disable to drive compaction yourself via
+    /// [`Storage::compact_now`] or a background
+    /// [`SharedStorage::spawn_compactor`] thread.
+    pub inline_compaction: bool,
     /// Print detailed progress information to stdout.
     pub verbose: bool,
 }
@@ -45,6 +71,9 @@ impl Default for StorageConfig {
             level_multiplier: 4,
             level0_file_limit: 4,
             compression: Compression::None,
+            wal_sync: WalSync::Always,
+            block_cache_size: 4 * 1024 * 1024, // 4MB
+            inline_compaction: true,
             verbose: false,
         }
     }
@@ -61,6 +90,7 @@ pub struct Storage {
     data_dir: PathBuf,
     sstable_counter: u64,
     compaction_manager: CompactionManager,
+    block_cache: Option<Arc<BlockCache>>,
     config: StorageConfig,
 }
 
@@ -87,8 +117,11 @@ impl Storage {
         }
         fs::create_dir_all(&data_dir)?;
 
+        let block_cache = (config.block_cache_size > 0)
+            .then(|| Arc::new(BlockCache::new(config.block_cache_size)));
+
         let wal_path = data_dir.as_ref().join("wal");
-        let mut wal = WAL::new(wal_path)?;
+        let mut wal = WAL::with_sync(wal_path, config.wal_sync)?;
         let mut memtable = MemTable::new();
 
         // Replay WAL if it exists
@@ -143,7 +176,10 @@ impl Storage {
         // so sort by sequence number.
         found.sort_by_key(|(level, seq, _)| (*level, *seq));
         for (level, _, path) in found {
-            sstables.entry(level).or_default().push(SSTable::new(path)?);
+            sstables
+                .entry(level)
+                .or_default()
+                .push(SSTable::with_cache(path, block_cache.clone())?);
             total_sstables += 1;
         }
 
@@ -177,6 +213,7 @@ impl Storage {
             data_dir: data_dir.as_ref().to_path_buf(),
             sstable_counter: counter,
             compaction_manager,
+            block_cache,
             config,
         })
     }
@@ -251,6 +288,46 @@ impl Storage {
             println!("  Key not found");
         }
         Ok(None)
+    }
+
+    /// Return all live key-value pairs with `start <= key < end`, in key
+    /// order. Deleted keys are excluded; the newest value wins when a key
+    /// exists at several levels.
+    pub fn scan(&self, start: &[u8], end: &[u8]) -> io::Result<Vec<(Key, Value)>> {
+        self.scan_impl(start, Some(end))
+    }
+
+    /// Return all live key-value pairs whose key starts with `prefix`,
+    /// in key order.
+    pub fn scan_prefix(&self, prefix: &[u8]) -> io::Result<Vec<(Key, Value)>> {
+        let end = prefix_successor(prefix);
+        self.scan_impl(prefix, end.as_deref())
+    }
+
+    fn scan_impl(&self, start: &[u8], end: Option<&[u8]>) -> io::Result<Vec<(Key, Value)>> {
+        let mut merged: BTreeMap<Key, Option<Value>> = BTreeMap::new();
+
+        // Insert oldest data first so newer entries overwrite it: deeper
+        // levels hold older data, within a level tables are stored oldest to
+        // newest, and the memtable is newest of all.
+        let mut levels: Vec<_> = self.sstables.keys().copied().collect();
+        levels.sort_unstable_by(|a, b| b.cmp(a));
+        for level in levels {
+            for table in &self.sstables[&level] {
+                for (key, value) in table.scan_range(start, end)? {
+                    merged.insert(key, value);
+                }
+            }
+        }
+        for (key, value) in self.memtable.range(start, end) {
+            merged.insert(key.clone(), value.clone());
+        }
+
+        // Tombstones shadow older values, then drop out of the result
+        Ok(merged
+            .into_iter()
+            .filter_map(|(k, v)| v.map(|v| (k, v)))
+            .collect())
     }
 
     /// Insert or update `key` with `value`. The write is durable (recorded
@@ -335,7 +412,7 @@ impl Storage {
         let sstable_path = self
             .data_dir
             .join(format!("L0_{}.sst", self.sstable_counter));
-        let mut sstable = SSTable::new(sstable_path)?;
+        let mut sstable = SSTable::with_cache(sstable_path, self.block_cache.clone())?;
 
         // Write memtable data (including tombstones) to SSTable
         let entries: Vec<_> = self
@@ -362,9 +439,28 @@ impl Storage {
         self.memtable = MemTable::new();
         self.wal.clear()?;
 
-        // Check if compaction is needed at level 0
-        self.maybe_compact(0)?;
+        // Check if compaction is needed at level 0, unless compaction has
+        // been taken off the write path
+        if self.config.inline_compaction {
+            self.maybe_compact(0)?;
+        }
 
+        Ok(())
+    }
+
+    /// Run any pending compactions across all levels, regardless of the
+    /// `inline_compaction` setting. Returns once every level is within its
+    /// threshold.
+    pub fn compact_now(&mut self) -> io::Result<()> {
+        let mut level = 0;
+        loop {
+            let max_level = self.sstables.keys().max().copied().unwrap_or(0);
+            if level > max_level {
+                break;
+            }
+            self.maybe_compact(level)?;
+            level += 1;
+        }
         Ok(())
     }
 
@@ -415,7 +511,7 @@ impl Storage {
             .data_dir
             .join(format!("L{}_{}.sst", next_level, self.sstable_counter));
 
-        let mut new_table = SSTable::new(new_path)?;
+        let mut new_table = SSTable::with_cache(new_path, self.block_cache.clone())?;
 
         if self.config.verbose {
             println!("\n=== Compaction Results ===");
@@ -437,9 +533,12 @@ impl Storage {
         self.sstables.entry(next_level).or_default().push(new_table);
         self.sstable_counter += 1;
 
-        // Now delete the old files
+        // Now delete the old files (and their cached blocks)
         for path in table_paths {
-            fs::remove_file(path)?;
+            fs::remove_file(&path)?;
+            if let Some(cache) = &self.block_cache {
+                cache.purge_file(&path);
+            }
         }
 
         if self.config.verbose {
@@ -737,5 +836,184 @@ mod tests {
             Some(format!("value{}", 499).repeat(20).into_bytes())
         );
         assert_eq!(recovered.get(&b"key0100".to_vec()).unwrap(), None);
+    }
+
+    #[test]
+    fn test_prefix_successor() {
+        assert_eq!(prefix_successor(b"abc"), Some(b"abd".to_vec()));
+        assert_eq!(prefix_successor(b"ab\xff"), Some(b"ac".to_vec()));
+        assert_eq!(prefix_successor(b"\xff\xff"), None);
+        assert_eq!(prefix_successor(b""), None);
+    }
+
+    #[test]
+    fn test_scan_across_memtable_and_sstables() {
+        let (_temp_dir, mut storage) = create_test_storage();
+
+        // Older values end up in SSTables...
+        storage.put(b"user:1".to_vec(), b"old1".to_vec()).unwrap();
+        storage.put(b"user:2".to_vec(), b"v2".to_vec()).unwrap();
+        storage.put(b"user:3".to_vec(), b"v3".to_vec()).unwrap();
+        storage.put(b"other:1".to_vec(), b"x".to_vec()).unwrap();
+        force_flush(&mut storage, "scan");
+
+        // ...then get overwritten/deleted in the memtable
+        storage.put(b"user:1".to_vec(), b"new1".to_vec()).unwrap();
+        storage.delete(&b"user:2".to_vec()).unwrap();
+        storage.put(b"user:4".to_vec(), b"v4".to_vec()).unwrap();
+
+        let result = storage.scan_prefix(b"user:").unwrap();
+        assert_eq!(
+            result,
+            vec![
+                (b"user:1".to_vec(), b"new1".to_vec()), // newest value wins
+                (b"user:3".to_vec(), b"v3".to_vec()),
+                (b"user:4".to_vec(), b"v4".to_vec()),
+                // user:2 deleted, other:1 outside the prefix
+            ]
+        );
+
+        // Bounded range: end is exclusive
+        let result = storage.scan(b"user:1", b"user:4").unwrap();
+        let keys: Vec<_> = result.into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, vec![b"user:1".to_vec(), b"user:3".to_vec()]);
+    }
+
+    #[test]
+    fn test_scan_survives_compaction_and_restart() {
+        let (temp_dir, mut storage) = create_test_storage();
+
+        for i in 0..50 {
+            storage
+                .put(format!("k{:03}", i).into_bytes(), vec![b'v'; 64])
+                .unwrap();
+        }
+        storage.delete(&b"k025".to_vec()).unwrap();
+        // Several flushes to spread data over levels and trigger compaction
+        for round in 0..5 {
+            force_flush(&mut storage, &format!("scanr{}", round));
+        }
+
+        drop(storage);
+        let storage = Storage::new(temp_dir.path(), false).unwrap();
+
+        let result = storage.scan(b"k000", b"k050").unwrap();
+        assert_eq!(result.len(), 49); // 50 keys minus the deleted one
+        assert!(result.iter().all(|(k, _)| k.as_slice() != b"k025"));
+        // Sorted by key
+        assert!(result.windows(2).all(|w| w[0].0 < w[1].0));
+    }
+
+    #[test]
+    fn test_batched_wal_sync_roundtrip() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = StorageConfig {
+            wal_sync: WalSync::Batched { every_n_writes: 16 },
+            ..StorageConfig::default()
+        };
+        let mut storage = Storage::with_config(temp_dir.path(), config.clone()).unwrap();
+        for i in 0..40 {
+            storage
+                .put(format!("key{}", i).into_bytes(), b"value".to_vec())
+                .unwrap();
+        }
+        storage.delete(&b"key5".to_vec()).unwrap();
+
+        // Clean shutdown syncs the batched tail; everything replays
+        drop(storage);
+        let recovered = Storage::with_config(temp_dir.path(), config).unwrap();
+        assert_eq!(
+            recovered.get(&b"key39".to_vec()).unwrap(),
+            Some(b"value".to_vec())
+        );
+        assert_eq!(recovered.get(&b"key5".to_vec()).unwrap(), None);
+    }
+
+    #[test]
+    fn test_block_cache_correctness_under_compaction() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = StorageConfig {
+            memtable_size_threshold: 8 * 1024,
+            compaction_size_threshold: 32 * 1024,
+            block_cache_size: 64 * 1024, // small cache with eviction pressure
+            ..StorageConfig::default()
+        };
+        let mut storage = Storage::with_config(temp_dir.path(), config).unwrap();
+
+        // Interleave writes and reads so cached blocks live across flushes
+        // and compactions that delete their underlying files
+        for i in 0..600 {
+            let key = format!("key{:04}", i % 200).into_bytes();
+            storage
+                .put(key.clone(), format!("v{}", i).into_bytes())
+                .unwrap();
+            let probe = format!("key{:04}", (i * 7) % 200).into_bytes();
+            storage.get(&probe).unwrap();
+        }
+
+        // Latest value per key must win despite caching
+        for k in 0..200 {
+            let key = format!("key{:04}", k).into_bytes();
+            let latest = (0..600).rev().find(|i| i % 200 == k).unwrap();
+            assert_eq!(
+                storage.get(&key).unwrap(),
+                Some(format!("v{}", latest).into_bytes()),
+                "key {}",
+                k
+            );
+        }
+    }
+
+    #[test]
+    fn test_deferred_compaction_via_compact_now() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = StorageConfig {
+            memtable_size_threshold: 8 * 1024,
+            inline_compaction: false,
+            ..StorageConfig::default()
+        };
+        let mut storage = Storage::with_config(temp_dir.path(), config).unwrap();
+
+        // Enough flushes that level 0 exceeds its file limit
+        for i in 0..800 {
+            storage
+                .put(format!("key{:04}", i).into_bytes(), vec![b'v'; 64])
+                .unwrap();
+        }
+        let l0_before = fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("L0_")
+            })
+            .count();
+        assert!(
+            l0_before >= 4,
+            "inline compaction disabled: L0 should accumulate files, got {}",
+            l0_before
+        );
+
+        storage.compact_now().unwrap();
+
+        let l0_after = fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("L0_")
+            })
+            .count();
+        assert!(l0_after < 4, "compact_now should drain level 0");
+
+        // All data still readable after manual compaction
+        for i in [0, 400, 799] {
+            let key = format!("key{:04}", i).into_bytes();
+            assert_eq!(storage.get(&key).unwrap(), Some(vec![b'v'; 64]));
+        }
     }
 }
