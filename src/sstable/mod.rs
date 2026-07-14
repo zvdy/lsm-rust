@@ -16,11 +16,23 @@ const TOMBSTONE_MARKER: u32 = u32::MAX;
 
 /// Magic bytes identifying the versioned SSTable format.
 const MAGIC: &[u8; 4] = b"LSMT";
+/// Header flag bit: data blocks are LZ4-compressed.
+const FLAG_LZ4: u8 = 0b0000_0001;
 /// Current on-disk format version.
 const FORMAT_VERSION: u8 = 2;
 /// Number of entries per data block; the sparse index holds one entry per
 /// block, so lookups read at most one block of this many entries.
 const BLOCK_ENTRY_COUNT: usize = 16;
+
+/// Block compression applied to SSTable data blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Compression {
+    /// Blocks are stored uncompressed.
+    #[default]
+    None,
+    /// Each data block is compressed with LZ4.
+    Lz4,
+}
 
 /// Result of looking up a key in an SSTable.
 #[derive(Debug, PartialEq, Eq)]
@@ -53,6 +65,7 @@ enum Layout {
     V2 {
         data_start: u64,
         index: Vec<IndexEntry>,
+        compression: Compression,
     },
 }
 
@@ -172,6 +185,11 @@ impl SSTable {
             if version != FORMAT_VERSION {
                 return Err(invalid_data("unsupported SSTable format version"));
             }
+            let compression = if version_flags[1] & FLAG_LZ4 != 0 {
+                Compression::Lz4
+            } else {
+                Compression::None
+            };
 
             // Bloom filter
             let mut len_bytes = [0u8; 4];
@@ -189,7 +207,14 @@ impl SSTable {
             let index = Self::parse_index(&index_bytes)?;
 
             let data_start = file.stream_position()?;
-            Ok((bloom, Layout::V2 { data_start, index }))
+            Ok((
+                bloom,
+                Layout::V2 {
+                    data_start,
+                    index,
+                    compression,
+                },
+            ))
         } else {
             // Legacy format: the first 4 bytes are the bloom filter length
             let bloom_len = u32::from_le_bytes(magic) as usize;
@@ -235,9 +260,19 @@ impl SSTable {
         bytes
     }
 
-    /// Write sorted entries to this SSTable in the versioned block format.
-    /// An entry value of `None` is a tombstone recording a deletion.
+    /// Write sorted entries uncompressed. See [`SSTable::write_with`].
     pub fn write(&mut self, data: &[(Key, Option<Value>)]) -> io::Result<()> {
+        self.write_with(data, Compression::None)
+    }
+
+    /// Write sorted entries to this SSTable in the versioned block format,
+    /// compressing each data block with the given algorithm.
+    /// An entry value of `None` is a tombstone recording a deletion.
+    pub fn write_with(
+        &mut self,
+        data: &[(Key, Option<Value>)],
+        compression: Compression,
+    ) -> io::Result<()> {
         // Build the bloom filter over all keys (including tombstones, so
         // that deletions are found and can shadow older values)
         let mut bloom = BloomFilter::new(
@@ -251,9 +286,17 @@ impl SSTable {
         // Build data blocks and the sparse index over them
         let mut data_section = Vec::new();
         let mut index = Vec::new();
+        let mut block_buf = Vec::new();
         for chunk in data.chunks(BLOCK_ENTRY_COUNT) {
+            block_buf.clear();
+            encode_entries(chunk, &mut block_buf);
             let offset = data_section.len() as u64;
-            encode_entries(chunk, &mut data_section);
+            match compression {
+                Compression::None => data_section.extend_from_slice(&block_buf),
+                Compression::Lz4 => {
+                    data_section.extend(lz4_flex::compress_prepend_size(&block_buf))
+                }
+            }
             let len = (data_section.len() as u64 - offset) as u32;
             index.push(IndexEntry {
                 first_key: chunk[0].0.clone(),
@@ -265,9 +308,13 @@ impl SSTable {
         let bloom_bytes = bloom.to_bytes();
         let index_bytes = Self::serialize_index(&index);
 
+        let flags = match compression {
+            Compression::None => 0,
+            Compression::Lz4 => FLAG_LZ4,
+        };
         let mut file = File::create(&self.path)?;
         file.write_all(MAGIC)?;
-        file.write_all(&[FORMAT_VERSION, 0])?; // version, flags (reserved)
+        file.write_all(&[FORMAT_VERSION, flags])?;
         file.write_all(&(bloom_bytes.len() as u32).to_le_bytes())?;
         file.write_all(&bloom_bytes)?;
         file.write_all(&(index_bytes.len() as u32).to_le_bytes())?;
@@ -278,8 +325,27 @@ impl SSTable {
 
         self.size = (data_start + data_section.len() as u64) as usize;
         self.bloom_filter = Some(bloom);
-        self.layout = Layout::V2 { data_start, index };
+        self.layout = Layout::V2 {
+            data_start,
+            index,
+            compression,
+        };
         Ok(())
+    }
+
+    /// Read one data block, decompressing it if the table is compressed.
+    fn read_block(
+        &self,
+        data_start: u64,
+        entry: &IndexEntry,
+        compression: Compression,
+    ) -> io::Result<Vec<u8>> {
+        let raw = self.read_range(data_start + entry.offset, entry.len as usize)?;
+        match compression {
+            Compression::None => Ok(raw),
+            Compression::Lz4 => lz4_flex::decompress_size_prepended(&raw)
+                .map_err(|e| invalid_data(&format!("failed to decompress block: {}", e))),
+        }
     }
 
     /// Read `len` bytes at `offset` from the start of the file.
@@ -308,10 +374,14 @@ impl SSTable {
                 let buffer = self.read_to_end_from(*data_start)?;
                 parse_entries(&buffer)
             }
-            Layout::V2 { data_start, index } => {
+            Layout::V2 {
+                data_start,
+                index,
+                compression,
+            } => {
                 let mut data = Vec::new();
                 for entry in index {
-                    let block = self.read_range(data_start + entry.offset, entry.len as usize)?;
+                    let block = self.read_block(*data_start, entry, *compression)?;
                     data.extend(parse_entries(&block)?);
                 }
                 Ok(data)
@@ -347,7 +417,11 @@ impl SSTable {
                 let buffer = self.read_to_end_from(*data_start)?;
                 Self::scan_entries(&buffer, key, false)
             }
-            Layout::V2 { data_start, index } => {
+            Layout::V2 {
+                data_start,
+                index,
+                compression,
+            } => {
                 // The candidate block is the last one whose first key is
                 // <= the target; earlier blocks only hold smaller keys.
                 let candidate = index.partition_point(|e| e.first_key.as_slice() <= key);
@@ -355,7 +429,7 @@ impl SSTable {
                     return Ok(SSTableLookup::NotFound);
                 }
                 let entry = &index[candidate - 1];
-                let block = self.read_range(data_start + entry.offset, entry.len as usize)?;
+                let block = self.read_block(*data_start, entry, *compression)?;
                 Self::scan_entries(&block, key, true)
             }
         }
@@ -686,6 +760,68 @@ mod tests {
                 (b"gone_key".to_vec(), None),
                 (b"old_key".to_vec(), Some(b"old_value".to_vec())),
             ]
+        );
+    }
+
+    #[test]
+    fn test_compressed_roundtrip() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("compressed.sst");
+        let mut table = SSTable::new(path.clone()).unwrap();
+
+        let data: Vec<_> = (0..100)
+            .map(|i| {
+                (
+                    format!("key{:04}", i).into_bytes(),
+                    if i == 50 {
+                        None // a tombstone inside a compressed block
+                    } else {
+                        Some(format!("value{}", i).repeat(50).into_bytes())
+                    },
+                )
+            })
+            .collect();
+        table.write_with(&data, Compression::Lz4).unwrap();
+
+        assert_eq!(table.read().unwrap(), data);
+        assert_eq!(
+            table.get(b"key0010").unwrap(),
+            SSTableLookup::Found(b"value10".repeat(50).to_vec())
+        );
+        assert_eq!(table.get(b"key0050").unwrap(), SSTableLookup::Deleted);
+        assert_eq!(table.get(b"missing").unwrap(), SSTableLookup::NotFound);
+
+        // Reopen from disk: compression flag comes from the header
+        let reopened = SSTable::new(path).unwrap();
+        assert_eq!(reopened.read().unwrap(), data);
+        assert_eq!(
+            reopened.get(b"key0099").unwrap(),
+            SSTableLookup::Found(b"value99".repeat(50).to_vec())
+        );
+    }
+
+    #[test]
+    fn test_compression_reduces_size() {
+        let temp_dir = TempDir::new().unwrap();
+        let data: Vec<_> = (0..200)
+            .map(|i| {
+                (
+                    format!("key{:04}", i).into_bytes(),
+                    Some(vec![b'a'; 512]), // highly compressible values
+                )
+            })
+            .collect();
+
+        let mut plain = SSTable::new(temp_dir.path().join("plain.sst")).unwrap();
+        plain.write_with(&data, Compression::None).unwrap();
+        let mut packed = SSTable::new(temp_dir.path().join("packed.sst")).unwrap();
+        packed.write_with(&data, Compression::Lz4).unwrap();
+
+        assert!(
+            packed.size() < plain.size() / 2,
+            "expected compressed table ({}) to be much smaller than plain ({})",
+            packed.size(),
+            plain.size()
         );
     }
 }
