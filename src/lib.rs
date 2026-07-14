@@ -37,3 +37,4 @@ pub type Value = Vec<u8>;
 
 pub use sstable::Compression;
 pub use storage::{SharedStorage, Storage, StorageConfig};
+pub use wal::WalSync;
