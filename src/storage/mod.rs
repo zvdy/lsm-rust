@@ -1,3 +1,6 @@
+mod shared;
+pub use shared::SharedStorage;
+
 use std::collections::HashMap;
 use std::fs;
 use std::io;
