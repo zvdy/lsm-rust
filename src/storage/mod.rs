@@ -6,9 +6,10 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use crate::memtable::MemTable;
-use crate::sstable::{CompactionManager, Compression, SSTable, SSTableLookup};
+use crate::sstable::{BlockCache, CompactionManager, Compression, SSTable, SSTableLookup};
 use crate::wal::{Operation, WalSync, WAL};
 use crate::{Key, Value};
 
@@ -50,6 +51,9 @@ pub struct StorageConfig {
     pub compression: Compression,
     /// When the write-ahead log fsyncs (per write, or batched group commit).
     pub wal_sync: WalSync,
+    /// Capacity in bytes of the shared block cache for SSTable reads
+    /// (0 disables caching).
+    pub block_cache_size: usize,
     /// Print detailed progress information to stdout.
     pub verbose: bool,
 }
@@ -63,6 +67,7 @@ impl Default for StorageConfig {
             level0_file_limit: 4,
             compression: Compression::None,
             wal_sync: WalSync::Always,
+            block_cache_size: 4 * 1024 * 1024, // 4MB
             verbose: false,
         }
     }
@@ -79,6 +84,7 @@ pub struct Storage {
     data_dir: PathBuf,
     sstable_counter: u64,
     compaction_manager: CompactionManager,
+    block_cache: Option<Arc<BlockCache>>,
     config: StorageConfig,
 }
 
@@ -104,6 +110,9 @@ impl Storage {
             println!("Initializing storage at {:?}", data_dir.as_ref());
         }
         fs::create_dir_all(&data_dir)?;
+
+        let block_cache = (config.block_cache_size > 0)
+            .then(|| Arc::new(BlockCache::new(config.block_cache_size)));
 
         let wal_path = data_dir.as_ref().join("wal");
         let mut wal = WAL::with_sync(wal_path, config.wal_sync)?;
@@ -161,7 +170,10 @@ impl Storage {
         // so sort by sequence number.
         found.sort_by_key(|(level, seq, _)| (*level, *seq));
         for (level, _, path) in found {
-            sstables.entry(level).or_default().push(SSTable::new(path)?);
+            sstables
+                .entry(level)
+                .or_default()
+                .push(SSTable::with_cache(path, block_cache.clone())?);
             total_sstables += 1;
         }
 
@@ -195,6 +207,7 @@ impl Storage {
             data_dir: data_dir.as_ref().to_path_buf(),
             sstable_counter: counter,
             compaction_manager,
+            block_cache,
             config,
         })
     }
@@ -393,7 +406,7 @@ impl Storage {
         let sstable_path = self
             .data_dir
             .join(format!("L0_{}.sst", self.sstable_counter));
-        let mut sstable = SSTable::new(sstable_path)?;
+        let mut sstable = SSTable::with_cache(sstable_path, self.block_cache.clone())?;
 
         // Write memtable data (including tombstones) to SSTable
         let entries: Vec<_> = self
@@ -473,7 +486,7 @@ impl Storage {
             .data_dir
             .join(format!("L{}_{}.sst", next_level, self.sstable_counter));
 
-        let mut new_table = SSTable::new(new_path)?;
+        let mut new_table = SSTable::with_cache(new_path, self.block_cache.clone())?;
 
         if self.config.verbose {
             println!("\n=== Compaction Results ===");
@@ -495,9 +508,12 @@ impl Storage {
         self.sstables.entry(next_level).or_default().push(new_table);
         self.sstable_counter += 1;
 
-        // Now delete the old files
+        // Now delete the old files (and their cached blocks)
         for path in table_paths {
-            fs::remove_file(path)?;
+            fs::remove_file(&path)?;
+            if let Some(cache) = &self.block_cache {
+                cache.purge_file(&path);
+            }
         }
 
         if self.config.verbose {
@@ -886,5 +902,40 @@ mod tests {
             Some(b"value".to_vec())
         );
         assert_eq!(recovered.get(&b"key5".to_vec()).unwrap(), None);
+    }
+
+    #[test]
+    fn test_block_cache_correctness_under_compaction() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = StorageConfig {
+            memtable_size_threshold: 8 * 1024,
+            compaction_size_threshold: 32 * 1024,
+            block_cache_size: 64 * 1024, // small cache with eviction pressure
+            ..StorageConfig::default()
+        };
+        let mut storage = Storage::with_config(temp_dir.path(), config).unwrap();
+
+        // Interleave writes and reads so cached blocks live across flushes
+        // and compactions that delete their underlying files
+        for i in 0..600 {
+            let key = format!("key{:04}", i % 200).into_bytes();
+            storage
+                .put(key.clone(), format!("v{}", i).into_bytes())
+                .unwrap();
+            let probe = format!("key{:04}", (i * 7) % 200).into_bytes();
+            storage.get(&probe).unwrap();
+        }
+
+        // Latest value per key must win despite caching
+        for k in 0..200 {
+            let key = format!("key{:04}", k).into_bytes();
+            let latest = (0..600).rev().find(|i| i % 200 == k).unwrap();
+            assert_eq!(
+                storage.get(&key).unwrap(),
+                Some(format!("v{}", latest).into_bytes()),
+                "key {}",
+                k
+            );
+        }
     }
 }
