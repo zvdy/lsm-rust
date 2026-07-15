@@ -3,8 +3,11 @@ use crate::{Key, Value};
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+mod cache;
 mod compaction;
+pub use cache::BlockCache;
 pub use compaction::CompactionManager;
 
 const BLOOM_FALSE_POSITIVE_RATE: f64 = 0.01;
@@ -74,6 +77,7 @@ pub struct SSTable {
     size: usize,
     bloom_filter: Option<BloomFilter>,
     layout: Layout,
+    cache: Option<Arc<BlockCache>>,
 }
 
 fn invalid_data(msg: &str) -> io::Error {
@@ -143,12 +147,19 @@ fn encode_entries(data: &[(Key, Option<Value>)], out: &mut Vec<u8>) {
 
 impl SSTable {
     pub fn new(path: PathBuf) -> io::Result<Self> {
+        Self::with_cache(path, None)
+    }
+
+    /// Open an SSTable that serves block reads through the given shared
+    /// block cache.
+    pub fn with_cache(path: PathBuf, cache: Option<Arc<BlockCache>>) -> io::Result<Self> {
         if !path.exists() {
             return Ok(SSTable {
                 path,
                 size: 0,
                 bloom_filter: None,
                 layout: Layout::Empty,
+                cache,
             });
         }
 
@@ -159,6 +170,7 @@ impl SSTable {
                 size: 0,
                 bloom_filter: None,
                 layout: Layout::Empty,
+                cache,
             });
         }
 
@@ -168,6 +180,7 @@ impl SSTable {
             size,
             bloom_filter,
             layout,
+            cache,
         })
     }
 
@@ -308,6 +321,11 @@ impl SSTable {
         let bloom_bytes = bloom.to_bytes();
         let index_bytes = Self::serialize_index(&index);
 
+        if let Some(cache) = &self.cache {
+            // The file is being (re)written: drop any cached blocks for it
+            cache.purge_file(&self.path);
+        }
+
         let flags = match compression {
             Compression::None => 0,
             Compression::Lz4 => FLAG_LZ4,
@@ -334,18 +352,30 @@ impl SSTable {
     }
 
     /// Read one data block, decompressing it if the table is compressed.
+    /// Served from the shared block cache when one is configured.
     fn read_block(
         &self,
         data_start: u64,
         entry: &IndexEntry,
         compression: Compression,
-    ) -> io::Result<Vec<u8>> {
-        let raw = self.read_range(data_start + entry.offset, entry.len as usize)?;
-        match compression {
-            Compression::None => Ok(raw),
-            Compression::Lz4 => lz4_flex::decompress_size_prepended(&raw)
-                .map_err(|e| invalid_data(&format!("failed to decompress block: {}", e))),
+    ) -> io::Result<Arc<Vec<u8>>> {
+        if let Some(cache) = &self.cache {
+            if let Some(block) = cache.get(&self.path, entry.offset) {
+                return Ok(block);
+            }
         }
+
+        let raw = self.read_range(data_start + entry.offset, entry.len as usize)?;
+        let block = Arc::new(match compression {
+            Compression::None => raw,
+            Compression::Lz4 => lz4_flex::decompress_size_prepended(&raw)
+                .map_err(|e| invalid_data(&format!("failed to decompress block: {}", e)))?,
+        });
+
+        if let Some(cache) = &self.cache {
+            cache.insert(&self.path, entry.offset, Arc::clone(&block));
+        }
+        Ok(block)
     }
 
     /// Read `len` bytes at `offset` from the start of the file.
@@ -912,5 +942,40 @@ mod tests {
 
         // Whole-table scan matches read()
         assert_eq!(table.scan_range(b"", None).unwrap(), data);
+    }
+
+    #[test]
+    fn test_block_cache_serves_repeated_reads() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache = Arc::new(BlockCache::new(1024 * 1024));
+        let path = temp_dir.path().join("cached.sst");
+        let mut table = SSTable::with_cache(path, Some(Arc::clone(&cache))).unwrap();
+
+        let data: Vec<_> = (0..50)
+            .map(|i| {
+                (
+                    format!("key{:03}", i).into_bytes(),
+                    Some(format!("value{}", i).into_bytes()),
+                )
+            })
+            .collect();
+        table.write_with(&data, Compression::Lz4).unwrap();
+
+        // First read misses and fills the cache; repeats hit
+        assert_eq!(
+            table.get(b"key010").unwrap(),
+            SSTableLookup::Found(b"value10".to_vec())
+        );
+        let (_, misses_after_first) = cache.stats();
+        for _ in 0..5 {
+            assert_eq!(
+                table.get(b"key010").unwrap(),
+                SSTableLookup::Found(b"value10".to_vec())
+            );
+        }
+        let (hits, misses) = cache.stats();
+        assert_eq!(misses, misses_after_first, "repeat reads must not miss");
+        assert!(hits >= 5);
+        assert!(cache.used_bytes() > 0);
     }
 }
