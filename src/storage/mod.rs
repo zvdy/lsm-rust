@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::memtable::MemTable;
 use crate::sstable::{CompactionManager, Compression, SSTable, SSTableLookup};
-use crate::wal::{Operation, WAL};
+use crate::wal::{Operation, WalSync, WAL};
 use crate::{Key, Value};
 
 /// Smallest byte string strictly greater than every string with this
@@ -48,6 +48,8 @@ pub struct StorageConfig {
     pub level0_file_limit: usize,
     /// Compression applied to SSTable data blocks.
     pub compression: Compression,
+    /// When the write-ahead log fsyncs (per write, or batched group commit).
+    pub wal_sync: WalSync,
     /// Print detailed progress information to stdout.
     pub verbose: bool,
 }
@@ -60,6 +62,7 @@ impl Default for StorageConfig {
             level_multiplier: 4,
             level0_file_limit: 4,
             compression: Compression::None,
+            wal_sync: WalSync::Always,
             verbose: false,
         }
     }
@@ -103,7 +106,7 @@ impl Storage {
         fs::create_dir_all(&data_dir)?;
 
         let wal_path = data_dir.as_ref().join("wal");
-        let mut wal = WAL::new(wal_path)?;
+        let mut wal = WAL::with_sync(wal_path, config.wal_sync)?;
         let mut memtable = MemTable::new();
 
         // Replay WAL if it exists
@@ -858,5 +861,30 @@ mod tests {
         assert!(result.iter().all(|(k, _)| k.as_slice() != b"k025"));
         // Sorted by key
         assert!(result.windows(2).all(|w| w[0].0 < w[1].0));
+    }
+
+    #[test]
+    fn test_batched_wal_sync_roundtrip() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = StorageConfig {
+            wal_sync: WalSync::Batched { every_n_writes: 16 },
+            ..StorageConfig::default()
+        };
+        let mut storage = Storage::with_config(temp_dir.path(), config.clone()).unwrap();
+        for i in 0..40 {
+            storage
+                .put(format!("key{}", i).into_bytes(), b"value".to_vec())
+                .unwrap();
+        }
+        storage.delete(&b"key5".to_vec()).unwrap();
+
+        // Clean shutdown syncs the batched tail; everything replays
+        drop(storage);
+        let recovered = Storage::with_config(temp_dir.path(), config).unwrap();
+        assert_eq!(
+            recovered.get(&b"key39".to_vec()).unwrap(),
+            Some(b"value".to_vec())
+        );
+        assert_eq!(recovered.get(&b"key5".to_vec()).unwrap(), None);
     }
 }

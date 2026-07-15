@@ -8,21 +8,45 @@ pub enum Operation {
     Delete,
 }
 
+/// When the write-ahead log fsyncs to disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WalSync {
+    /// fsync after every append: an acknowledged write is never lost, at
+    /// the cost of one disk sync per operation.
+    #[default]
+    Always,
+    /// Group commit: fsync once every `every_n_writes` appends (and on
+    /// memtable flush and shutdown). Much higher write throughput; on a
+    /// crash, up to `every_n_writes - 1` acknowledged writes may be lost.
+    Batched { every_n_writes: usize },
+}
+
 #[allow(clippy::upper_case_acronyms)]
 pub struct WAL {
     path: PathBuf,
     file: File,
+    sync: WalSync,
+    unsynced_writes: usize,
 }
 
 impl WAL {
     pub fn new(path: PathBuf) -> io::Result<Self> {
+        Self::with_sync(path, WalSync::Always)
+    }
+
+    pub fn with_sync(path: PathBuf, sync: WalSync) -> io::Result<Self> {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .read(true)
             .open(&path)?;
 
-        Ok(WAL { path, file })
+        Ok(WAL {
+            path,
+            file,
+            sync,
+            unsynced_writes: 0,
+        })
     }
 
     pub fn append(&mut self, op: Operation, key: &[u8], value: Option<&[u8]>) -> io::Result<()> {
@@ -42,9 +66,28 @@ impl WAL {
         }
 
         self.file.flush()?;
-        // fsync so the operation is durable even if the process or machine
-        // crashes right after append() returns
-        self.file.sync_data()?;
+        self.unsynced_writes += 1;
+
+        // fsync so operations are durable even if the process or machine
+        // crashes right after append() returns; in batched mode the sync is
+        // amortized over several appends (group commit)
+        match self.sync {
+            WalSync::Always => self.sync_now()?,
+            WalSync::Batched { every_n_writes } => {
+                if self.unsynced_writes >= every_n_writes.max(1) {
+                    self.sync_now()?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Force any batched appends to disk.
+    pub fn sync_now(&mut self) -> io::Result<()> {
+        if self.unsynced_writes > 0 {
+            self.file.sync_data()?;
+            self.unsynced_writes = 0;
+        }
         Ok(())
     }
 
@@ -115,7 +158,15 @@ impl WAL {
             .read(true)
             .open(&self.path)?;
         self.file.sync_data()?;
+        self.unsynced_writes = 0;
         Ok(())
+    }
+}
+
+impl Drop for WAL {
+    fn drop(&mut self) {
+        // Best-effort flush of batched appends on clean shutdown
+        let _ = self.sync_now();
     }
 }
 
@@ -277,5 +328,39 @@ mod tests {
             }
             _ => panic!("Expected Put operation"),
         }
+    }
+
+    #[test]
+    fn test_batched_sync_replays_all_writes() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("test.wal");
+        let mut wal = WAL::with_sync(path.clone(), WalSync::Batched { every_n_writes: 8 }).unwrap();
+
+        for i in 0..20 {
+            let key = format!("key{}", i).into_bytes();
+            wal.append(Operation::Put, &key, Some(b"value")).unwrap();
+        }
+        drop(wal); // syncs the batched tail
+
+        let mut wal = WAL::new(path).unwrap();
+        assert_eq!(wal.replay().unwrap().len(), 20);
+    }
+
+    #[test]
+    fn test_sync_now_resets_pending_counter() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("test.wal");
+        let mut wal = WAL::with_sync(
+            path,
+            WalSync::Batched {
+                every_n_writes: 100,
+            },
+        )
+        .unwrap();
+
+        wal.append(Operation::Put, b"k", Some(b"v")).unwrap();
+        assert_eq!(wal.unsynced_writes, 1);
+        wal.sync_now().unwrap();
+        assert_eq!(wal.unsynced_writes, 0);
     }
 }
