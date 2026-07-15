@@ -1,12 +1,93 @@
 use std::env;
 use std::fs;
 use std::io;
+use std::net::TcpListener;
 
-use lsm_rust::Storage;
+use lsm_rust::{RespServer, SharedStorage, Storage};
 
 fn main() -> io::Result<()> {
-    let verbose = env::args().any(|arg| arg == "-v" || arg == "--verbose");
+    let args: Vec<String> = env::args().skip(1).collect();
+    let verbose = args.iter().any(|a| a == "-v" || a == "--verbose");
 
+    match args.first().map(String::as_str) {
+        Some("serve") => serve(&args[1..], verbose),
+        Some("demo") | None => demo(verbose),
+        Some("-v") | Some("--verbose") => demo(verbose),
+        Some("help") | Some("--help") | Some("-h") => {
+            print_usage();
+            Ok(())
+        }
+        Some(other) => {
+            eprintln!("Unknown command: {}", other);
+            print_usage();
+            std::process::exit(2);
+        }
+    }
+}
+
+fn print_usage() {
+    println!("Usage: lsm-rust [COMMAND] [OPTIONS]");
+    println!();
+    println!("Commands:");
+    println!("  demo               Run the scripted demo (default)");
+    println!("  serve              Serve the store over the Redis protocol (RESP)");
+    println!();
+    println!("Options:");
+    println!("  -v, --verbose      Verbose engine logging");
+    println!("  --addr HOST:PORT   serve: listen address (default 127.0.0.1:6379)");
+    println!("  --data DIR         serve: data directory (default ./data)");
+}
+
+/// `lsm-rust serve [--addr HOST:PORT] [--data DIR] [-v]`
+fn serve(args: &[String], verbose: bool) -> io::Result<()> {
+    let mut addr = "127.0.0.1:6379".to_string();
+    let mut data_dir = "./data".to_string();
+
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--addr" => {
+                addr = iter
+                    .next()
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "--addr needs a value")
+                    })?
+                    .clone();
+            }
+            "--data" => {
+                data_dir = iter
+                    .next()
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "--data needs a value")
+                    })?
+                    .clone();
+            }
+            "-v" | "--verbose" => {}
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unknown serve option: {}", other),
+                ));
+            }
+        }
+    }
+
+    let storage = SharedStorage::new(&data_dir, verbose)?;
+    let listener = TcpListener::bind(&addr)?;
+    println!(
+        "lsm-rust serving RESP on {} (data: {})",
+        listener.local_addr()?,
+        data_dir
+    );
+    println!("Try: redis-cli -p {}", listener.local_addr()?.port());
+
+    let server = RespServer::spawn(storage, listener)?;
+    server.join();
+    Ok(())
+}
+
+/// `lsm-rust demo [-v]` — the original scripted example.
+fn demo(verbose: bool) -> io::Result<()> {
     println!("LSM Tree Database Example");
     if verbose {
         println!("Verbose mode enabled");
