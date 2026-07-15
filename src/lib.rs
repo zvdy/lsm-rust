@@ -26,6 +26,7 @@
 
 pub mod bloom;
 pub mod memtable;
+pub mod server;
 pub mod sstable;
 pub mod storage;
 pub mod wal;
@@ -35,6 +36,7 @@ pub type Key = Vec<u8>;
 /// Values are arbitrary byte strings.
 pub type Value = Vec<u8>;
 
+pub use server::RespServer;
 pub use sstable::{BlockCache, Compression};
 pub use storage::{CompactorHandle, SharedStorage, Storage, StorageConfig};
 pub use wal::WalSync;

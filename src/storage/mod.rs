@@ -1,4 +1,6 @@
+mod manifest;
 mod shared;
+use manifest::{Manifest, ManifestEntry};
 pub use shared::{CompactorHandle, SharedStorage};
 
 use std::collections::{BTreeMap, HashMap};
@@ -26,6 +28,16 @@ fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
         }
     }
     None
+}
+
+/// Parse `L{level}_{seq}.sst` filenames.
+fn parse_sst_filename(path: &Path) -> Option<(usize, u64)> {
+    if path.extension().and_then(|s| s.to_str()) != Some("sst") {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?;
+    let (level, seq) = stem.strip_prefix('L')?.split_once('_')?;
+    Some((level.parse().ok()?, seq.parse().ok()?))
 }
 
 static PUT_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -91,6 +103,7 @@ pub struct Storage {
     sstable_counter: u64,
     compaction_manager: CompactionManager,
     block_cache: Option<Arc<BlockCache>>,
+    manifest: Manifest,
     config: StorageConfig,
 }
 
@@ -144,26 +157,45 @@ impl Storage {
             println!("Replayed {} operations from WAL", replay_count);
         }
 
-        // Load existing SSTables
-        let mut sstables: HashMap<usize, Vec<SSTable>> = HashMap::new();
-        let mut counter = 0;
-        let mut total_sstables = 0;
+        // Load existing SSTables. The manifest is the authoritative record
+        // of which tables are live; without one (legacy data directory) we
+        // fall back to scanning the directory.
+        let manifest = Manifest::new(data_dir.as_ref());
+        let had_manifest = manifest.exists();
 
         let mut found: Vec<(usize, u64, PathBuf)> = Vec::new();
-        for entry in fs::read_dir(&data_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("sst") {
-                if let Some(filename) = path.file_stem().and_then(|s| s.to_str()) {
-                    // Parse level and sequence number from filename (L{level}_{seq}.sst)
-                    if let Some(level_str) = filename.strip_prefix('L') {
-                        if let Some((level, seq_str)) = level_str.split_once('_') {
-                            if let (Ok(level), Ok(seq)) =
-                                (level.parse::<usize>(), seq_str.parse::<u64>())
-                            {
-                                counter = counter.max(seq + 1);
-                                found.push((level, seq, path));
-                            }
+        match manifest.load()? {
+            Some(entries) => {
+                for entry in entries {
+                    found.push((
+                        entry.level,
+                        entry.seq,
+                        data_dir.as_ref().join(&entry.filename),
+                    ));
+                }
+
+                // Delete unreferenced .sst files: leftovers from a flush or
+                // compaction that crashed before its manifest commit, or old
+                // tables whose deletion was interrupted after it.
+                for dir_entry in fs::read_dir(&data_dir)? {
+                    let path = dir_entry?.path();
+                    if path.is_file()
+                        && parse_sst_filename(&path).is_some()
+                        && !found.iter().any(|(_, _, p)| *p == path)
+                    {
+                        if verbose {
+                            println!("Removing orphan SSTable {:?}", path.file_name().unwrap());
+                        }
+                        fs::remove_file(&path)?;
+                    }
+                }
+            }
+            None => {
+                for dir_entry in fs::read_dir(&data_dir)? {
+                    let path = dir_entry?.path();
+                    if path.is_file() {
+                        if let Some((level, seq)) = parse_sst_filename(&path) {
+                            found.push((level, seq, path));
                         }
                     }
                 }
@@ -172,10 +204,15 @@ impl Storage {
 
         // Within a level, tables must be ordered oldest to newest so that
         // reads (which scan newest first) and compaction (where the newest
-        // value wins) see them consistently. Directory order is arbitrary,
-        // so sort by sequence number.
+        // value wins) see them consistently. Sort by sequence number since
+        // neither manifest order nor directory order is guaranteed.
         found.sort_by_key(|(level, seq, _)| (*level, *seq));
-        for (level, _, path) in found {
+
+        let mut sstables: HashMap<usize, Vec<SSTable>> = HashMap::new();
+        let mut counter = 0;
+        let mut total_sstables = 0;
+        for (level, seq, path) in found {
+            counter = counter.max(seq + 1);
             sstables
                 .entry(level)
                 .or_default()
@@ -206,7 +243,7 @@ impl Storage {
             config.level0_file_limit,
         );
 
-        Ok(Storage {
+        let storage = Storage {
             memtable,
             wal,
             sstables,
@@ -214,8 +251,37 @@ impl Storage {
             sstable_counter: counter,
             compaction_manager,
             block_cache,
+            manifest,
             config,
-        })
+        };
+
+        // Give legacy directories a manifest so the next startup (and any
+        // crash recovery in between) has an authoritative table record
+        if !had_manifest {
+            storage.persist_manifest()?;
+        }
+
+        Ok(storage)
+    }
+
+    /// Atomically record the current live table set in the manifest. Called
+    /// at every commit point where the table set changes.
+    fn persist_manifest(&self) -> io::Result<()> {
+        let mut entries = Vec::new();
+        for (level, tables) in &self.sstables {
+            for table in tables {
+                let path = table.get_path();
+                if let Some((_, seq)) = parse_sst_filename(path) {
+                    entries.push(ManifestEntry {
+                        level: *level,
+                        seq,
+                        filename: path.file_name().unwrap().to_string_lossy().into_owned(),
+                    });
+                }
+            }
+        }
+        entries.sort_by_key(|e| (e.level, e.seq));
+        self.manifest.write(&entries)
     }
 
     /// Look up the current value for `key`, or `None` if the key does not
@@ -435,6 +501,12 @@ impl Storage {
         self.sstables.entry(0).or_default().push(sstable);
         self.sstable_counter += 1;
 
+        // Commit the new table to the manifest BEFORE clearing the WAL: if
+        // we crash in between, the WAL still holds the data; if we cleared
+        // first, an unreferenced table would be garbage-collected as an
+        // orphan and the flushed writes lost
+        self.persist_manifest()?;
+
         // Clear memtable and WAL
         self.memtable = MemTable::new();
         self.wal.clear()?;
@@ -532,6 +604,11 @@ impl Storage {
         self.sstables.get_mut(&level).unwrap().clear();
         self.sstables.entry(next_level).or_default().push(new_table);
         self.sstable_counter += 1;
+
+        // The manifest rename is the commit point: crash before it and the
+        // half-finished compaction output is an orphan; crash after it and
+        // the stale inputs are orphans. Either way startup cleans up.
+        self.persist_manifest()?;
 
         // Now delete the old files (and their cached blocks)
         for path in table_paths {
@@ -1015,5 +1092,63 @@ mod tests {
             let key = format!("key{:04}", i).into_bytes();
             assert_eq!(storage.get(&key).unwrap(), Some(vec![b'v'; 64]));
         }
+    }
+
+    #[test]
+    fn test_manifest_written_on_flush() {
+        let (temp_dir, mut storage) = create_test_storage();
+        assert!(temp_dir.path().join("MANIFEST").exists()); // written at open
+
+        force_flush(&mut storage, "m");
+        let manifest = fs::read_to_string(temp_dir.path().join("MANIFEST")).unwrap();
+        assert!(
+            manifest.lines().any(|l| l.starts_with("0 ")),
+            "manifest should list a level-0 table:\n{}",
+            manifest
+        );
+    }
+
+    #[test]
+    fn test_orphan_sstables_removed_on_startup() {
+        let (temp_dir, mut storage) = create_test_storage();
+        storage.put(b"real".to_vec(), b"data".to_vec()).unwrap();
+        force_flush(&mut storage, "o");
+        drop(storage);
+
+        // Fabricate leftovers of a crashed flush/compaction: a garbage
+        // half-written table and a valid table that isn't in the manifest
+        fs::write(temp_dir.path().join("L0_9998.sst"), b"garbage").unwrap();
+        let mut stray = SSTable::new(temp_dir.path().join("L9_9999.sst")).unwrap();
+        stray
+            .write(&[(b"ghost".to_vec(), Some(b"boo".to_vec()))])
+            .unwrap();
+
+        let recovered = Storage::new(temp_dir.path(), false).unwrap();
+        assert!(!temp_dir.path().join("L0_9998.sst").exists());
+        assert!(!temp_dir.path().join("L9_9999.sst").exists());
+        assert_eq!(recovered.get(&b"ghost".to_vec()).unwrap(), None);
+        assert_eq!(
+            recovered.get(&b"real".to_vec()).unwrap(),
+            Some(b"data".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_legacy_directory_without_manifest() {
+        let (temp_dir, mut storage) = create_test_storage();
+        storage.put(b"key".to_vec(), b"value".to_vec()).unwrap();
+        force_flush(&mut storage, "l");
+        drop(storage);
+
+        // Simulate a data directory created before manifests existed
+        fs::remove_file(temp_dir.path().join("MANIFEST")).unwrap();
+
+        let recovered = Storage::new(temp_dir.path(), false).unwrap();
+        assert_eq!(
+            recovered.get(&b"key".to_vec()).unwrap(),
+            Some(b"value".to_vec())
+        );
+        // The fallback scan writes a fresh manifest
+        assert!(temp_dir.path().join("MANIFEST").exists());
     }
 }
