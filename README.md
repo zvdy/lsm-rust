@@ -26,6 +26,15 @@ block compression.
   cheap while shrinking tables
 - **Concurrent access** — a cloneable `SharedStorage` handle with concurrent
   reads and serialized writes
+- **Range and prefix scans** — ordered scans with newest-wins merging across
+  the memtable and all levels, reading only the blocks that intersect the
+  range
+- **Block cache** — a shared LRU cache of hot (decompressed) blocks makes
+  repeated point reads sub-microsecond
+- **WAL group commit** — optionally batch fsyncs across writes for much
+  higher write throughput
+- **Background compaction** — compaction can be taken off the write path and
+  run on a dedicated thread
 - **Configurable** — flush/compaction thresholds, level growth, and
   compression are tunable via `StorageConfig`
 - **Benchmarked and tested** — a criterion suite covers the hot paths, and a
@@ -149,6 +158,14 @@ fn main() -> std::io::Result<()> {
     std::thread::spawn(move || handle.get(&b"key".to_vec())).join().unwrap()?;
     let _ = SharedStorage::new("./data3", false)?; // or construct directly
 
+    // Ordered scans (end-exclusive ranges, or by prefix)
+    let _users = shared.scan_prefix(b"user:")?;
+    let _range = shared.scan(b"user:100", b"user:200")?;
+
+    // Background compaction off the write path
+    let compactor = shared.spawn_compactor(std::time::Duration::from_secs(1));
+    drop(compactor); // stops the thread
+
     Ok(())
 }
 ```
@@ -176,6 +193,9 @@ docker run -it lsm-rust
 | `level_multiplier` | 4 | Growth factor of the threshold per level (`base * multiplier^N`) |
 | `level0_file_limit` | 4 | Compact Level 0 at this many files |
 | `compression` | `None` | `Compression::Lz4` enables per-block LZ4 |
+| `wal_sync` | `Always` | `Batched { every_n_writes }` amortizes fsyncs (group commit) |
+| `block_cache_size` | 4 MB | Shared LRU block cache capacity (0 disables) |
+| `inline_compaction` | `true` | Disable to drive compaction via `compact_now()` or `spawn_compactor()` |
 | `verbose` | `false` | Engine progress logging to stdout |
 
 ## Performance
@@ -187,7 +207,7 @@ build, 128-byte values; run `cargo bench` for your own hardware):
 | --- | --- | --- |
 | `put` / `delete` | ~0.9 ms | Dominated by the per-write WAL fsync |
 | `get` (MemTable hit) | ~210 ns | Pure in-memory BTreeMap lookup |
-| `get` (SSTable hit) | ~4 µs | Index binary search + one block read |
+| `get` (SSTable hit) | ~4 µs (~1 µs cached) | Index binary search + one block read |
 | `get` (missing key) | ~400 ns | Bloom filters avoid disk almost always |
 
 Criterion writes HTML reports to `target/criterion/` and compares against
@@ -236,10 +256,13 @@ lsm-rust/
 - [x] Compression support (LZ4)
 - [x] Recovery testing
 - [x] Versioned on-disk format
-- [ ] Range scans / iterators
-- [ ] Background (off-thread) compaction
-- [ ] WAL group commit / batched fsync
-- [ ] Block cache for hot reads
+- [x] Range scans / iterators
+- [x] Background (off-thread) compaction
+- [x] WAL group commit / batched fsync
+- [x] Block cache for hot reads
+- [ ] Snapshot isolation / MVCC
+- [ ] Manifest file for atomic level manifest updates
+- [ ] Network server mode (e.g. RESP or gRPC front end)
 
 ## Community and Contributing
 

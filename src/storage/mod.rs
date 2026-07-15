@@ -1,5 +1,5 @@
 mod shared;
-pub use shared::SharedStorage;
+pub use shared::{CompactorHandle, SharedStorage};
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -54,6 +54,11 @@ pub struct StorageConfig {
     /// Capacity in bytes of the shared block cache for SSTable reads
     /// (0 disables caching).
     pub block_cache_size: usize,
+    /// Run compaction inline on the write path when a flush fills a level
+    /// (default). Disable to drive compaction yourself via
+    /// [`Storage::compact_now`] or a background
+    /// [`SharedStorage::spawn_compactor`] thread.
+    pub inline_compaction: bool,
     /// Print detailed progress information to stdout.
     pub verbose: bool,
 }
@@ -68,6 +73,7 @@ impl Default for StorageConfig {
             compression: Compression::None,
             wal_sync: WalSync::Always,
             block_cache_size: 4 * 1024 * 1024, // 4MB
+            inline_compaction: true,
             verbose: false,
         }
     }
@@ -433,9 +439,28 @@ impl Storage {
         self.memtable = MemTable::new();
         self.wal.clear()?;
 
-        // Check if compaction is needed at level 0
-        self.maybe_compact(0)?;
+        // Check if compaction is needed at level 0, unless compaction has
+        // been taken off the write path
+        if self.config.inline_compaction {
+            self.maybe_compact(0)?;
+        }
 
+        Ok(())
+    }
+
+    /// Run any pending compactions across all levels, regardless of the
+    /// `inline_compaction` setting. Returns once every level is within its
+    /// threshold.
+    pub fn compact_now(&mut self) -> io::Result<()> {
+        let mut level = 0;
+        loop {
+            let max_level = self.sstables.keys().max().copied().unwrap_or(0);
+            if level > max_level {
+                break;
+            }
+            self.maybe_compact(level)?;
+            level += 1;
+        }
         Ok(())
     }
 
@@ -936,6 +961,59 @@ mod tests {
                 "key {}",
                 k
             );
+        }
+    }
+
+    #[test]
+    fn test_deferred_compaction_via_compact_now() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = StorageConfig {
+            memtable_size_threshold: 8 * 1024,
+            inline_compaction: false,
+            ..StorageConfig::default()
+        };
+        let mut storage = Storage::with_config(temp_dir.path(), config).unwrap();
+
+        // Enough flushes that level 0 exceeds its file limit
+        for i in 0..800 {
+            storage
+                .put(format!("key{:04}", i).into_bytes(), vec![b'v'; 64])
+                .unwrap();
+        }
+        let l0_before = fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("L0_")
+            })
+            .count();
+        assert!(
+            l0_before >= 4,
+            "inline compaction disabled: L0 should accumulate files, got {}",
+            l0_before
+        );
+
+        storage.compact_now().unwrap();
+
+        let l0_after = fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("L0_")
+            })
+            .count();
+        assert!(l0_after < 4, "compact_now should drain level 0");
+
+        // All data still readable after manual compaction
+        for i in [0, 400, 799] {
+            let key = format!("key{:04}", i).into_bytes();
+            assert_eq!(storage.get(&key).unwrap(), Some(vec![b'v'; 64]));
         }
     }
 }

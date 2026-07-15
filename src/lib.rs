@@ -36,5 +36,5 @@ pub type Key = Vec<u8>;
 pub type Value = Vec<u8>;
 
 pub use sstable::{BlockCache, Compression};
-pub use storage::{SharedStorage, Storage, StorageConfig};
+pub use storage::{CompactorHandle, SharedStorage, Storage, StorageConfig};
 pub use wal::WalSync;
