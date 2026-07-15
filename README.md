@@ -35,6 +35,11 @@ block compression.
   higher write throughput
 - **Background compaction** — compaction can be taken off the write path and
   run on a dedicated thread
+- **Crash-atomic manifest** — a MANIFEST file is the authoritative record of
+  live SSTables; interrupted flushes and compactions are cleaned up as
+  orphans on the next startup
+- **Redis-protocol server** — `lsm-rust serve` exposes the store over RESP,
+  so `redis-cli` and Redis client libraries work out of the box
 - **Configurable** — flush/compaction thresholds, level growth, and
   compression are tunable via `StorageConfig`
 - **Benchmarked and tested** — a criterion suite covers the hot paths, and a
@@ -173,9 +178,32 @@ fn main() -> std::io::Result<()> {
 ### Demo binary
 
 ```bash
-cargo run --release        # scripted demo: basic ops + compaction run
-cargo run --release -- -v  # with verbose engine logging
+cargo run --release -- demo      # scripted demo: basic ops + compaction run
+cargo run --release -- demo -v   # with verbose engine logging
 ```
+
+### Server mode (Redis protocol)
+
+```bash
+cargo run --release -- serve --addr 127.0.0.1:6379 --data ./data
+```
+
+Then use any Redis client:
+
+```text
+$ redis-cli
+127.0.0.1:6379> SET user:1 "Jane"
+OK
+127.0.0.1:6379> GET user:1
+"Jane"
+127.0.0.1:6379> KEYS user:*
+1) "user:1"
+127.0.0.1:6379> DEL user:1
+(integer) 1
+```
+
+Supported commands: `PING`, `ECHO`, `SET`, `GET`, `DEL`, `EXISTS`,
+`KEYS <prefix>*` (trailing-star globs), `QUIT`.
 
 ### Docker
 
@@ -256,13 +284,15 @@ lsm-rust/
 - [x] Compression support (LZ4)
 - [x] Recovery testing
 - [x] Versioned on-disk format
+- [x] Manifest file for atomic table-set updates
+- [x] Network server mode (RESP / Redis protocol)
 - [x] Range scans / iterators
 - [x] Background (off-thread) compaction
 - [x] WAL group commit / batched fsync
 - [x] Block cache for hot reads
 - [ ] Snapshot isolation / MVCC
-- [ ] Manifest file for atomic level manifest updates
-- [ ] Network server mode (e.g. RESP or gRPC front end)
+- [ ] Write batches (atomic multi-key commits)
+- [ ] Metrics endpoint (Prometheus text format)
 
 ## Community and Contributing
 
