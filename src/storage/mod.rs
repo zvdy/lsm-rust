@@ -1,7 +1,7 @@
 mod shared;
 pub use shared::SharedStorage;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -11,6 +11,21 @@ use crate::memtable::MemTable;
 use crate::sstable::{CompactionManager, Compression, SSTable, SSTableLookup};
 use crate::wal::{Operation, WAL};
 use crate::{Key, Value};
+
+/// Smallest byte string strictly greater than every string with this
+/// prefix, or `None` if no such bound exists (prefix is empty or all 0xFF).
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    while let Some(&last) = end.last() {
+        if last == 0xFF {
+            end.pop();
+        } else {
+            *end.last_mut().unwrap() = last + 1;
+            return Some(end);
+        }
+    }
+    None
+}
 
 static PUT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static TOTAL_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -251,6 +266,46 @@ impl Storage {
             println!("  Key not found");
         }
         Ok(None)
+    }
+
+    /// Return all live key-value pairs with `start <= key < end`, in key
+    /// order. Deleted keys are excluded; the newest value wins when a key
+    /// exists at several levels.
+    pub fn scan(&self, start: &[u8], end: &[u8]) -> io::Result<Vec<(Key, Value)>> {
+        self.scan_impl(start, Some(end))
+    }
+
+    /// Return all live key-value pairs whose key starts with `prefix`,
+    /// in key order.
+    pub fn scan_prefix(&self, prefix: &[u8]) -> io::Result<Vec<(Key, Value)>> {
+        let end = prefix_successor(prefix);
+        self.scan_impl(prefix, end.as_deref())
+    }
+
+    fn scan_impl(&self, start: &[u8], end: Option<&[u8]>) -> io::Result<Vec<(Key, Value)>> {
+        let mut merged: BTreeMap<Key, Option<Value>> = BTreeMap::new();
+
+        // Insert oldest data first so newer entries overwrite it: deeper
+        // levels hold older data, within a level tables are stored oldest to
+        // newest, and the memtable is newest of all.
+        let mut levels: Vec<_> = self.sstables.keys().copied().collect();
+        levels.sort_unstable_by(|a, b| b.cmp(a));
+        for level in levels {
+            for table in &self.sstables[&level] {
+                for (key, value) in table.scan_range(start, end)? {
+                    merged.insert(key, value);
+                }
+            }
+        }
+        for (key, value) in self.memtable.range(start, end) {
+            merged.insert(key.clone(), value.clone());
+        }
+
+        // Tombstones shadow older values, then drop out of the result
+        Ok(merged
+            .into_iter()
+            .filter_map(|(k, v)| v.map(|v| (k, v)))
+            .collect())
     }
 
     /// Insert or update `key` with `value`. The write is durable (recorded
@@ -737,5 +792,71 @@ mod tests {
             Some(format!("value{}", 499).repeat(20).into_bytes())
         );
         assert_eq!(recovered.get(&b"key0100".to_vec()).unwrap(), None);
+    }
+
+    #[test]
+    fn test_prefix_successor() {
+        assert_eq!(prefix_successor(b"abc"), Some(b"abd".to_vec()));
+        assert_eq!(prefix_successor(b"ab\xff"), Some(b"ac".to_vec()));
+        assert_eq!(prefix_successor(b"\xff\xff"), None);
+        assert_eq!(prefix_successor(b""), None);
+    }
+
+    #[test]
+    fn test_scan_across_memtable_and_sstables() {
+        let (_temp_dir, mut storage) = create_test_storage();
+
+        // Older values end up in SSTables...
+        storage.put(b"user:1".to_vec(), b"old1".to_vec()).unwrap();
+        storage.put(b"user:2".to_vec(), b"v2".to_vec()).unwrap();
+        storage.put(b"user:3".to_vec(), b"v3".to_vec()).unwrap();
+        storage.put(b"other:1".to_vec(), b"x".to_vec()).unwrap();
+        force_flush(&mut storage, "scan");
+
+        // ...then get overwritten/deleted in the memtable
+        storage.put(b"user:1".to_vec(), b"new1".to_vec()).unwrap();
+        storage.delete(&b"user:2".to_vec()).unwrap();
+        storage.put(b"user:4".to_vec(), b"v4".to_vec()).unwrap();
+
+        let result = storage.scan_prefix(b"user:").unwrap();
+        assert_eq!(
+            result,
+            vec![
+                (b"user:1".to_vec(), b"new1".to_vec()), // newest value wins
+                (b"user:3".to_vec(), b"v3".to_vec()),
+                (b"user:4".to_vec(), b"v4".to_vec()),
+                // user:2 deleted, other:1 outside the prefix
+            ]
+        );
+
+        // Bounded range: end is exclusive
+        let result = storage.scan(b"user:1", b"user:4").unwrap();
+        let keys: Vec<_> = result.into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, vec![b"user:1".to_vec(), b"user:3".to_vec()]);
+    }
+
+    #[test]
+    fn test_scan_survives_compaction_and_restart() {
+        let (temp_dir, mut storage) = create_test_storage();
+
+        for i in 0..50 {
+            storage
+                .put(format!("k{:03}", i).into_bytes(), vec![b'v'; 64])
+                .unwrap();
+        }
+        storage.delete(&b"k025".to_vec()).unwrap();
+        // Several flushes to spread data over levels and trigger compaction
+        for round in 0..5 {
+            force_flush(&mut storage, &format!("scanr{}", round));
+        }
+
+        drop(storage);
+        let storage = Storage::new(temp_dir.path(), false).unwrap();
+
+        let result = storage.scan(b"k000", b"k050").unwrap();
+        assert_eq!(result.len(), 49); // 50 keys minus the deleted one
+        assert!(result.iter().all(|(k, _)| k.as_slice() != b"k025"));
+        // Sorted by key
+        assert!(result.windows(2).all(|w| w[0].0 < w[1].0));
     }
 }

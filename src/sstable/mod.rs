@@ -389,6 +389,51 @@ impl SSTable {
         }
     }
 
+    /// Return all entries (including tombstones) with `start <= key < end`
+    /// in key order. `end = None` means unbounded above. On the versioned
+    /// format only the blocks that can intersect the range are read.
+    pub fn scan_range(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> io::Result<Vec<(Key, Option<Value>)>> {
+        let in_range = |k: &[u8]| k >= start && end.is_none_or(|e| k < e);
+        match &self.layout {
+            Layout::Empty => Ok(Vec::new()),
+            Layout::Legacy { data_start } => {
+                let buffer = self.read_to_end_from(*data_start)?;
+                Ok(parse_entries(&buffer)?
+                    .into_iter()
+                    .filter(|(k, _)| in_range(k))
+                    .collect())
+            }
+            Layout::V2 {
+                data_start,
+                index,
+                compression,
+            } => {
+                // Blocks before the candidate hold only keys < start; blocks
+                // whose first key is >= end hold only keys past the range.
+                let first = index
+                    .partition_point(|e| e.first_key.as_slice() <= start)
+                    .saturating_sub(1);
+                let mut out = Vec::new();
+                for entry in &index[first..] {
+                    if end.is_some_and(|e| entry.first_key.as_slice() >= e) {
+                        break;
+                    }
+                    let block = self.read_block(*data_start, entry, *compression)?;
+                    for (k, v) in parse_entries(&block)? {
+                        if in_range(&k) {
+                            out.push((k, v));
+                        }
+                    }
+                }
+                Ok(out)
+            }
+        }
+    }
+
     pub fn might_contain_key(&self, key: &[u8]) -> bool {
         if let Some(filter) = &self.bloom_filter {
             filter.might_contain(key)
@@ -823,5 +868,49 @@ mod tests {
             packed.size(),
             plain.size()
         );
+    }
+
+    #[test]
+    fn test_scan_range_multi_block() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("scan.sst");
+        let mut table = SSTable::new(path).unwrap();
+
+        // 100 entries spanning several blocks; one tombstone inside the range
+        let data: Vec<_> = (0..100)
+            .map(|i| {
+                (
+                    format!("key{:04}", i).into_bytes(),
+                    if i == 42 {
+                        None
+                    } else {
+                        Some(format!("value{}", i).into_bytes())
+                    },
+                )
+            })
+            .collect();
+        table.write(&data).unwrap();
+
+        // Mid-range scan crossing block boundaries
+        let hits = table.scan_range(b"key0040", Some(b"key0045")).unwrap();
+        let keys: Vec<_> = hits.iter().map(|(k, _)| k.clone()).collect();
+        assert_eq!(
+            keys,
+            (40..45)
+                .map(|i| format!("key{:04}", i).into_bytes())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(hits[2].1, None); // the tombstone is reported
+
+        // Unbounded above
+        let tail = table.scan_range(b"key0098", None).unwrap();
+        assert_eq!(tail.len(), 2);
+
+        // Before the first key and after the last key
+        assert_eq!(table.scan_range(b"a", Some(b"key0000")).unwrap().len(), 0);
+        assert_eq!(table.scan_range(b"z", None).unwrap().len(), 0);
+
+        // Whole-table scan matches read()
+        assert_eq!(table.scan_range(b"", None).unwrap(), data);
     }
 }
