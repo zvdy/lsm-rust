@@ -35,8 +35,14 @@ pub mod wal;
 pub type Key = Vec<u8>;
 /// Values are arbitrary byte strings.
 pub type Value = Vec<u8>;
+/// A monotonically increasing sequence number identifying a write version.
+///
+/// Every put and delete is tagged with a unique, increasing `Seq`. A
+/// [`Snapshot`] captures one and reads only versions at or below it, which is
+/// what gives the store snapshot isolation.
+pub type Seq = u64;
 
 pub use server::RespServer;
 pub use sstable::{BlockCache, Compression};
-pub use storage::{CompactorHandle, SharedStorage, Storage, StorageConfig};
+pub use storage::{CompactorHandle, SharedStorage, Snapshot, Storage, StorageConfig};
 pub use wal::WalSync;

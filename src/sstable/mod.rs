@@ -1,5 +1,5 @@
 use crate::bloom::BloomFilter;
-use crate::{Key, Value};
+use crate::{Key, Seq, Value};
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -21,11 +21,18 @@ const TOMBSTONE_MARKER: u32 = u32::MAX;
 const MAGIC: &[u8; 4] = b"LSMT";
 /// Header flag bit: data blocks are LZ4-compressed.
 const FLAG_LZ4: u8 = 0b0000_0001;
-/// Current on-disk format version.
-const FORMAT_VERSION: u8 = 2;
-/// Number of entries per data block; the sparse index holds one entry per
-/// block, so lookups read at most one block of this many entries.
+/// Current on-disk format version. v3 stores a sequence number per entry
+/// (MVCC). v2 is the same layout without the per-entry sequence; it is still
+/// read (all entries treated as sequence 0).
+const FORMAT_VERSION: u8 = 3;
+/// Soft target for the number of entries per data block. A block is never
+/// split in the middle of a key's versions, so all versions of a key are
+/// always in one block and a point lookup reads a single block.
 const BLOCK_ENTRY_COUNT: usize = 16;
+
+/// A single stored version: key, its sequence number, and either a value or
+/// a tombstone (`None`).
+pub type VersionedEntry = (Key, Seq, Option<Value>);
 
 /// Block compression applied to SSTable data blocks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -37,14 +44,14 @@ pub enum Compression {
     Lz4,
 }
 
-/// Result of looking up a key in an SSTable.
+/// Result of looking up a key in an SSTable at some snapshot.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SSTableLookup {
     /// The key exists with this value.
     Found(Value),
     /// The key was deleted; a tombstone shadows any older value.
     Deleted,
-    /// The key is not present in this SSTable.
+    /// The key is not present in this SSTable (at the requested snapshot).
     NotFound,
 }
 
@@ -60,15 +67,19 @@ struct IndexEntry {
 enum Layout {
     /// No data written yet.
     Empty,
-    /// Pre-versioned format: `[bloom_len][bloom][flat entries...]`.
-    /// Lookups fall back to a linear scan of the whole data section.
+    /// Pre-versioned format: `[bloom_len][bloom][flat entries...]` with no
+    /// sequence numbers. Lookups fall back to a linear scan; entries are
+    /// treated as sequence 0.
     Legacy { data_start: u64 },
-    /// Versioned format (v2): header + bloom + sparse index + data blocks.
-    /// Lookups binary-search the index and read a single block.
-    V2 {
+    /// Versioned format: header + bloom + sparse index + data blocks.
+    /// `has_seq` distinguishes v3 (per-entry sequence) from v2 (no sequence,
+    /// treated as sequence 0). Lookups binary-search the index and read a
+    /// single block.
+    Versioned {
         data_start: u64,
         index: Vec<IndexEntry>,
         compression: Compression,
+        has_seq: bool,
     },
 }
 
@@ -95,7 +106,7 @@ fn read_u64(buffer: &[u8], pos: usize) -> io::Result<u64> {
     buffer
         .get(pos..pos + 8)
         .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
-        .ok_or_else(|| invalid_data("SSTable truncated: expected 8-byte offset"))
+        .ok_or_else(|| invalid_data("SSTable truncated: expected 8-byte field"))
 }
 
 fn read_slice(buffer: &[u8], pos: usize, len: usize) -> io::Result<&[u8]> {
@@ -104,9 +115,10 @@ fn read_slice(buffer: &[u8], pos: usize, len: usize) -> io::Result<&[u8]> {
         .ok_or_else(|| invalid_data("SSTable truncated: entry data out of bounds"))
 }
 
-/// Parse a flat sequence of `[key_len][key][value_len_or_tombstone][value?]`
-/// entries covering the whole buffer.
-fn parse_entries(buffer: &[u8]) -> io::Result<Vec<(Key, Option<Value>)>> {
+/// Parse a flat sequence of entries covering the whole buffer. When
+/// `has_seq` is false the format carries no sequence number and every entry
+/// is assigned sequence 0 (legacy / v2 data, which predates MVCC).
+fn parse_entries(buffer: &[u8], has_seq: bool) -> io::Result<Vec<VersionedEntry>> {
     let mut data = Vec::new();
     let mut pos = 0;
     while pos < buffer.len() {
@@ -114,6 +126,14 @@ fn parse_entries(buffer: &[u8]) -> io::Result<Vec<(Key, Option<Value>)>> {
         pos += 4;
         let key = read_slice(buffer, pos, key_size)?.to_vec();
         pos += key_size;
+
+        let seq = if has_seq {
+            let s = read_u64(buffer, pos)?;
+            pos += 8;
+            s
+        } else {
+            0
+        };
 
         let value_size = read_u32(buffer, pos)?;
         pos += 4;
@@ -125,16 +145,18 @@ fn parse_entries(buffer: &[u8]) -> io::Result<Vec<(Key, Option<Value>)>> {
             Some(value)
         };
 
-        data.push((key, value));
+        data.push((key, seq, value));
     }
     Ok(data)
 }
 
-/// Encode entries in the flat on-disk entry format.
-fn encode_entries(data: &[(Key, Option<Value>)], out: &mut Vec<u8>) {
-    for (key, value) in data {
+/// Encode versioned entries in the flat on-disk entry format (v3, with
+/// sequence numbers).
+fn encode_entries(data: &[VersionedEntry], out: &mut Vec<u8>) {
+    for (key, seq, value) in data {
         out.extend_from_slice(&(key.len() as u32).to_le_bytes());
         out.extend_from_slice(key);
+        out.extend_from_slice(&seq.to_le_bytes());
         match value {
             Some(value) => {
                 out.extend_from_slice(&(value.len() as u32).to_le_bytes());
@@ -195,9 +217,11 @@ impl SSTable {
             let mut version_flags = [0u8; 2];
             file.read_exact(&mut version_flags)?;
             let version = version_flags[0];
-            if version != FORMAT_VERSION {
-                return Err(invalid_data("unsupported SSTable format version"));
-            }
+            let has_seq = match version {
+                2 => false,
+                3 => true,
+                _ => return Err(invalid_data("unsupported SSTable format version")),
+            };
             let compression = if version_flags[1] & FLAG_LZ4 != 0 {
                 Compression::Lz4
             } else {
@@ -222,10 +246,11 @@ impl SSTable {
             let data_start = file.stream_position()?;
             Ok((
                 bloom,
-                Layout::V2 {
+                Layout::Versioned {
                     data_start,
                     index,
                     compression,
+                    has_seq,
                 },
             ))
         } else {
@@ -273,17 +298,33 @@ impl SSTable {
         bytes
     }
 
-    /// Write sorted entries uncompressed. See [`SSTable::write_with`].
+    /// Write single-version entries (sequence 0) uncompressed. Convenience
+    /// for callers that don't track sequence numbers (and tests).
     pub fn write(&mut self, data: &[(Key, Option<Value>)]) -> io::Result<()> {
         self.write_with(data, Compression::None)
     }
 
-    /// Write sorted entries to this SSTable in the versioned block format,
-    /// compressing each data block with the given algorithm.
-    /// An entry value of `None` is a tombstone recording a deletion.
+    /// Write single-version entries (sequence 0) with the given compression.
     pub fn write_with(
         &mut self,
         data: &[(Key, Option<Value>)],
+        compression: Compression,
+    ) -> io::Result<()> {
+        let versioned: Vec<VersionedEntry> = data
+            .iter()
+            .map(|(k, v)| (k.clone(), 0, v.clone()))
+            .collect();
+        self.write_versioned(&versioned, compression)
+    }
+
+    /// Write versioned entries to this SSTable in the v3 block format.
+    ///
+    /// `data` must be sorted by `(key ascending, seq descending)`; all
+    /// versions of a key must be contiguous. Blocks are cut on key
+    /// boundaries so a key's versions never span two blocks.
+    pub fn write_versioned(
+        &mut self,
+        data: &[VersionedEntry],
         compression: Compression,
     ) -> io::Result<()> {
         // Build the bloom filter over all keys (including tombstones, so
@@ -292,15 +333,25 @@ impl SSTable {
             data.len().max(EXPECTED_ENTRIES_PER_SSTABLE),
             BLOOM_FALSE_POSITIVE_RATE,
         );
-        for (key, _) in data {
+        for (key, _, _) in data {
             bloom.insert(key.as_slice());
         }
 
-        // Build data blocks and the sparse index over them
+        // Build key-aligned data blocks and the sparse index over them
         let mut data_section = Vec::new();
         let mut index = Vec::new();
         let mut block_buf = Vec::new();
-        for chunk in data.chunks(BLOCK_ENTRY_COUNT) {
+        let mut i = 0;
+        while i < data.len() {
+            let start = i;
+            i += 1;
+            // Extend the block until it reaches the target size, but never
+            // stop in the middle of a key's run of versions.
+            while i < data.len() && (i - start < BLOCK_ENTRY_COUNT || data[i].0 == data[i - 1].0) {
+                i += 1;
+            }
+            let chunk = &data[start..i];
+
             block_buf.clear();
             encode_entries(chunk, &mut block_buf);
             let offset = data_section.len() as u64;
@@ -343,10 +394,11 @@ impl SSTable {
 
         self.size = (data_start + data_section.len() as u64) as usize;
         self.bloom_filter = Some(bloom);
-        self.layout = Layout::V2 {
+        self.layout = Layout::Versioned {
             data_start,
             index,
             compression,
+            has_seq: true,
         };
         Ok(())
     }
@@ -396,51 +448,63 @@ impl SSTable {
         Ok(buffer)
     }
 
-    /// Read all entries (including tombstones) from this SSTable.
-    pub fn read(&self) -> io::Result<Vec<(Key, Option<Value>)>> {
+    /// Read every stored version (including tombstones) from this SSTable.
+    pub fn read_versioned(&self) -> io::Result<Vec<VersionedEntry>> {
         match &self.layout {
             Layout::Empty => Ok(Vec::new()),
             Layout::Legacy { data_start } => {
                 let buffer = self.read_to_end_from(*data_start)?;
-                parse_entries(&buffer)
+                parse_entries(&buffer, false)
             }
-            Layout::V2 {
+            Layout::Versioned {
                 data_start,
                 index,
                 compression,
+                has_seq,
             } => {
                 let mut data = Vec::new();
                 for entry in index {
                     let block = self.read_block(*data_start, entry, *compression)?;
-                    data.extend(parse_entries(&block)?);
+                    data.extend(parse_entries(&block, *has_seq)?);
                 }
                 Ok(data)
             }
         }
     }
 
-    /// Return all entries (including tombstones) with `start <= key < end`
-    /// in key order. `end = None` means unbounded above. On the versioned
-    /// format only the blocks that can intersect the range are read.
-    pub fn scan_range(
+    /// Read all entries as `(key, value_or_tombstone)`, dropping sequence
+    /// numbers. Convenience for single-version callers and tests.
+    pub fn read(&self) -> io::Result<Vec<(Key, Option<Value>)>> {
+        Ok(self
+            .read_versioned()?
+            .into_iter()
+            .map(|(k, _seq, v)| (k, v))
+            .collect())
+    }
+
+    /// Return every version whose key is in `[start, end)`, in
+    /// `(key asc, seq desc)` order. `end = None` means unbounded above. Only
+    /// the blocks that can intersect the range are read.
+    pub fn scan_range_versioned(
         &self,
         start: &[u8],
         end: Option<&[u8]>,
-    ) -> io::Result<Vec<(Key, Option<Value>)>> {
+    ) -> io::Result<Vec<VersionedEntry>> {
         let in_range = |k: &[u8]| k >= start && end.is_none_or(|e| k < e);
         match &self.layout {
             Layout::Empty => Ok(Vec::new()),
             Layout::Legacy { data_start } => {
                 let buffer = self.read_to_end_from(*data_start)?;
-                Ok(parse_entries(&buffer)?
+                Ok(parse_entries(&buffer, false)?
                     .into_iter()
-                    .filter(|(k, _)| in_range(k))
+                    .filter(|(k, _, _)| in_range(k))
                     .collect())
             }
-            Layout::V2 {
+            Layout::Versioned {
                 data_start,
                 index,
                 compression,
+                has_seq,
             } => {
                 // Blocks before the candidate hold only keys < start; blocks
                 // whose first key is >= end hold only keys past the range.
@@ -453,15 +517,35 @@ impl SSTable {
                         break;
                     }
                     let block = self.read_block(*data_start, entry, *compression)?;
-                    for (k, v) in parse_entries(&block)? {
+                    for (k, seq, v) in parse_entries(&block, *has_seq)? {
                         if in_range(&k) {
-                            out.push((k, v));
+                            out.push((k, seq, v));
                         }
                     }
                 }
                 Ok(out)
             }
         }
+    }
+
+    /// Return the newest value per key in `[start, end)`, dropping sequence
+    /// numbers and older versions. Convenience for single-version callers
+    /// and tests.
+    pub fn scan_range(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> io::Result<Vec<(Key, Option<Value>)>> {
+        let mut out: Vec<(Key, Option<Value>)> = Vec::new();
+        for (k, _seq, v) in self.scan_range_versioned(start, end)? {
+            // Versions are (key asc, seq desc): the first entry seen for a
+            // key is its newest version.
+            if out.last().is_some_and(|(lk, _)| *lk == k) {
+                continue;
+            }
+            out.push((k, v));
+        }
+        Ok(out)
     }
 
     pub fn might_contain_key(&self, key: &[u8]) -> bool {
@@ -473,12 +557,10 @@ impl SSTable {
         }
     }
 
-    /// Look up a key in this SSTable, distinguishing "deleted here" from
-    /// "not present here" so that tombstones shadow older SSTables.
-    ///
-    /// On the versioned format this binary-searches the sparse index and
-    /// reads a single data block instead of scanning the whole file.
-    pub fn get(&self, key: &[u8]) -> io::Result<SSTableLookup> {
+    /// Look up the newest version of `key` visible at `snapshot_seq`,
+    /// distinguishing "deleted here" from "not present here" so that
+    /// tombstones shadow older SSTables.
+    pub fn get_at(&self, key: &[u8], snapshot_seq: Seq) -> io::Result<SSTableLookup> {
         // First check the bloom filter
         if let Some(filter) = &self.bloom_filter {
             if !filter.might_contain(key) {
@@ -490,12 +572,13 @@ impl SSTable {
             Layout::Empty => Ok(SSTableLookup::NotFound),
             Layout::Legacy { data_start } => {
                 let buffer = self.read_to_end_from(*data_start)?;
-                Self::scan_entries(&buffer, key, false)
+                Self::scan_entries_at(&buffer, key, snapshot_seq, false, false)
             }
-            Layout::V2 {
+            Layout::Versioned {
                 data_start,
                 index,
                 compression,
+                has_seq,
             } => {
                 // The candidate block is the last one whose first key is
                 // <= the target; earlier blocks only hold smaller keys.
@@ -505,14 +588,28 @@ impl SSTable {
                 }
                 let entry = &index[candidate - 1];
                 let block = self.read_block(*data_start, entry, *compression)?;
-                Self::scan_entries(&block, key, true)
+                Self::scan_entries_at(&block, key, snapshot_seq, true, *has_seq)
             }
         }
     }
 
-    /// Linear scan of a flat entry buffer for `key`. When `sorted` is set,
-    /// the scan stops early once it passes where the key would be.
-    fn scan_entries(buffer: &[u8], key: &[u8], sorted: bool) -> io::Result<SSTableLookup> {
+    /// Look up the latest version of `key` (highest sequence).
+    pub fn get(&self, key: &[u8]) -> io::Result<SSTableLookup> {
+        self.get_at(key, Seq::MAX)
+    }
+
+    /// Scan a flat entry buffer for the newest version of `key` with
+    /// sequence `<= snapshot_seq`. Entries are ordered `(key asc, seq desc)`,
+    /// so the first matching version at or below the snapshot is the answer.
+    /// When `sorted` is set, the scan stops once it passes where the key
+    /// would be.
+    fn scan_entries_at(
+        buffer: &[u8],
+        key: &[u8],
+        snapshot_seq: Seq,
+        sorted: bool,
+        has_seq: bool,
+    ) -> io::Result<SSTableLookup> {
         let mut pos = 0;
         while pos < buffer.len() {
             let key_size = read_u32(buffer, pos)? as usize;
@@ -520,18 +617,29 @@ impl SSTable {
             let current_key = read_slice(buffer, pos, key_size)?;
             pos += key_size;
 
+            let seq = if has_seq {
+                let s = read_u64(buffer, pos)?;
+                pos += 8;
+                s
+            } else {
+                0
+            };
+
             let value_size = read_u32(buffer, pos)?;
             pos += 4;
 
             if current_key == key {
-                if value_size == TOMBSTONE_MARKER {
-                    return Ok(SSTableLookup::Deleted);
+                if seq <= snapshot_seq {
+                    // Newest version visible to this snapshot
+                    if value_size == TOMBSTONE_MARKER {
+                        return Ok(SSTableLookup::Deleted);
+                    }
+                    let value = read_slice(buffer, pos, value_size as usize)?.to_vec();
+                    return Ok(SSTableLookup::Found(value));
                 }
-                let value = read_slice(buffer, pos, value_size as usize)?.to_vec();
-                return Ok(SSTableLookup::Found(value));
-            }
-
-            if sorted && current_key > key {
+                // Version is too new for this snapshot; keep looking at
+                // older versions of the same key (they come next).
+            } else if sorted && current_key > key {
                 return Ok(SSTableLookup::NotFound);
             }
 
@@ -723,6 +831,97 @@ mod tests {
     }
 
     #[test]
+    fn test_mvcc_versions_and_snapshot_reads() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("mvcc.sst");
+        let mut table = SSTable::new(path.clone()).unwrap();
+
+        // Three versions of "k" plus a deleted "gone", sorted key asc, seq desc
+        let data: Vec<VersionedEntry> = vec![
+            (b"gone".to_vec(), 7, None),
+            (b"k".to_vec(), 9, Some(b"v9".to_vec())),
+            (b"k".to_vec(), 5, Some(b"v5".to_vec())),
+            (b"k".to_vec(), 1, Some(b"v1".to_vec())),
+        ];
+        table.write_versioned(&data, Compression::None).unwrap();
+
+        // Snapshot reads pick the newest version at or below the snapshot seq
+        assert_eq!(table.get_at(b"k", 0).unwrap(), SSTableLookup::NotFound);
+        assert_eq!(
+            table.get_at(b"k", 1).unwrap(),
+            SSTableLookup::Found(b"v1".to_vec())
+        );
+        assert_eq!(
+            table.get_at(b"k", 4).unwrap(),
+            SSTableLookup::Found(b"v1".to_vec())
+        );
+        assert_eq!(
+            table.get_at(b"k", 6).unwrap(),
+            SSTableLookup::Found(b"v5".to_vec())
+        );
+        assert_eq!(
+            table.get_at(b"k", 100).unwrap(),
+            SSTableLookup::Found(b"v9".to_vec())
+        );
+        assert_eq!(
+            table.get(b"k").unwrap(),
+            SSTableLookup::Found(b"v9".to_vec())
+        );
+
+        // Tombstone visibility follows the snapshot too
+        assert_eq!(table.get_at(b"gone", 6).unwrap(), SSTableLookup::NotFound);
+        assert_eq!(table.get_at(b"gone", 7).unwrap(), SSTableLookup::Deleted);
+
+        // Round-trips through disk
+        let reopened = SSTable::new(path).unwrap();
+        assert_eq!(reopened.read_versioned().unwrap(), data);
+        assert_eq!(
+            reopened.get_at(b"k", 5).unwrap(),
+            SSTableLookup::Found(b"v5".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_many_versions_span_block_boundary() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("versions.sst");
+        let mut table = SSTable::new(path).unwrap();
+
+        // One key with far more than BLOCK_ENTRY_COUNT versions: they must
+        // stay in a single block so get_at still reads one block.
+        let mut data: Vec<VersionedEntry> = (1..=50)
+            .rev()
+            .map(|s| {
+                (
+                    b"hot".to_vec(),
+                    s as Seq,
+                    Some(format!("v{}", s).into_bytes()),
+                )
+            })
+            .collect();
+        // Plus neighbouring keys to force multiple blocks around it
+        for i in 0..40 {
+            data.push((format!("z{:03}", i).into_bytes(), 100, Some(b"z".to_vec())));
+        }
+        data.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+
+        table.write_versioned(&data, Compression::Lz4).unwrap();
+
+        assert_eq!(
+            table.get_at(b"hot", 25).unwrap(),
+            SSTableLookup::Found(b"v25".to_vec())
+        );
+        assert_eq!(
+            table.get_at(b"hot", 50).unwrap(),
+            SSTableLookup::Found(b"v50".to_vec())
+        );
+        assert_eq!(
+            table.get_at(b"z039", 100).unwrap(),
+            SSTableLookup::Found(b"z".to_vec())
+        );
+    }
+
+    #[test]
     fn test_corrupt_file_returns_error() {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("corrupt.sst");
@@ -802,7 +1001,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("legacy.sst");
 
-        // Hand-craft a legacy (pre-versioned) file:
+        // Hand-craft a legacy (pre-versioned) file with no sequence numbers:
         // [bloom_len][bloom][key_len][key][value_len][value]...
         let mut bloom = BloomFilter::new(EXPECTED_ENTRIES_PER_SSTABLE, BLOOM_FALSE_POSITIVE_RATE);
         bloom.insert(b"old_key".as_slice());
@@ -812,13 +1011,21 @@ mod tests {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&(bloom_bytes.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&bloom_bytes);
-        encode_entries(
-            &[
-                (b"gone_key".to_vec(), None),
-                (b"old_key".to_vec(), Some(b"old_value".to_vec())),
-            ],
-            &mut bytes,
-        );
+        // Legacy entry encoding (no seq field)
+        for (key, value) in [
+            (b"gone_key".to_vec(), None::<Vec<u8>>),
+            (b"old_key".to_vec(), Some(b"old_value".to_vec())),
+        ] {
+            bytes.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&key);
+            match value {
+                Some(v) => {
+                    bytes.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                    bytes.extend_from_slice(&v);
+                }
+                None => bytes.extend_from_slice(&TOMBSTONE_MARKER.to_le_bytes()),
+            }
+        }
         fs::write(&path, &bytes).unwrap();
 
         // The legacy file is readable without the versioned header

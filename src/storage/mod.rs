@@ -1,7 +1,10 @@
 mod manifest;
 mod shared;
+mod snapshot;
 use manifest::{Manifest, ManifestEntry};
 pub use shared::{CompactorHandle, SharedStorage};
+pub use snapshot::Snapshot;
+use snapshot::SnapshotRegistry;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -13,7 +16,7 @@ use std::sync::Arc;
 use crate::memtable::MemTable;
 use crate::sstable::{BlockCache, CompactionManager, Compression, SSTable, SSTableLookup};
 use crate::wal::{Operation, WalSync, WAL};
-use crate::{Key, Value};
+use crate::{Key, Seq, Value};
 
 /// Smallest byte string strictly greater than every string with this
 /// prefix, or `None` if no such bound exists (prefix is empty or all 0xFF).
@@ -101,6 +104,10 @@ pub struct Storage {
     sstables: HashMap<usize, Vec<SSTable>>, // level -> SSTables
     data_dir: PathBuf,
     sstable_counter: u64,
+    /// Highest MVCC sequence number assigned so far. The next write uses
+    /// `seq_counter + 1`; a read or snapshot at "now" sees seqs `<= seq_counter`.
+    seq_counter: Seq,
+    snapshots: Arc<SnapshotRegistry>,
     compaction_manager: CompactionManager,
     block_cache: Option<Arc<BlockCache>>,
     manifest: Manifest,
@@ -133,40 +140,19 @@ impl Storage {
         let block_cache = (config.block_cache_size > 0)
             .then(|| Arc::new(BlockCache::new(config.block_cache_size)));
 
-        let wal_path = data_dir.as_ref().join("wal");
-        let mut wal = WAL::with_sync(wal_path, config.wal_sync)?;
-        let mut memtable = MemTable::new();
-
-        // Replay WAL if it exists
-        let mut replay_count = 0;
-        for (op, key, value) in wal.replay()? {
-            match op {
-                Operation::Put => {
-                    if let Some(value) = value {
-                        memtable.insert(key, value);
-                        replay_count += 1;
-                    }
-                }
-                Operation::Delete => {
-                    memtable.delete(key);
-                    replay_count += 1;
-                }
-            }
-        }
-        if verbose && replay_count > 0 {
-            println!("Replayed {} operations from WAL", replay_count);
-        }
-
         // Load existing SSTables. The manifest is the authoritative record
-        // of which tables are live; without one (legacy data directory) we
-        // fall back to scanning the directory.
+        // of which tables are live and how far the MVCC sequence counter has
+        // advanced; without one (legacy data directory) we fall back to
+        // scanning the directory and start sequences from zero.
         let manifest = Manifest::new(data_dir.as_ref());
         let had_manifest = manifest.exists();
 
         let mut found: Vec<(usize, u64, PathBuf)> = Vec::new();
+        let mut seq_counter: Seq = 0;
         match manifest.load()? {
-            Some(entries) => {
-                for entry in entries {
+            Some(state) => {
+                seq_counter = state.last_seq;
+                for entry in state.entries {
                     found.push((
                         entry.level,
                         entry.seq,
@@ -200,6 +186,34 @@ impl Storage {
                     }
                 }
             }
+        }
+
+        let wal_path = data_dir.as_ref().join("wal");
+        let mut wal = WAL::with_sync(wal_path, config.wal_sync)?;
+        let mut memtable = MemTable::new();
+
+        // Replay the WAL, assigning fresh sequence numbers continuing from the
+        // manifest's high-water mark. The WAL preserves write order, so the
+        // replayed sequences match what the entries held before the crash and
+        // land above every sequence in the loaded SSTables.
+        let mut replay_count = 0;
+        for (op, key, value) in wal.replay()? {
+            seq_counter += 1;
+            match op {
+                Operation::Put => {
+                    if let Some(value) = value {
+                        memtable.insert(key, seq_counter, value);
+                        replay_count += 1;
+                    }
+                }
+                Operation::Delete => {
+                    memtable.delete(key, seq_counter);
+                    replay_count += 1;
+                }
+            }
+        }
+        if verbose && replay_count > 0 {
+            println!("Replayed {} operations from WAL", replay_count);
         }
 
         // Within a level, tables must be ordered oldest to newest so that
@@ -249,6 +263,8 @@ impl Storage {
             sstables,
             data_dir: data_dir.as_ref().to_path_buf(),
             sstable_counter: counter,
+            seq_counter,
+            snapshots: Arc::new(SnapshotRegistry::default()),
             compaction_manager,
             block_cache,
             manifest,
@@ -281,78 +297,68 @@ impl Storage {
             }
         }
         entries.sort_by_key(|e| (e.level, e.seq));
-        self.manifest.write(&entries)
+        self.manifest.write(&entries, self.seq_counter)
+    }
+
+    /// Take a snapshot: a consistent, read-only view of the store as of now.
+    ///
+    /// Reads through the returned [`Snapshot`] (via [`Storage::get_at`] /
+    /// [`Storage::scan_at`]) see only writes that had committed when it was
+    /// taken. Holding it pins the versions it needs against compaction, so
+    /// drop it when done.
+    pub fn snapshot(&self) -> Snapshot {
+        self.snapshots.acquire(self.seq_counter)
     }
 
     /// Look up the current value for `key`, or `None` if the key does not
     /// exist or has been deleted.
     pub fn get(&self, key: &Key) -> io::Result<Option<Value>> {
+        self.get_at_seq(key, self.seq_counter)
+    }
+
+    /// Look up `key` as seen by `snapshot`, ignoring any writes that
+    /// committed after the snapshot was taken.
+    pub fn get_at(&self, snapshot: &Snapshot, key: &Key) -> io::Result<Option<Value>> {
+        self.get_at_seq(key, snapshot.sequence())
+    }
+
+    /// Read the newest version of `key` with sequence `<= snapshot_seq`.
+    ///
+    /// Correctness relies on an invariant of the LSM layout: for a given key,
+    /// a higher sequence number always lives in a newer (shallower) table, so
+    /// scanning newest-to-oldest and returning at the first visible version
+    /// yields the newest version the snapshot can see.
+    fn get_at_seq(&self, key: &Key, snapshot_seq: Seq) -> io::Result<Option<Value>> {
         if self.config.verbose {
-            println!("GET {:?}", String::from_utf8_lossy(key));
+            println!("GET {:?} @ {}", String::from_utf8_lossy(key), snapshot_seq);
         }
 
-        // First check memtable; a tombstone there means the key was deleted
-        // and must shadow any older value in the SSTables
-        match self.memtable.get(key) {
-            Some(Some(value)) => {
-                if self.config.verbose {
-                    println!("  Found in memtable");
-                }
-                return Ok(Some(value.clone()));
-            }
-            Some(None) => {
-                if self.config.verbose {
-                    println!("  Deleted (tombstone in memtable)");
-                }
-                return Ok(None);
-            }
+        // First check the memtable; a tombstone visible to the snapshot means
+        // the key was deleted and must shadow any older value in the SSTables
+        match self.memtable.get_at(key, snapshot_seq) {
+            Some(Some(value)) => return Ok(Some(value.clone())),
+            Some(None) => return Ok(None),
             None => {}
         }
 
         // Then check SSTables from newest to oldest, level by level
         for level in 0..=self.sstables.keys().max().copied().unwrap_or(0) {
             if let Some(tables) = self.sstables.get(&level) {
-                if self.config.verbose {
-                    println!("  Searching level {} ({} files)", level, tables.len());
-                }
-                for (idx, sstable) in tables.iter().rev().enumerate() {
+                for sstable in tables.iter().rev() {
                     // Use bloom filter to avoid unnecessary disk reads
                     if !sstable.might_contain_key(key) {
-                        if self.config.verbose {
-                            println!(
-                                "  Skipped SSTable {} at level {} (Bloom filter negative)",
-                                idx, level
-                            );
-                        }
                         continue;
                     }
 
-                    // Key might be in this SSTable, do a full check
-                    match sstable.get(key)? {
-                        SSTableLookup::Found(value) => {
-                            if self.config.verbose {
-                                println!("  Found in SSTable {} at level {}", idx, level);
-                            }
-                            return Ok(Some(value));
-                        }
-                        SSTableLookup::Deleted => {
-                            if self.config.verbose {
-                                println!(
-                                    "  Deleted (tombstone in SSTable {} at level {})",
-                                    idx, level
-                                );
-                            }
-                            return Ok(None);
-                        }
+                    match sstable.get_at(key, snapshot_seq)? {
+                        SSTableLookup::Found(value) => return Ok(Some(value)),
+                        SSTableLookup::Deleted => return Ok(None),
                         SSTableLookup::NotFound => {}
                     }
                 }
             }
         }
 
-        if self.config.verbose {
-            println!("  Key not found");
-        }
         Ok(None)
     }
 
@@ -360,39 +366,72 @@ impl Storage {
     /// order. Deleted keys are excluded; the newest value wins when a key
     /// exists at several levels.
     pub fn scan(&self, start: &[u8], end: &[u8]) -> io::Result<Vec<(Key, Value)>> {
-        self.scan_impl(start, Some(end))
+        self.scan_at_seq(start, Some(end), self.seq_counter)
     }
 
     /// Return all live key-value pairs whose key starts with `prefix`,
     /// in key order.
     pub fn scan_prefix(&self, prefix: &[u8]) -> io::Result<Vec<(Key, Value)>> {
         let end = prefix_successor(prefix);
-        self.scan_impl(prefix, end.as_deref())
+        self.scan_at_seq(prefix, end.as_deref(), self.seq_counter)
     }
 
-    fn scan_impl(&self, start: &[u8], end: Option<&[u8]>) -> io::Result<Vec<(Key, Value)>> {
-        let mut merged: BTreeMap<Key, Option<Value>> = BTreeMap::new();
+    /// Range scan as seen by `snapshot`.
+    pub fn scan_at(
+        &self,
+        snapshot: &Snapshot,
+        start: &[u8],
+        end: &[u8],
+    ) -> io::Result<Vec<(Key, Value)>> {
+        self.scan_at_seq(start, Some(end), snapshot.sequence())
+    }
 
-        // Insert oldest data first so newer entries overwrite it: deeper
-        // levels hold older data, within a level tables are stored oldest to
-        // newest, and the memtable is newest of all.
-        let mut levels: Vec<_> = self.sstables.keys().copied().collect();
-        levels.sort_unstable_by(|a, b| b.cmp(a));
-        for level in levels {
-            for table in &self.sstables[&level] {
-                for (key, value) in table.scan_range(start, end)? {
-                    merged.insert(key, value);
+    /// Prefix scan as seen by `snapshot`.
+    pub fn scan_prefix_at(
+        &self,
+        snapshot: &Snapshot,
+        prefix: &[u8],
+    ) -> io::Result<Vec<(Key, Value)>> {
+        let end = prefix_successor(prefix);
+        self.scan_at_seq(prefix, end.as_deref(), snapshot.sequence())
+    }
+
+    fn scan_at_seq(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        snapshot_seq: Seq,
+    ) -> io::Result<Vec<(Key, Value)>> {
+        // For each key, keep the newest version visible to the snapshot
+        // (largest seq <= snapshot_seq). A BTreeMap keeps the output sorted.
+        let mut best: BTreeMap<Key, (Seq, Option<Value>)> = BTreeMap::new();
+        let mut consider = |key: Key, seq: Seq, value: Option<Value>| {
+            if seq > snapshot_seq {
+                return;
+            }
+            match best.get(&key) {
+                Some((best_seq, _)) if *best_seq >= seq => {}
+                _ => {
+                    best.insert(key, (seq, value));
+                }
+            }
+        };
+
+        for tables in self.sstables.values() {
+            for table in tables {
+                for (key, seq, value) in table.scan_range_versioned(start, end)? {
+                    consider(key, seq, value);
                 }
             }
         }
-        for (key, value) in self.memtable.range(start, end) {
-            merged.insert(key.clone(), value.clone());
+        for (key, seq, value) in self.memtable.range(start, end) {
+            consider(key.clone(), seq, value.clone());
         }
 
         // Tombstones shadow older values, then drop out of the result
-        Ok(merged
+        Ok(best
             .into_iter()
-            .filter_map(|(k, v)| v.map(|v| (k, v)))
+            .filter_map(|(k, (_seq, v))| v.map(|v| (k, v)))
             .collect())
     }
 
@@ -421,8 +460,9 @@ impl Storage {
         // Write to WAL first
         self.wal.append(Operation::Put, &key, Some(&value))?;
 
-        // Then update memtable
-        self.memtable.insert(key, value);
+        // Assign the next sequence number and record this version
+        self.seq_counter += 1;
+        self.memtable.insert(key, self.seq_counter, value);
 
         self.maybe_flush_memtable()
     }
@@ -437,10 +477,11 @@ impl Storage {
         // Write to WAL first
         self.wal.append(Operation::Delete, key, None)?;
 
-        // Then record a tombstone in the memtable. The tombstone (not a plain
-        // removal) is what shadows older values still living in SSTables and
-        // is flushed to disk alongside regular entries.
-        self.memtable.delete(key.clone());
+        // Record a tombstone version in the memtable. The tombstone (not a
+        // plain removal) is what shadows older values still living in SSTables
+        // and is flushed to disk alongside regular entries.
+        self.seq_counter += 1;
+        self.memtable.delete(key.clone(), self.seq_counter);
 
         self.maybe_flush_memtable()
     }
@@ -480,14 +521,14 @@ impl Storage {
             .join(format!("L0_{}.sst", self.sstable_counter));
         let mut sstable = SSTable::with_cache(sstable_path, self.block_cache.clone())?;
 
-        // Write memtable data (including tombstones) to SSTable
+        // Write memtable data (all versions, including tombstones) to SSTable
         let entries: Vec<_> = self
             .memtable
             .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(k, seq, v)| (k.clone(), seq, v.clone()))
             .collect();
 
-        sstable.write_with(&entries, self.config.compression)?;
+        sstable.write_versioned(&entries, self.config.compression)?;
 
         if self.config.verbose {
             println!(
@@ -572,8 +613,15 @@ impl Storage {
             .iter()
             .all(|(l, tables)| *l <= level || tables.is_empty());
 
-        // Perform compaction (merge in memory, newest value wins)
-        let entries = self.compaction_manager.compact(tables, drop_tombstones)?;
+        // Versions older than the oldest live snapshot's floor can be
+        // garbage-collected; with no live snapshots everything collapses to
+        // the newest version per key.
+        let gc_floor = self.snapshots.oldest().unwrap_or(Seq::MAX);
+
+        // Perform compaction (merge in memory, retaining versions as needed)
+        let entries = self
+            .compaction_manager
+            .compact(tables, drop_tombstones, gc_floor)?;
 
         // Get paths of tables to delete
         let table_paths: Vec<_> = tables.iter().map(|t| t.get_path().clone()).collect();
@@ -590,7 +638,7 @@ impl Storage {
             println!("Unique entries: {}", entries.len());
         }
 
-        new_table.write_with(&entries, self.config.compression)?;
+        new_table.write_versioned(&entries, self.config.compression)?;
 
         let new_table_size = new_table.size();
         if self.config.verbose {
