@@ -24,6 +24,9 @@ block compression.
   read a single block instead of scanning the file
 - **Optional LZ4 compression** — per-block compression keeps point reads
   cheap while shrinking tables
+- **Snapshot isolation (MVCC)** — every write is sequence-numbered, and a
+  `Snapshot` reads a consistent view as of the moment it was taken, unaffected
+  by later writes, deletes, flushes, or compactions
 - **Concurrent access** — a cloneable `SharedStorage` handle with concurrent
   reads and serialized writes
 - **Range and prefix scans** — ordered scans with newest-wins merging across
@@ -114,20 +117,25 @@ older value for the key.
 
 ## On-disk formats
 
-**SSTable (versioned, v2)** — files written by older versions (without the
-magic header) remain readable through a legacy fallback path:
+**SSTable (versioned, v3)** — v3 stores a sequence number per entry (MVCC).
+v2 (no sequence) and pre-header legacy files remain readable through fallback
+paths, with their entries treated as sequence 0:
 
 ```text
 ┌───────┬─────────┬───────┬─────────────┬─────────────┬───────────────────┐
 │ magic │ version │ flags │ bloom       │ sparse      │ data blocks       │
-│ LSMT  │ u8 = 2  │ u8    │ len + bytes │ index       │ ≤16 entries each, │
-│       │         │       │             │ len + bytes │ LZ4 if flag set   │
+│ LSMT  │ u8 = 3  │ u8    │ len + bytes │ index       │ key-aligned, one  │
+│       │         │       │             │ len + bytes │ block per lookup  │
 └───────┴─────────┴───────┴─────────────┴─────────────┴───────────────────┘
 
 index entry:  [first_key_len u32][first_key][block_offset u64][block_len u32]
-data entry:   [key_len u32][key][value_len u32][value]
-tombstone:    [key_len u32][key][0xFFFFFFFF]
+data entry:   [key_len u32][key][seq u64][value_len u32][value]
+tombstone:    [key_len u32][key][seq u64][0xFFFFFFFF]
 ```
+
+Within a block, entries are sorted by `(key ascending, seq descending)` and a
+key's versions are never split across blocks, so a snapshot lookup reads a
+single block and returns the newest version at or below its sequence.
 
 **WAL** — `[op u8][key_len u32][key][value_len u32][value]` per entry, where
 `op` is 0 for put (with value) and 1 for delete (without). Replay tolerates a
@@ -166,6 +174,14 @@ fn main() -> std::io::Result<()> {
     // Ordered scans (end-exclusive ranges, or by prefix)
     let _users = shared.scan_prefix(b"user:")?;
     let _range = shared.scan(b"user:100", b"user:200")?;
+
+    // Snapshot isolation: a consistent view unaffected by later writes
+    let mut db = Storage::new("./data4", false)?;
+    db.put(b"k".to_vec(), b"v1".to_vec())?;
+    let snap = db.snapshot();
+    db.put(b"k".to_vec(), b"v2".to_vec())?; // committed after the snapshot
+    assert_eq!(db.get_at(&snap, &b"k".to_vec())?, Some(b"v1".to_vec())); // snapshot view
+    assert_eq!(db.get(&b"k".to_vec())?, Some(b"v2".to_vec())); // latest view
 
     // Background compaction off the write path
     let compactor = shared.spawn_compactor(std::time::Duration::from_secs(1));
@@ -290,9 +306,10 @@ lsm-rust/
 - [x] Background (off-thread) compaction
 - [x] WAL group commit / batched fsync
 - [x] Block cache for hot reads
-- [ ] Snapshot isolation / MVCC
+- [x] Snapshot isolation / MVCC
 - [ ] Write batches (atomic multi-key commits)
 - [ ] Metrics endpoint (Prometheus text format)
+- [ ] Time-travel reads (open a snapshot at a persisted sequence)
 
 ## Community and Contributing
 
