@@ -1,3 +1,4 @@
+use crate::Seq;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -15,7 +16,17 @@ pub struct ManifestEntry {
     pub filename: String,
 }
 
-/// The manifest is the authoritative record of which SSTables are live.
+/// What a manifest describes: the live table set plus the highest MVCC
+/// sequence number assigned so far (so sequences stay monotonic across
+/// restarts).
+#[derive(Debug, PartialEq, Eq)]
+pub struct ManifestState {
+    pub entries: Vec<ManifestEntry>,
+    pub last_seq: Seq,
+}
+
+/// The manifest is the authoritative record of which SSTables are live and
+/// how far the MVCC sequence counter has advanced.
 ///
 /// It is rewritten atomically (write to a temp file, fsync, rename over the
 /// old manifest) at every point where the table set changes — after a flush
@@ -46,8 +57,9 @@ impl Manifest {
 
     /// Load the manifest. Returns `None` if no manifest exists (a legacy
     /// data directory); the caller should fall back to a directory scan and
-    /// write an initial manifest.
-    pub fn load(&self) -> io::Result<Option<Vec<ManifestEntry>>> {
+    /// write an initial manifest. A manifest without a `seq` line (written
+    /// before MVCC) yields `last_seq = 0`.
+    pub fn load(&self) -> io::Result<Option<ManifestState>> {
         if !self.exists() {
             return Ok(None);
         }
@@ -65,8 +77,15 @@ impl Manifest {
         }
 
         let mut entries = Vec::new();
+        let mut last_seq: Seq = 0;
         for line in lines {
             if line.trim().is_empty() {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("seq ") {
+                last_seq = rest.trim().parse().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "bad manifest seq line")
+                })?;
                 continue;
             }
             let mut parts = line.split_whitespace();
@@ -90,15 +109,17 @@ impl Manifest {
                 filename: filename.to_string(),
             });
         }
-        Ok(Some(entries))
+        Ok(Some(ManifestState { entries, last_seq }))
     }
 
-    /// Atomically replace the manifest with the given table set.
-    pub fn write(&self, entries: &[ManifestEntry]) -> io::Result<()> {
+    /// Atomically replace the manifest with the given table set and MVCC
+    /// sequence high-water mark.
+    pub fn write(&self, entries: &[ManifestEntry], last_seq: Seq) -> io::Result<()> {
         let tmp_path = self.dir.join(MANIFEST_TMP);
         {
             let mut tmp = File::create(&tmp_path)?;
             writeln!(tmp, "{}", MANIFEST_VERSION)?;
+            writeln!(tmp, "seq {}", last_seq)?;
             for entry in entries {
                 writeln!(tmp, "{} {} {}", entry.level, entry.seq, entry.filename)?;
             }
@@ -142,9 +163,11 @@ mod tests {
         let manifest = Manifest::new(temp_dir.path());
 
         let entries = vec![entry(0, 3), entry(0, 4), entry(1, 2)];
-        manifest.write(&entries).unwrap();
+        manifest.write(&entries, 42).unwrap();
 
-        assert_eq!(manifest.load().unwrap(), Some(entries));
+        let state = manifest.load().unwrap().unwrap();
+        assert_eq!(state.entries, entries);
+        assert_eq!(state.last_seq, 42);
         // The temp file must not linger after the rename
         assert!(!temp_dir.path().join(MANIFEST_TMP).exists());
     }
@@ -154,10 +177,24 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let manifest = Manifest::new(temp_dir.path());
 
-        manifest.write(&[entry(0, 1), entry(0, 2)]).unwrap();
-        manifest.write(&[entry(1, 3)]).unwrap();
+        manifest.write(&[entry(0, 1), entry(0, 2)], 5).unwrap();
+        manifest.write(&[entry(1, 3)], 9).unwrap();
 
-        assert_eq!(manifest.load().unwrap(), Some(vec![entry(1, 3)]));
+        let state = manifest.load().unwrap().unwrap();
+        assert_eq!(state.entries, vec![entry(1, 3)]);
+        assert_eq!(state.last_seq, 9);
+    }
+
+    #[test]
+    fn test_legacy_manifest_without_seq_line() {
+        let temp_dir = TempDir::new().unwrap();
+        // A manifest written before MVCC: header + entries, no seq line
+        let contents = format!("{}\n0 1 L0_1.sst\n", MANIFEST_VERSION);
+        fs::write(temp_dir.path().join(MANIFEST_FILE), contents).unwrap();
+
+        let state = Manifest::new(temp_dir.path()).load().unwrap().unwrap();
+        assert_eq!(state.entries, vec![entry(0, 1)]);
+        assert_eq!(state.last_seq, 0);
     }
 
     #[test]

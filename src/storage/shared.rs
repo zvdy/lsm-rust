@@ -1,4 +1,4 @@
-use super::{Storage, StorageConfig};
+use super::{Snapshot, Storage, StorageConfig};
 use crate::{Key, Value};
 use std::io;
 use std::path::Path;
@@ -79,6 +79,46 @@ impl SharedStorage {
             .read()
             .map_err(|_| poisoned())?
             .scan_prefix(prefix)
+    }
+
+    /// Take a consistent, read-only [`Snapshot`] of the store as of now.
+    /// Reads through it (`get_at`, `scan_at`, `scan_prefix_at`) ignore later
+    /// writes; drop it when finished so pinned versions can be compacted.
+    pub fn snapshot(&self) -> io::Result<Snapshot> {
+        Ok(self.inner.read().map_err(|_| poisoned())?.snapshot())
+    }
+
+    /// Look up `key` as seen by `snapshot`. Concurrent with other reads.
+    pub fn get_at(&self, snapshot: &Snapshot, key: &Key) -> io::Result<Option<Value>> {
+        self.inner
+            .read()
+            .map_err(|_| poisoned())?
+            .get_at(snapshot, key)
+    }
+
+    /// Range scan as seen by `snapshot`. Concurrent with other reads.
+    pub fn scan_at(
+        &self,
+        snapshot: &Snapshot,
+        start: &[u8],
+        end: &[u8],
+    ) -> io::Result<Vec<(Key, Value)>> {
+        self.inner
+            .read()
+            .map_err(|_| poisoned())?
+            .scan_at(snapshot, start, end)
+    }
+
+    /// Prefix scan as seen by `snapshot`. Concurrent with other reads.
+    pub fn scan_prefix_at(
+        &self,
+        snapshot: &Snapshot,
+        prefix: &[u8],
+    ) -> io::Result<Vec<(Key, Value)>> {
+        self.inner
+            .read()
+            .map_err(|_| poisoned())?
+            .scan_prefix_at(snapshot, prefix)
     }
 
     /// Run any pending compactions now, under the write lock.
