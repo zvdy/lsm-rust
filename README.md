@@ -27,6 +27,9 @@ block compression.
 - **Snapshot isolation (MVCC)** — every write is sequence-numbered, and a
   `Snapshot` reads a consistent view as of the moment it was taken, unaffected
   by later writes, deletes, flushes, or compactions
+- **Atomic write batches** — group multiple puts and deletes into one commit
+  that is durable and visible all-or-nothing (a crash recovers the whole
+  batch or none of it)
 - **Concurrent access** — a cloneable `SharedStorage` handle with concurrent
   reads and serialized writes
 - **Range and prefix scans** — ordered scans with newest-wins merging across
@@ -138,8 +141,9 @@ key's versions are never split across blocks, so a snapshot lookup reads a
 single block and returns the newest version at or below its sequence.
 
 **WAL** — `[op u8][key_len u32][key][value_len u32][value]` per entry, where
-`op` is 0 for put (with value) and 1 for delete (without). Replay tolerates a
-truncated final entry.
+`op` is 0 for put (with value) and 1 for delete (without). An atomic write
+batch is one framed record — `[2][count u32]` followed by `count` entries —
+recovered whole or not at all. Replay tolerates a truncated final record.
 
 ## Usage
 
@@ -182,6 +186,11 @@ fn main() -> std::io::Result<()> {
     db.put(b"k".to_vec(), b"v2".to_vec())?; // committed after the snapshot
     assert_eq!(db.get_at(&snap, &b"k".to_vec())?, Some(b"v1".to_vec())); // snapshot view
     assert_eq!(db.get(&b"k".to_vec())?, Some(b"v2".to_vec())); // latest view
+
+    // Atomic write batch: all-or-nothing, one commit
+    let mut batch = lsm_rust::WriteBatch::new();
+    batch.put(b"a".to_vec(), b"1".to_vec()).delete(b"k".to_vec());
+    db.write_batch(batch)?;
 
     // Background compaction off the write path
     let compactor = shared.spawn_compactor(std::time::Duration::from_secs(1));
@@ -307,7 +316,7 @@ lsm-rust/
 - [x] WAL group commit / batched fsync
 - [x] Block cache for hot reads
 - [x] Snapshot isolation / MVCC
-- [ ] Write batches (atomic multi-key commits)
+- [x] Write batches (atomic multi-key commits)
 - [ ] Metrics endpoint (Prometheus text format)
 - [ ] Time-travel reads (open a snapshot at a persisted sequence)
 

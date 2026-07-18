@@ -44,5 +44,5 @@ pub type Seq = u64;
 
 pub use server::RespServer;
 pub use sstable::{BlockCache, Compression};
-pub use storage::{CompactorHandle, SharedStorage, Snapshot, Storage, StorageConfig};
+pub use storage::{CompactorHandle, SharedStorage, Snapshot, Storage, StorageConfig, WriteBatch};
 pub use wal::WalSync;

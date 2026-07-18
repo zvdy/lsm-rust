@@ -1,4 +1,4 @@
-use super::{Snapshot, Storage, StorageConfig};
+use super::{Snapshot, Storage, StorageConfig, WriteBatch};
 use crate::{Key, Value};
 use std::io;
 use std::path::Path;
@@ -66,6 +66,14 @@ impl SharedStorage {
     /// Delete `key`, durable once this returns.
     pub fn delete(&self, key: &Key) -> io::Result<()> {
         self.inner.write().map_err(|_| poisoned())?.delete(key)
+    }
+
+    /// Apply a [`WriteBatch`] atomically, durable once this returns.
+    pub fn write_batch(&self, batch: WriteBatch) -> io::Result<()> {
+        self.inner
+            .write()
+            .map_err(|_| poisoned())?
+            .write_batch(batch)
     }
 
     /// Range scan (`start <= key < end`). Concurrent with other reads.

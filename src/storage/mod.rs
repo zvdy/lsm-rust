@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use crate::memtable::MemTable;
 use crate::sstable::{BlockCache, CompactionManager, Compression, SSTable, SSTableLookup};
-use crate::wal::{Operation, WalSync, WAL};
+use crate::wal::{BatchEntry, Operation, WalRecord, WalSync, WAL};
 use crate::{Key, Seq, Value};
 
 /// Smallest byte string strictly greater than every string with this
@@ -41,6 +41,63 @@ fn parse_sst_filename(path: &Path) -> Option<(usize, u64)> {
     let stem = path.file_stem()?.to_str()?;
     let (level, seq) = stem.strip_prefix('L')?.split_once('_')?;
     Some((level.parse().ok()?, seq.parse().ok()?))
+}
+
+/// Apply a single replayed/batched operation to the memtable at `seq`.
+fn apply_op(memtable: &mut MemTable, seq: Seq, op: Operation, key: Key, value: Option<Value>) {
+    match op {
+        Operation::Put => {
+            if let Some(value) = value {
+                memtable.insert(key, seq, value);
+            }
+        }
+        Operation::Delete => memtable.delete(key, seq),
+    }
+}
+
+/// A set of writes committed atomically at a single sequence number.
+///
+/// Build one with [`WriteBatch::put`] / [`WriteBatch::delete`], then apply it
+/// with [`Storage::write_batch`]. Atomicity has two facets:
+/// - **Visibility**: every op shares one sequence number, so a [`Snapshot`]
+///   taken before the batch sees none of it and one taken after sees all of
+///   it — never a partial batch.
+/// - **Durability**: the batch is written to the WAL as one record, so a
+///   crash mid-commit recovers either the whole batch or none of it.
+///
+/// Within a batch, a later op on a key supersedes an earlier one.
+#[derive(Default)]
+pub struct WriteBatch {
+    ops: Vec<(Operation, Key, Option<Value>)>,
+}
+
+impl WriteBatch {
+    /// Create an empty batch.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Queue a put of `key` = `value`.
+    pub fn put(&mut self, key: Key, value: Value) -> &mut Self {
+        self.ops.push((Operation::Put, key, Some(value)));
+        self
+    }
+
+    /// Queue a delete of `key`.
+    pub fn delete(&mut self, key: Key) -> &mut Self {
+        self.ops.push((Operation::Delete, key, None));
+        self
+    }
+
+    /// Number of queued operations.
+    pub fn len(&self) -> usize {
+        self.ops.len()
+    }
+
+    /// Whether the batch has no queued operations.
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
 }
 
 static PUT_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -197,18 +254,21 @@ impl Storage {
         // replayed sequences match what the entries held before the crash and
         // land above every sequence in the loaded SSTables.
         let mut replay_count = 0;
-        for (op, key, value) in wal.replay()? {
-            seq_counter += 1;
-            match op {
-                Operation::Put => {
-                    if let Some(value) = value {
-                        memtable.insert(key, seq_counter, value);
+        for record in wal.replay()? {
+            match record {
+                // A standalone op gets its own sequence number
+                WalRecord::Single(op, key, value) => {
+                    seq_counter += 1;
+                    apply_op(&mut memtable, seq_counter, op, key, value);
+                    replay_count += 1;
+                }
+                // A batch's ops all share one sequence number (atomic visibility)
+                WalRecord::Batch(entries) => {
+                    seq_counter += 1;
+                    for (op, key, value) in entries {
+                        apply_op(&mut memtable, seq_counter, op, key, value);
                         replay_count += 1;
                     }
-                }
-                Operation::Delete => {
-                    memtable.delete(key, seq_counter);
-                    replay_count += 1;
                 }
             }
         }
@@ -482,6 +542,38 @@ impl Storage {
         // and is flushed to disk alongside regular entries.
         self.seq_counter += 1;
         self.memtable.delete(key.clone(), self.seq_counter);
+
+        self.maybe_flush_memtable()
+    }
+
+    /// Apply a [`WriteBatch`] atomically: all of its operations commit at a
+    /// single sequence number and are recovered together on a crash.
+    pub fn write_batch(&mut self, batch: WriteBatch) -> io::Result<()> {
+        if batch.ops.is_empty() {
+            return Ok(());
+        }
+
+        // Durably record the whole batch as one atomic WAL record first
+        {
+            let entries: Vec<BatchEntry> = batch
+                .ops
+                .iter()
+                .map(|(op, key, value)| BatchEntry {
+                    op: *op,
+                    key,
+                    value: value.as_deref(),
+                })
+                .collect();
+            self.wal.append_batch(&entries)?;
+        }
+
+        // One sequence number for the whole batch gives atomic visibility;
+        // later ops on a key supersede earlier ones (same seq, insert wins).
+        self.seq_counter += 1;
+        let seq = self.seq_counter;
+        for (op, key, value) in batch.ops {
+            apply_op(&mut self.memtable, seq, op, key, value);
+        }
 
         self.maybe_flush_memtable()
     }
