@@ -42,7 +42,10 @@ pub type Value = Vec<u8>;
 /// what gives the store snapshot isolation.
 pub type Seq = u64;
 
-pub use server::RespServer;
+pub use server::{MetricsServer, RespServer};
 pub use sstable::{BlockCache, Compression};
-pub use storage::{CompactorHandle, SharedStorage, Snapshot, Storage, StorageConfig, WriteBatch};
+pub use storage::{
+    CompactorHandle, LevelStats, SharedStorage, Snapshot, Storage, StorageConfig, StorageStats,
+    WriteBatch,
+};
 pub use wal::WalSync;
