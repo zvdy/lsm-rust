@@ -268,6 +268,11 @@ live snapshots, memtable occupancy, and per-level SSTable counts and sizes.
 Point a Prometheus scrape at the endpoint, or read the same snapshot in-process
 via `Storage::stats()` / `SharedStorage::stats()`.
 
+Live endpoint after ~9,000 operations (writes, reads, deletes, prefix scans)
+that drove 11 flushes and 3 compactions:
+
+![lsm-rust Prometheus metrics endpoint](docs/images/prometheus-metrics-endpoint.png)
+
 ### Docker
 
 ```bash
