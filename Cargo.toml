@@ -6,7 +6,7 @@ authors = ["zvdy"]
 description = "A Log-Structured Merge Tree implementation in Rust"
 
 [dependencies]
-lz4_flex = "0.13.1"
+lz4_flex = "0.14.0"
 
 # Disable the default libtest bench harness so `cargo bench -- <criterion args>`
 # only reaches the criterion benches
