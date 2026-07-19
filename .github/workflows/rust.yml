@@ -5,6 +5,7 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -33,13 +34,37 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
-        run: cargo fmt -- --check
+        run: make fmt-check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: make lint
 
   test:
     name: Test Suite
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # `stable` gates merges; `beta` is an early-warning signal for
+        # upcoming compiler changes and is allowed to fail.
+        toolchain: [ stable, beta ]
+    continue-on-error: ${{ matrix.toolchain == 'beta' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: make test
+
+  docs:
+    name: Docs
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -50,8 +75,23 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Run tests
-        run: cargo test --all-features --verbose
+      - name: Build documentation
+        run: make doc
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: make release
 
   coverage:
     name: Coverage
@@ -71,30 +111,13 @@ jobs:
           tool: cargo-tarpaulin
 
       - name: Run tests with coverage
-        run: cargo tarpaulin --verbose --all-features --workspace --timeout 120 --out xml
+        run: make coverage
 
       - name: Upload coverage report
         uses: actions/upload-artifact@v7
         with:
           name: coverage-report
           path: cobertura.xml
-
-  docs:
-    name: Docs
-    runs-on: ubuntu-latest
-    env:
-      RUSTDOCFLAGS: -D warnings
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build documentation
-        run: cargo doc --no-deps --all-features
 
   audit:
     name: Security Audit
@@ -108,19 +131,27 @@ jobs:
           tool: cargo-audit
 
       - name: Audit dependencies
-        run: cargo audit
+        run: make audit
 
-  build:
-    name: Build
+  # Single required status check for branch protection: it succeeds only when
+  # every gating job above has succeeded (and fails fast if any did not).
+  ci:
+    name: CI
+    if: always()
+    needs: [ lint, test, docs, build, coverage, audit ]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build
-        run: cargo build --verbose --release
+      - name: Verify all gating jobs succeeded
+        run: |
+          echo "lint=${{ needs.lint.result }}"
+          echo "test=${{ needs.test.result }}"
+          echo "docs=${{ needs.docs.result }}"
+          echo "build=${{ needs.build.result }}"
+          echo "coverage=${{ needs.coverage.result }}"
+          echo "audit=${{ needs.audit.result }}"
+          test "${{ needs.lint.result }}" = "success" \
+            && test "${{ needs.test.result }}" = "success" \
+            && test "${{ needs.docs.result }}" = "success" \
+            && test "${{ needs.build.result }}" = "success" \
+            && test "${{ needs.coverage.result }}" = "success" \
+            && test "${{ needs.audit.result }}" = "success"
