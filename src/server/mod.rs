@@ -16,6 +16,9 @@
 //! `KEYS <prefix>*` (trailing-star globs only), and `QUIT`. One thread per
 //! connection; all state lives in a [`SharedStorage`].
 
+mod metrics;
+pub use metrics::MetricsServer;
+
 use crate::storage::SharedStorage;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::net::{TcpListener, TcpStream};

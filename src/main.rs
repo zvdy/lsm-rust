@@ -3,7 +3,7 @@ use std::fs;
 use std::io;
 use std::net::TcpListener;
 
-use lsm_rust::{RespServer, SharedStorage, Storage};
+use lsm_rust::{MetricsServer, RespServer, SharedStorage, Storage};
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -33,15 +33,17 @@ fn print_usage() {
     println!("  serve              Serve the store over the Redis protocol (RESP)");
     println!();
     println!("Options:");
-    println!("  -v, --verbose      Verbose engine logging");
-    println!("  --addr HOST:PORT   serve: listen address (default 127.0.0.1:6379)");
-    println!("  --data DIR         serve: data directory (default ./data)");
+    println!("  -v, --verbose            Verbose engine logging");
+    println!("  --addr HOST:PORT         serve: RESP listen address (default 127.0.0.1:6379)");
+    println!("  --data DIR               serve: data directory (default ./data)");
+    println!("  --metrics-addr HOST:PORT serve: also expose Prometheus /metrics at this address");
 }
 
 /// `lsm-rust serve [--addr HOST:PORT] [--data DIR] [-v]`
 fn serve(args: &[String], verbose: bool) -> io::Result<()> {
     let mut addr = "127.0.0.1:6379".to_string();
     let mut data_dir = "./data".to_string();
+    let mut metrics_addr: Option<String> = None;
 
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -62,6 +64,18 @@ fn serve(args: &[String], verbose: bool) -> io::Result<()> {
                     })?
                     .clone();
             }
+            "--metrics-addr" => {
+                metrics_addr = Some(
+                    iter.next()
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "--metrics-addr needs a value",
+                            )
+                        })?
+                        .clone(),
+                );
+            }
             "-v" | "--verbose" => {}
             other => {
                 return Err(io::Error::new(
@@ -80,6 +94,19 @@ fn serve(args: &[String], verbose: bool) -> io::Result<()> {
         data_dir
     );
     println!("Try: redis-cli -p {}", listener.local_addr()?.port());
+
+    // Optionally expose Prometheus metrics on a separate HTTP port. Keep the
+    // handle alive for the lifetime of the server so the thread keeps running.
+    let _metrics = match metrics_addr {
+        Some(addr) => {
+            let metrics_listener = TcpListener::bind(&addr)?;
+            let bound = metrics_listener.local_addr()?;
+            let server = MetricsServer::spawn(storage.clone(), metrics_listener)?;
+            println!("Prometheus metrics on http://{}/metrics", bound);
+            Some(server)
+        }
+        None => None,
+    };
 
     let server = RespServer::spawn(storage, listener)?;
     server.join();

@@ -1,4 +1,4 @@
-use super::{Snapshot, Storage, StorageConfig, WriteBatch};
+use super::{Snapshot, Storage, StorageConfig, StorageStats, WriteBatch};
 use crate::{Key, Value};
 use std::io;
 use std::path::Path;
@@ -127,6 +127,12 @@ impl SharedStorage {
             .read()
             .map_err(|_| poisoned())?
             .scan_prefix_at(snapshot, prefix)
+    }
+
+    /// Take a point-in-time snapshot of the store's operational metrics.
+    /// Concurrent with other reads.
+    pub fn stats(&self) -> io::Result<StorageStats> {
+        Ok(self.inner.read().map_err(|_| poisoned())?.stats())
     }
 
     /// Run any pending compactions now, under the write lock.

@@ -34,6 +34,11 @@ impl SnapshotRegistry {
     pub(super) fn oldest(&self) -> Option<Seq> {
         self.live.lock().unwrap().keys().next().copied()
     }
+
+    /// The number of live snapshots (summed across shared sequences).
+    pub(super) fn live_count(&self) -> u64 {
+        self.live.lock().unwrap().values().map(|&c| c as u64).sum()
+    }
 }
 
 /// A consistent, read-only view of the store as of the moment it was taken.

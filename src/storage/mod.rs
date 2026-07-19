@@ -1,10 +1,13 @@
 mod manifest;
 mod shared;
 mod snapshot;
+mod stats;
 use manifest::{Manifest, ManifestEntry};
 pub use shared::{CompactorHandle, SharedStorage};
 pub use snapshot::Snapshot;
 use snapshot::SnapshotRegistry;
+use stats::Metrics;
+pub use stats::{LevelStats, StorageStats};
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -165,6 +168,7 @@ pub struct Storage {
     /// `seq_counter + 1`; a read or snapshot at "now" sees seqs `<= seq_counter`.
     seq_counter: Seq,
     snapshots: Arc<SnapshotRegistry>,
+    metrics: Metrics,
     compaction_manager: CompactionManager,
     block_cache: Option<Arc<BlockCache>>,
     manifest: Manifest,
@@ -325,6 +329,7 @@ impl Storage {
             sstable_counter: counter,
             seq_counter,
             snapshots: Arc::new(SnapshotRegistry::default()),
+            metrics: Metrics::default(),
             compaction_manager,
             block_cache,
             manifest,
@@ -370,6 +375,43 @@ impl Storage {
         self.snapshots.acquire(self.seq_counter)
     }
 
+    /// Take a point-in-time snapshot of the store's operational metrics.
+    ///
+    /// Returns cumulative operation counters plus gauges describing the
+    /// store's current shape (memtable occupancy, per-level SSTable counts and
+    /// sizes, live snapshots, and the MVCC sequence). Render the result for a
+    /// Prometheus scrape with [`StorageStats::to_prometheus`].
+    pub fn stats(&self) -> StorageStats {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let mut levels: Vec<LevelStats> = self
+            .sstables
+            .iter()
+            .filter(|(_, tables)| !tables.is_empty())
+            .map(|(&level, tables)| LevelStats {
+                level,
+                num_sstables: tables.len() as u64,
+                bytes: tables.iter().map(|t| t.size() as u64).sum(),
+            })
+            .collect();
+        levels.sort_by_key(|l| l.level);
+
+        StorageStats {
+            puts_total: self.metrics.puts.load(Relaxed),
+            deletes_total: self.metrics.deletes.load(Relaxed),
+            batches_total: self.metrics.batches.load(Relaxed),
+            gets_total: self.metrics.gets.load(Relaxed),
+            scans_total: self.metrics.scans.load(Relaxed),
+            flushes_total: self.metrics.flushes.load(Relaxed),
+            compactions_total: self.metrics.compactions.load(Relaxed),
+            sequence: self.seq_counter,
+            live_snapshots: self.snapshots.live_count(),
+            memtable_bytes: self.memtable.size() as u64,
+            memtable_entries: self.memtable.len() as u64,
+            levels,
+        }
+    }
+
     /// Look up the current value for `key`, or `None` if the key does not
     /// exist or has been deleted.
     pub fn get(&self, key: &Key) -> io::Result<Option<Value>> {
@@ -389,6 +431,7 @@ impl Storage {
     /// scanning newest-to-oldest and returning at the first visible version
     /// yields the newest version the snapshot can see.
     fn get_at_seq(&self, key: &Key, snapshot_seq: Seq) -> io::Result<Option<Value>> {
+        Metrics::incr(&self.metrics.gets);
         if self.config.verbose {
             println!("GET {:?} @ {}", String::from_utf8_lossy(key), snapshot_seq);
         }
@@ -462,6 +505,7 @@ impl Storage {
         end: Option<&[u8]>,
         snapshot_seq: Seq,
     ) -> io::Result<Vec<(Key, Value)>> {
+        Metrics::incr(&self.metrics.scans);
         // For each key, keep the newest version visible to the snapshot
         // (largest seq <= snapshot_seq). A BTreeMap keeps the output sorted.
         let mut best: BTreeMap<Key, (Seq, Option<Value>)> = BTreeMap::new();
@@ -523,6 +567,7 @@ impl Storage {
         // Assign the next sequence number and record this version
         self.seq_counter += 1;
         self.memtable.insert(key, self.seq_counter, value);
+        Metrics::incr(&self.metrics.puts);
 
         self.maybe_flush_memtable()
     }
@@ -542,6 +587,7 @@ impl Storage {
         // and is flushed to disk alongside regular entries.
         self.seq_counter += 1;
         self.memtable.delete(key.clone(), self.seq_counter);
+        Metrics::incr(&self.metrics.deletes);
 
         self.maybe_flush_memtable()
     }
@@ -574,6 +620,7 @@ impl Storage {
         for (op, key, value) in batch.ops {
             apply_op(&mut self.memtable, seq, op, key, value);
         }
+        Metrics::incr(&self.metrics.batches);
 
         self.maybe_flush_memtable()
     }
@@ -598,6 +645,7 @@ impl Storage {
         if self.memtable.is_empty() {
             return Ok(());
         }
+        Metrics::incr(&self.metrics.flushes);
 
         if self.config.verbose {
             println!("Entries: {}", self.memtable.len());
@@ -685,6 +733,7 @@ impl Storage {
         if !self.compaction_manager.should_compact(level, tables) {
             return Ok(());
         }
+        Metrics::incr(&self.metrics.compactions);
 
         if self.config.verbose {
             println!("\n=== Starting Compaction ===");

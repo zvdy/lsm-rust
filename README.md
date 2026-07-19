@@ -46,6 +46,9 @@ block compression.
   orphans on the next startup
 - **Redis-protocol server** — `lsm-rust serve` exposes the store over RESP,
   so `redis-cli` and Redis client libraries work out of the box
+- **Prometheus metrics** — `Storage::stats()` exposes operation counters and
+  live gauges, and `lsm-rust serve --metrics-addr` serves them at `/metrics`
+  in the Prometheus text exposition format for scraping
 - **Configurable** — flush/compaction thresholds, level growth, and
   compression are tunable via `StorageConfig`
 - **Benchmarked and tested** — a criterion suite covers the hot paths, and a
@@ -192,6 +195,11 @@ fn main() -> std::io::Result<()> {
     batch.put(b"a".to_vec(), b"1".to_vec()).delete(b"k".to_vec());
     db.write_batch(batch)?;
 
+    // Operational metrics, renderable in Prometheus text format
+    let stats = db.stats();
+    println!("puts={} sstables={}", stats.puts_total, stats.total_sstables());
+    print!("{}", stats.to_prometheus());
+
     // Background compaction off the write path
     let compactor = shared.spawn_compactor(std::time::Duration::from_secs(1));
     drop(compactor); // stops the thread
@@ -229,6 +237,41 @@ OK
 
 Supported commands: `PING`, `ECHO`, `SET`, `GET`, `DEL`, `EXISTS`,
 `KEYS <prefix>*` (trailing-star globs), `QUIT`.
+
+### Prometheus metrics
+
+Pass `--metrics-addr` to also expose a `/metrics` endpoint alongside the RESP
+server:
+
+```bash
+cargo run --release -- serve --addr 127.0.0.1:6379 --metrics-addr 127.0.0.1:9898
+```
+
+```text
+$ curl -s http://127.0.0.1:9898/metrics
+# HELP lsm_puts_total Total put operations applied.
+# TYPE lsm_puts_total counter
+lsm_puts_total 42
+# HELP lsm_sequence Highest MVCC sequence number assigned so far.
+# TYPE lsm_sequence gauge
+lsm_sequence 51
+# HELP lsm_sstables Number of SSTable files per level.
+# TYPE lsm_sstables gauge
+lsm_sstables{level="0"} 2
+...
+```
+
+Exposed metrics include operation counters (`lsm_puts_total`,
+`lsm_deletes_total`, `lsm_batches_total`, `lsm_gets_total`, `lsm_scans_total`,
+`lsm_flushes_total`, `lsm_compactions_total`) and gauges for the MVCC sequence,
+live snapshots, memtable occupancy, and per-level SSTable counts and sizes.
+Point a Prometheus scrape at the endpoint, or read the same snapshot in-process
+via `Storage::stats()` / `SharedStorage::stats()`.
+
+Live endpoint after ~9,000 operations (writes, reads, deletes, prefix scans)
+that drove 11 flushes and 3 compactions:
+
+![lsm-rust Prometheus metrics endpoint](docs/images/prometheus-metrics-endpoint.png)
 
 ### Docker
 
@@ -317,7 +360,7 @@ lsm-rust/
 - [x] Block cache for hot reads
 - [x] Snapshot isolation / MVCC
 - [x] Write batches (atomic multi-key commits)
-- [ ] Metrics endpoint (Prometheus text format)
+- [x] Metrics endpoint (Prometheus text format)
 - [ ] Time-travel reads (open a snapshot at a persisted sequence)
 
 ## Community and Contributing
