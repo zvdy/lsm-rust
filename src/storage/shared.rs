@@ -96,6 +96,23 @@ impl SharedStorage {
         Ok(self.inner.read().map_err(|_| poisoned())?.snapshot())
     }
 
+    /// The highest MVCC sequence number assigned so far. Record it as a
+    /// logical checkpoint to revisit later via [`SharedStorage::snapshot_at`].
+    pub fn current_sequence(&self) -> io::Result<crate::Seq> {
+        Ok(self
+            .inner
+            .read()
+            .map_err(|_| poisoned())?
+            .current_sequence())
+    }
+
+    /// Open a snapshot positioned at a specific historical `seq`
+    /// ("time-travel"). See [`Storage::snapshot_at`] for the semantics and the
+    /// retention caveat.
+    pub fn snapshot_at(&self, seq: crate::Seq) -> io::Result<Snapshot> {
+        self.inner.read().map_err(|_| poisoned())?.snapshot_at(seq)
+    }
+
     /// Look up `key` as seen by `snapshot`. Concurrent with other reads.
     pub fn get_at(&self, snapshot: &Snapshot, key: &Key) -> io::Result<Option<Value>> {
         self.inner

@@ -27,6 +27,9 @@ block compression.
 - **Snapshot isolation (MVCC)** — every write is sequence-numbered, and a
   `Snapshot` reads a consistent view as of the moment it was taken, unaffected
   by later writes, deletes, flushes, or compactions
+- **Time-travel reads** — record a sequence number as a logical checkpoint
+  and later reopen the store's state as of that point with `snapshot_at`; the
+  sequence is persisted in the manifest, so checkpoints survive restarts
 - **Atomic write batches** — group multiple puts and deletes into one commit
   that is durable and visible all-or-nothing (a crash recovers the whole
   batch or none of it)
@@ -189,6 +192,12 @@ fn main() -> std::io::Result<()> {
     db.put(b"k".to_vec(), b"v2".to_vec())?; // committed after the snapshot
     assert_eq!(db.get_at(&snap, &b"k".to_vec())?, Some(b"v1".to_vec())); // snapshot view
     assert_eq!(db.get(&b"k".to_vec())?, Some(b"v2".to_vec())); // latest view
+
+    // Time-travel: revisit the store as of a recorded sequence checkpoint
+    let checkpoint = db.current_sequence(); // save this (it survives restarts)
+    db.put(b"k".to_vec(), b"v3".to_vec())?;
+    let past = db.snapshot_at(checkpoint)?;
+    assert_eq!(db.get_at(&past, &b"k".to_vec())?, Some(b"v2".to_vec()));
 
     // Atomic write batch: all-or-nothing, one commit
     let mut batch = lsm_rust::WriteBatch::new();
@@ -361,7 +370,7 @@ lsm-rust/
 - [x] Snapshot isolation / MVCC
 - [x] Write batches (atomic multi-key commits)
 - [x] Metrics endpoint (Prometheus text format)
-- [ ] Time-travel reads (open a snapshot at a persisted sequence)
+- [x] Time-travel reads (open a snapshot at a persisted sequence)
 
 ## Community and Contributing
 
