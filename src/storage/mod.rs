@@ -375,6 +375,47 @@ impl Storage {
         self.snapshots.acquire(self.seq_counter)
     }
 
+    /// The highest MVCC sequence number assigned so far.
+    ///
+    /// Every put, delete, and write-batch advances it by one. Record the value
+    /// at a moment of interest (a logical checkpoint) and later revisit the
+    /// store's state as of that moment with [`Storage::snapshot_at`] — the
+    /// sequence survives restarts, since it is persisted in the manifest and
+    /// restored on open.
+    pub fn current_sequence(&self) -> Seq {
+        self.seq_counter
+    }
+
+    /// Open a snapshot positioned at a specific historical sequence number
+    /// ("time-travel"): reads through it observe the newest version of each
+    /// key committed at or before `seq`, exactly as an ordinary [`Snapshot`]
+    /// taken at that moment would have.
+    ///
+    /// `seq` must not exceed [`Storage::current_sequence`] — there is no
+    /// travelling into the future. Like any snapshot, holding the returned
+    /// value pins the versions it needs against garbage collection.
+    ///
+    /// # Retention
+    ///
+    /// Time-travel is exact for any sequence at or above the store's retained
+    /// history floor. Older versions that compaction has already collapsed
+    /// (because no live snapshot pinned them) are *not* resurrected: a read at
+    /// such a sequence sees the oldest version still on disk. To guarantee a
+    /// past sequence stays readable, open the time-travel snapshot before the
+    /// compaction that would collapse it, or keep a snapshot pinned meanwhile.
+    pub fn snapshot_at(&self, seq: Seq) -> io::Result<Snapshot> {
+        if seq > self.seq_counter {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "cannot time-travel to sequence {} beyond the current sequence {}",
+                    seq, self.seq_counter
+                ),
+            ));
+        }
+        Ok(self.snapshots.acquire(seq))
+    }
+
     /// Take a point-in-time snapshot of the store's operational metrics.
     ///
     /// Returns cumulative operation counters plus gauges describing the

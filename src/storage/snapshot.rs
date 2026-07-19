@@ -61,6 +61,12 @@ impl Snapshot {
     }
 }
 
+impl std::fmt::Debug for Snapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Snapshot").field("seq", &self.seq).finish()
+    }
+}
+
 impl Drop for Snapshot {
     fn drop(&mut self) {
         self.registry.release(self.seq);
