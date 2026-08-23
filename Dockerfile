@@ -1,5 +1,5 @@
 # Build stage
-FROM rust:1.97-slim-bullseye AS builder
+FROM rust:1.98-slim-bullseye AS builder
 
 WORKDIR /usr/src/lsm-rust
 
