@@ -2,8 +2,21 @@
 name = "lsm-rust"
 version = "0.1.0"
 edition = "2021"
+# Verified: 1.87 builds, 1.86 fails (`unsigned_is_multiple_of` is 1.87+).
+# The MSRV job in CI keeps this honest.
+rust-version = "1.87"
 authors = ["zvdy"]
-description = "A Log-Structured Merge Tree implementation in Rust"
+description = "A Log-Structured Merge Tree (LSM tree) storage engine with MVCC snapshots, atomic write batches, checksummed durability, and a Redis-protocol server"
+documentation = "https://docs.rs/lsm-rust"
+homepage = "https://github.com/zvdy/lsm-rust"
+repository = "https://github.com/zvdy/lsm-rust"
+license = "MIT"
+readme = "README.md"
+keywords = ["lsm-tree", "database", "key-value", "storage", "sstable"]
+categories = ["database-implementations", "data-structures"]
+# Keep the published package small: screenshots and CI config are not needed
+# to build or use the crate.
+exclude = ["docs/images/*", ".github/*"]
 
 [dependencies]
 lz4_flex = "0.14.0"

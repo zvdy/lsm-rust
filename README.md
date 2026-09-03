@@ -1,6 +1,8 @@
 # lsm-rust
 
 [![Rust CI](https://github.com/zvdy/lsm-rust/actions/workflows/rust.yml/badge.svg)](https://github.com/zvdy/lsm-rust/actions/workflows/rust.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/zvdy/lsm-rust/badge)](https://scorecard.dev/viewer/?uri=github.com/zvdy/lsm-rust)
+[![MSRV](https://img.shields.io/badge/MSRV-1.87-blue.svg)](https://github.com/zvdy/lsm-rust/blob/main/Cargo.toml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A Log-Structured Merge (LSM) tree storage engine in Rust — usable as an
@@ -227,8 +229,13 @@ A `Makefile` mirrors CI so you can reproduce a green build locally:
 make            # list all targets
 make check      # format, lint, tests, docs — the CI gates
 make test       # full test suite (unit + integration + doc tests)
+make msrv       # build against the declared minimum Rust version
+make deny       # license, advisory, source and ban policy (cargo-deny)
 make bench      # criterion benchmarks
 ```
+
+The minimum supported Rust version is **1.87**, declared in `Cargo.toml` and
+verified by CI on every pull request.
 
 The test suite covers the engine, a crash-recovery suite (restarts, torn WAL
 tails, delete persistence, and a model-based random workload), and the
@@ -256,7 +263,8 @@ docs/ARCHITECTURE.md    # Design deep-dive and on-disk formats
 
 Contributions of all kinds are welcome. Please read:
 
-- [CONTRIBUTING.md](CONTRIBUTING.md) — development setup and PR process
+- [CONTRIBUTING.md](CONTRIBUTING.md) — development setup, PR process, releases
+- [CHANGELOG.md](CHANGELOG.md) — what changed in each version
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the engine works
 - [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) · [SECURITY.md](SECURITY.md) ·
   [GOVERNANCE.md](GOVERNANCE.md) · [MAINTAINERS.md](MAINTAINERS.md)

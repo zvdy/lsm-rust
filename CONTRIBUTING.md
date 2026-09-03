@@ -23,13 +23,17 @@ cargo test
 
 ## Before Submitting a Pull Request
 
-All pull requests must pass CI, which enforces:
+All pull requests must pass CI. Reproduce the full gate locally with a single
+command:
 
 ```bash
-cargo fmt -- --check      # formatting
-cargo clippy -- -D warnings  # lints
-cargo test                # test suite
+make check   # formatting, clippy, the test suite and the docs build
 ```
+
+CI additionally runs the crate against its declared minimum supported Rust
+version (`make msrv`), a license/advisory policy check (`make deny`),
+`cargo audit`, coverage, and a release build. The `CI` job is the aggregate
+status check: it passes only when every other job does.
 
 Please also:
 
@@ -52,6 +56,24 @@ Please also:
 4. A maintainer will review your PR. Address review feedback by pushing new
    commits to your branch.
 5. Once approved and CI is green, a maintainer will merge it.
+
+## Releasing
+
+Releases are cut by pushing a tag; there is nothing to run by hand.
+
+1. Update `CHANGELOG.md`, moving entries from `Unreleased` into a new version
+   section.
+2. Bump `version` in `Cargo.toml` and open a PR with both changes.
+3. Once merged, tag the merge commit and push it:
+
+   ```bash
+   git tag v0.2.0 && git push origin v0.2.0
+   ```
+
+The release workflow then verifies the tag matches `Cargo.toml`, runs the full
+gate, builds Linux and macOS binaries, publishes a GitHub Release with generated
+notes, and publishes to crates.io when a `CARGO_REGISTRY_TOKEN` secret is
+configured (it skips that step cleanly when it is not).
 
 ## Reporting Bugs
 
