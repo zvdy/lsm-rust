@@ -32,7 +32,10 @@ make check   # formatting, clippy, the test suite and the docs build
 
 CI additionally runs the crate against its declared minimum supported Rust
 version (`make msrv`), a license/advisory policy check (`make deny`),
-`cargo audit`, coverage, and a release build. The `CI` job is the aggregate
+`cargo audit`, coverage, and a release build. The test suite runs on Linux,
+macOS and Windows so platform-specific assumptions about paths, fsync and file
+locking are caught, plus on the `beta` toolchain as a non-blocking early
+warning. The `CI` job is the aggregate
 status check: it passes only when every other job does.
 
 Please also:
