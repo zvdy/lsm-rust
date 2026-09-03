@@ -133,12 +133,50 @@ jobs:
       - name: Audit dependencies
         run: make audit
 
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: |
+          version=$(python3 -c "import tomllib;print(tomllib.load(open('Cargo.toml','rb'))['package']['rust-version'])")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install the declared minimum toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      # Keeps the declared MSRV honest: if a newer API sneaks in, this fails.
+      - name: Check against the MSRV
+        run: cargo check --all-targets --all-features
+
+  deny:
+    name: Licenses & Advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2.85.9
+        with:
+          tool: cargo-deny
+
+      - name: Check licenses, advisories, sources and bans
+        run: make deny
+
   # Single required status check for branch protection: it succeeds only when
   # every gating job above has succeeded (and fails fast if any did not).
   ci:
     name: CI
     if: always()
-    needs: [ lint, test, docs, build, coverage, audit ]
+    needs: [ lint, test, docs, build, coverage, audit, msrv, deny ]
     runs-on: ubuntu-latest
     steps:
       - name: Verify all gating jobs succeeded
@@ -149,9 +187,13 @@ jobs:
           echo "build=${{ needs.build.result }}"
           echo "coverage=${{ needs.coverage.result }}"
           echo "audit=${{ needs.audit.result }}"
+          echo "msrv=${{ needs.msrv.result }}"
+          echo "deny=${{ needs.deny.result }}"
           test "${{ needs.lint.result }}" = "success" \
             && test "${{ needs.test.result }}" = "success" \
             && test "${{ needs.docs.result }}" = "success" \
             && test "${{ needs.build.result }}" = "success" \
             && test "${{ needs.coverage.result }}" = "success" \
-            && test "${{ needs.audit.result }}" = "success"
+            && test "${{ needs.audit.result }}" = "success" \
+            && test "${{ needs.msrv.result }}" = "success" \
+            && test "${{ needs.deny.result }}" = "success"

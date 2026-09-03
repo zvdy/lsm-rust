@@ -91,9 +91,22 @@ coverage: ## Measure coverage with cargo-tarpaulin (writes cobertura.xml).
 audit: ## Audit dependencies for known vulnerabilities (cargo-audit).
 	$(CARGO) audit
 
+.PHONY: deny
+deny: ## Check licenses, advisories, sources and bans (cargo-deny).
+	$(CARGO) deny --all-features check
+
+.PHONY: msrv
+msrv: ## Check the crate against its declared minimum supported Rust version.
+	$(CARGO) +$(shell python3 -c "import tomllib;print(tomllib.load(open('Cargo.toml','rb'))['package']['rust-version'])") \
+		check --all-targets --all-features
+
+.PHONY: package
+package: ## Verify the crate packages cleanly for crates.io.
+	$(CARGO) package
+
 .PHONY: install-tools
 install-tools: ## Install the optional dev tools used by coverage/audit.
-	$(CARGO) install cargo-tarpaulin cargo-audit
+	$(CARGO) install cargo-tarpaulin cargo-audit cargo-deny
 
 ##@ Housekeeping
 
