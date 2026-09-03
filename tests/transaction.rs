@@ -1,6 +1,6 @@
 //! Integration tests for concurrent optimistic transactions.
 
-use lsm_rust::{Isolation, SharedStorage, TransactionError};
+use lsm_rust::{Error, Isolation, SharedStorage};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use tempfile::TempDir;
@@ -85,7 +85,7 @@ fn write_write_conflict_aborts_the_loser() {
 
     let err = second.commit().expect_err("second must abort");
     assert!(err.is_retriable(), "conflict should be retriable: {err}");
-    assert!(matches!(err, TransactionError::Conflict { .. }));
+    assert!(matches!(err, Error::Conflict { .. }));
 
     // The loser had no effect at all.
     assert_eq!(

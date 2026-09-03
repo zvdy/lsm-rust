@@ -1,6 +1,6 @@
 use crate::Seq;
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Name of the manifest file inside the data directory.
@@ -59,7 +59,7 @@ impl Manifest {
     /// data directory); the caller should fall back to a directory scan and
     /// write an initial manifest. A manifest without a `seq` line (written
     /// before MVCC) yields `last_seq = 0`.
-    pub fn load(&self) -> io::Result<Option<ManifestState>> {
+    pub fn load(&self) -> crate::Result<Option<ManifestState>> {
         if !self.exists() {
             return Ok(None);
         }
@@ -68,12 +68,7 @@ impl Manifest {
 
         match lines.next() {
             Some(MANIFEST_VERSION) => {}
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unrecognized manifest header",
-                ))
-            }
+            _ => return Err(crate::Error::corruption("unrecognized manifest header")),
         }
 
         let mut entries = Vec::new();
@@ -83,26 +78,27 @@ impl Manifest {
                 continue;
             }
             if let Some(rest) = line.strip_prefix("seq ") {
-                last_seq = rest.trim().parse().map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "bad manifest seq line")
-                })?;
+                last_seq = rest
+                    .trim()
+                    .parse()
+                    .map_err(|_| crate::Error::corruption("bad manifest seq line"))?;
                 continue;
             }
             let mut parts = line.split_whitespace();
             let (Some(level), Some(seq), Some(filename)) =
                 (parts.next(), parts.next(), parts.next())
             else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("malformed manifest line: {:?}", line),
-                ));
+                return Err(crate::Error::corruption(format!(
+                    "malformed manifest line: {:?}",
+                    line
+                )));
             };
             let level = level
                 .parse::<usize>()
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad manifest level"))?;
+                .map_err(|_| crate::Error::corruption("bad manifest level"))?;
             let seq = seq
                 .parse::<u64>()
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad manifest seq"))?;
+                .map_err(|_| crate::Error::corruption("bad manifest seq"))?;
             entries.push(ManifestEntry {
                 level,
                 seq,
@@ -114,7 +110,7 @@ impl Manifest {
 
     /// Atomically replace the manifest with the given table set and MVCC
     /// sequence high-water mark.
-    pub fn write(&self, entries: &[ManifestEntry], last_seq: Seq) -> io::Result<()> {
+    pub fn write(&self, entries: &[ManifestEntry], last_seq: Seq) -> crate::Result<()> {
         let tmp_path = self.dir.join(MANIFEST_TMP);
         {
             let mut tmp = File::create(&tmp_path)?;

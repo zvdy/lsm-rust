@@ -15,12 +15,17 @@
 //! carries a CRC-32 that is verified on read, so on-disk corruption surfaces
 //! as an error rather than as silently wrong data.
 //!
+//! Every fallible call returns [`Result<T>`], whose [`Error`] distinguishes
+//! corruption, transaction conflicts, invalid arguments and underlying I/O.
+//! It converts to and from [`std::io::Error`], so callers that still work in
+//! [`std::io::Result`] need no changes.
+//!
 //! # Example
 //!
 //! ```no_run
 //! use lsm_rust::Storage;
 //!
-//! fn main() -> std::io::Result<()> {
+//! fn main() -> lsm_rust::Result<()> {
 //!     let mut db = Storage::new("./data", false)?;
 //!
 //!     db.put(b"name".to_vec(), b"Jane Doe".to_vec())?;
@@ -34,6 +39,7 @@
 
 pub mod bloom;
 pub mod checksum;
+pub mod error;
 pub mod memtable;
 pub mod server;
 pub mod sstable;
@@ -51,10 +57,11 @@ pub type Value = Vec<u8>;
 /// what gives the store snapshot isolation.
 pub type Seq = u64;
 
+pub use error::{Error, Result};
 pub use server::{MetricsServer, RespServer};
 pub use sstable::{BlockCache, Compression};
 pub use storage::{
     CompactorHandle, Isolation, LevelStats, ScanIter, SharedStorage, Snapshot, SnapshotScan,
-    Storage, StorageConfig, StorageStats, Transaction, TransactionError, WriteBatch,
+    Storage, StorageConfig, StorageStats, Transaction, WriteBatch,
 };
 pub use wal::WalSync;

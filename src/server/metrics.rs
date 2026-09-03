@@ -38,7 +38,7 @@ pub struct MetricsServer {
 impl MetricsServer {
     /// Start serving metrics for `storage` on `listener` in a background
     /// thread.
-    pub fn spawn(storage: SharedStorage, listener: TcpListener) -> io::Result<Self> {
+    pub fn spawn(storage: SharedStorage, listener: TcpListener) -> crate::Result<Self> {
         let local_addr = listener.local_addr()?;
         let stop = Arc::new(AtomicBool::new(false));
 

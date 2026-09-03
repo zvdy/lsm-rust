@@ -1,7 +1,4 @@
-use super::{
-    Isolation, Snapshot, Storage, StorageConfig, StorageStats, Transaction, TransactionError,
-    WriteBatch,
-};
+use super::{Isolation, Snapshot, Storage, StorageConfig, StorageStats, Transaction, WriteBatch};
 use crate::Seq;
 use crate::{Key, Value};
 use std::collections::{BTreeMap, HashSet};
@@ -25,7 +22,7 @@ use std::time::Duration;
 /// use lsm_rust::SharedStorage;
 /// use std::thread;
 ///
-/// fn main() -> std::io::Result<()> {
+/// fn main() -> lsm_rust::Result<()> {
 ///     let db = SharedStorage::new("./data", false)?;
 ///
 ///     let writer = {
@@ -43,38 +40,38 @@ pub struct SharedStorage {
     inner: Arc<RwLock<Storage>>,
 }
 
-fn poisoned() -> io::Error {
-    io::Error::other("storage lock poisoned by a panicked thread")
+fn poisoned() -> crate::Error {
+    io::Error::other("storage lock poisoned by a panicked thread").into()
 }
 
 impl SharedStorage {
     /// Open (or create) a shared store at `data_dir` with default tuning.
-    pub fn new<P: AsRef<Path>>(data_dir: P, verbose: bool) -> io::Result<Self> {
+    pub fn new<P: AsRef<Path>>(data_dir: P, verbose: bool) -> crate::Result<Self> {
         Ok(Storage::new(data_dir, verbose)?.into_shared())
     }
 
     /// Open (or create) a shared store with explicit tuning options.
-    pub fn with_config<P: AsRef<Path>>(data_dir: P, config: StorageConfig) -> io::Result<Self> {
+    pub fn with_config<P: AsRef<Path>>(data_dir: P, config: StorageConfig) -> crate::Result<Self> {
         Ok(Storage::with_config(data_dir, config)?.into_shared())
     }
 
     /// Look up the current value for `key`. Concurrent with other reads.
-    pub fn get(&self, key: &Key) -> io::Result<Option<Value>> {
+    pub fn get(&self, key: &Key) -> crate::Result<Option<Value>> {
         self.inner.read().map_err(|_| poisoned())?.get(key)
     }
 
     /// Insert or update `key`, durable once this returns.
-    pub fn put(&self, key: Key, value: Value) -> io::Result<()> {
+    pub fn put(&self, key: Key, value: Value) -> crate::Result<()> {
         self.inner.write().map_err(|_| poisoned())?.put(key, value)
     }
 
     /// Delete `key`, durable once this returns.
-    pub fn delete(&self, key: &Key) -> io::Result<()> {
+    pub fn delete(&self, key: &Key) -> crate::Result<()> {
         self.inner.write().map_err(|_| poisoned())?.delete(key)
     }
 
     /// Apply a [`WriteBatch`] atomically, durable once this returns.
-    pub fn write_batch(&self, batch: WriteBatch) -> io::Result<()> {
+    pub fn write_batch(&self, batch: WriteBatch) -> crate::Result<()> {
         self.inner
             .write()
             .map_err(|_| poisoned())?
@@ -82,7 +79,7 @@ impl SharedStorage {
     }
 
     /// Range scan (`start <= key < end`). Concurrent with other reads.
-    pub fn scan(&self, start: &[u8], end: &[u8]) -> io::Result<Vec<(Key, Value)>> {
+    pub fn scan(&self, start: &[u8], end: &[u8]) -> crate::Result<Vec<(Key, Value)>> {
         self.inner.read().map_err(|_| poisoned())?.scan(start, end)
     }
 
@@ -96,9 +93,14 @@ impl SharedStorage {
     ///
     /// Because the lock is held throughout, keep `visit` cheap — do not block
     /// on I/O or attempt to write to the same store from inside it.
-    pub fn scan_for_each<F>(&self, start: &[u8], end: Option<&[u8]>, mut visit: F) -> io::Result<()>
+    pub fn scan_for_each<F>(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        mut visit: F,
+    ) -> crate::Result<()>
     where
-        F: FnMut(Key, Value) -> io::Result<()>,
+        F: FnMut(Key, Value) -> crate::Result<()>,
     {
         let storage = self.inner.read().map_err(|_| poisoned())?;
         for entry in storage.scan_iter(start, end)? {
@@ -110,9 +112,9 @@ impl SharedStorage {
 
     /// Stream entries whose key starts with `prefix` to `visit`, in key order.
     /// See [`SharedStorage::scan_for_each`] for the locking caveat.
-    pub fn scan_prefix_for_each<F>(&self, prefix: &[u8], mut visit: F) -> io::Result<()>
+    pub fn scan_prefix_for_each<F>(&self, prefix: &[u8], mut visit: F) -> crate::Result<()>
     where
-        F: FnMut(Key, Value) -> io::Result<()>,
+        F: FnMut(Key, Value) -> crate::Result<()>,
     {
         let storage = self.inner.read().map_err(|_| poisoned())?;
         for entry in storage.scan_prefix_iter(prefix)? {
@@ -123,7 +125,7 @@ impl SharedStorage {
     }
 
     /// Prefix scan. Concurrent with other reads.
-    pub fn scan_prefix(&self, prefix: &[u8]) -> io::Result<Vec<(Key, Value)>> {
+    pub fn scan_prefix(&self, prefix: &[u8]) -> crate::Result<Vec<(Key, Value)>> {
         self.inner
             .read()
             .map_err(|_| poisoned())?
@@ -133,13 +135,13 @@ impl SharedStorage {
     /// Take a consistent, read-only [`Snapshot`] of the store as of now.
     /// Reads through it (`get_at`, `scan_at`, `scan_prefix_at`) ignore later
     /// writes; drop it when finished so pinned versions can be compacted.
-    pub fn snapshot(&self) -> io::Result<Snapshot> {
+    pub fn snapshot(&self) -> crate::Result<Snapshot> {
         Ok(self.inner.read().map_err(|_| poisoned())?.snapshot())
     }
 
     /// The highest MVCC sequence number assigned so far. Record it as a
     /// logical checkpoint to revisit later via [`SharedStorage::snapshot_at`].
-    pub fn current_sequence(&self) -> io::Result<crate::Seq> {
+    pub fn current_sequence(&self) -> crate::Result<crate::Seq> {
         Ok(self
             .inner
             .read()
@@ -150,12 +152,12 @@ impl SharedStorage {
     /// Open a snapshot positioned at a specific historical `seq`
     /// ("time-travel"). See [`Storage::snapshot_at`] for the semantics and the
     /// retention caveat.
-    pub fn snapshot_at(&self, seq: crate::Seq) -> io::Result<Snapshot> {
+    pub fn snapshot_at(&self, seq: crate::Seq) -> crate::Result<Snapshot> {
         self.inner.read().map_err(|_| poisoned())?.snapshot_at(seq)
     }
 
     /// Look up `key` as seen by `snapshot`. Concurrent with other reads.
-    pub fn get_at(&self, snapshot: &Snapshot, key: &Key) -> io::Result<Option<Value>> {
+    pub fn get_at(&self, snapshot: &Snapshot, key: &Key) -> crate::Result<Option<Value>> {
         self.inner
             .read()
             .map_err(|_| poisoned())?
@@ -168,7 +170,7 @@ impl SharedStorage {
         snapshot: &Snapshot,
         start: &[u8],
         end: &[u8],
-    ) -> io::Result<Vec<(Key, Value)>> {
+    ) -> crate::Result<Vec<(Key, Value)>> {
         self.inner
             .read()
             .map_err(|_| poisoned())?
@@ -180,7 +182,7 @@ impl SharedStorage {
         &self,
         snapshot: &Snapshot,
         prefix: &[u8],
-    ) -> io::Result<Vec<(Key, Value)>> {
+    ) -> crate::Result<Vec<(Key, Value)>> {
         self.inner
             .read()
             .map_err(|_| poisoned())?
@@ -192,12 +194,12 @@ impl SharedStorage {
     /// The transaction reads from a snapshot taken now and buffers its writes
     /// privately until [`Transaction::commit`]. Transactions never block each
     /// other while they run; conflicts are resolved at commit time.
-    pub fn begin(&self) -> io::Result<Transaction> {
+    pub fn begin(&self) -> crate::Result<Transaction> {
         self.begin_with(Isolation::default())
     }
 
     /// Begin an optimistic transaction at an explicit isolation level.
-    pub fn begin_with(&self, isolation: Isolation) -> io::Result<Transaction> {
+    pub fn begin_with(&self, isolation: Isolation) -> crate::Result<Transaction> {
         let snapshot = self.snapshot()?;
         Ok(Transaction::new(self.clone(), snapshot, isolation))
     }
@@ -208,7 +210,7 @@ impl SharedStorage {
     /// shows up as a retry rather than as an error the caller must handle.
     /// `body` may run more than once, so it should not have side effects
     /// outside the transaction. Gives up after `max_retries` conflicts and
-    /// returns the last [`TransactionError::Conflict`].
+    /// returns the last [`Error::Conflict`](crate::Error::Conflict).
     ///
     /// # Example
     ///
@@ -226,9 +228,9 @@ impl SharedStorage {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn transaction<T, F>(&self, max_retries: usize, mut body: F) -> Result<T, TransactionError>
+    pub fn transaction<T, F>(&self, max_retries: usize, mut body: F) -> crate::Result<T>
     where
-        F: FnMut(&mut Transaction) -> Result<T, TransactionError>,
+        F: FnMut(&mut Transaction) -> crate::Result<T>,
     {
         let mut attempt = 0;
         loop {
@@ -253,7 +255,7 @@ impl SharedStorage {
         reads: HashSet<Key>,
         ranges: Vec<(Key, Option<Key>)>,
         isolation: Isolation,
-    ) -> Result<Seq, TransactionError> {
+    ) -> crate::Result<Seq> {
         self.inner
             .write()
             .map_err(|_| poisoned())?
@@ -261,18 +263,18 @@ impl SharedStorage {
     }
 
     /// Number of commit records retained for transaction conflict detection.
-    pub fn tracked_commits(&self) -> io::Result<usize> {
+    pub fn tracked_commits(&self) -> crate::Result<usize> {
         Ok(self.inner.read().map_err(|_| poisoned())?.tracked_commits())
     }
 
     /// Take a point-in-time snapshot of the store's operational metrics.
     /// Concurrent with other reads.
-    pub fn stats(&self) -> io::Result<StorageStats> {
+    pub fn stats(&self) -> crate::Result<StorageStats> {
         Ok(self.inner.read().map_err(|_| poisoned())?.stats())
     }
 
     /// Run any pending compactions now, under the write lock.
-    pub fn compact_now(&self) -> io::Result<()> {
+    pub fn compact_now(&self) -> crate::Result<()> {
         self.inner.write().map_err(|_| poisoned())?.compact_now()
     }
 

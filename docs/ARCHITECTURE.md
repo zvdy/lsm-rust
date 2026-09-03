@@ -279,3 +279,55 @@ shared lock and proceed concurrently; writes (`put`, `delete`, `write_batch`,
 `compact_now`) take the exclusive lock and serialize. The background compactor
 holds only a `Weak` reference, so it never keeps the store alive on its own and
 stops cleanly when the last handle is dropped.
+
+## Error model
+
+Every fallible call returns `lsm_rust::Result<T>`. A single `Error` enum spans
+the whole engine, so failures are classified at the point they are detected
+rather than reconstructed from message text by the caller:
+
+| Variant | Raised by | Retriable |
+| --- | --- | --- |
+| `Corruption(String)` | a CRC mismatch or unparseable structure in an SSTable section, data block, WAL frame, Bloom block or the manifest | no |
+| `Conflict { key }` | commit-time validation against the `CommitLog` | **yes** |
+| `InvalidArgument(String)` | caller misuse, such as `snapshot_at` beyond the current sequence | no |
+| `Io(io::Error)` | the filesystem or a socket | no |
+
+Two properties matter more than the variants themselves.
+
+**Corruption is never silently downgraded.** A checksum mismatch anywhere on
+the read path becomes `Corruption`, never a `None` result and never plausible
+bytes. The one deliberate exception is a WAL frame whose checksum fails *at the
+tail of the file*: that is a torn write from a crash mid-append, indistinguishable
+from a truncated tail, so it is dropped during replay rather than reported —
+the same treatment a short final record gets. A bad checksum anywhere earlier
+is real corruption of durable data and is returned as an error.
+
+**Conflicts are the only retriable failure.** `Error::is_retriable()` is true
+for `Conflict` alone, because a losing transaction is rolled back before
+anything is written — replaying it against a fresh snapshot is safe. Nothing
+else fixes itself on a retry, which is what lets `SharedStorage::transaction`
+loop on `is_retriable()` without risking a write being applied twice.
+
+```mermaid
+flowchart LR
+    OP["Any fallible call"] --> R{"Result"}
+    R -->|Ok| V["value"]
+    R -->|Err| E["Error"]
+    E --> C["Corruption<br/>bad CRC / unparseable"]
+    E --> K["Conflict<br/>lost an optimistic race"]
+    E --> A["InvalidArgument<br/>caller misuse"]
+    E --> I["Io<br/>filesystem or socket"]
+    K -->|is_retriable| RETRY["retry against a fresh snapshot"]
+```
+
+`Error` converts to and from `std::io::Error` in both directions. `From<io::Error>`
+lets the engine use `?` over `File` and socket calls; `From<Error> for io::Error`
+maps `Corruption` to `InvalidData`, `Conflict` to `WouldBlock` and
+`InvalidArgument` to `InvalidInput`, and passes an `Io` error through untouched
+so a round trip preserves the original OS error. Callers whose own signatures
+are still `io::Result` therefore need no changes.
+
+The RESP and metrics servers keep their private wire helpers on `io::Result`,
+since parsing a socket is pure I/O; their public `spawn` entry points return
+`lsm_rust::Result`, so the crate's public surface speaks one error type.

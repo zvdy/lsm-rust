@@ -56,11 +56,11 @@ pub struct WAL {
 }
 
 impl WAL {
-    pub fn new(path: PathBuf) -> io::Result<Self> {
+    pub fn new(path: PathBuf) -> crate::Result<Self> {
         Self::with_sync(path, WalSync::Always)
     }
 
-    pub fn with_sync(path: PathBuf, sync: WalSync) -> io::Result<Self> {
+    pub fn with_sync(path: PathBuf, sync: WalSync) -> crate::Result<Self> {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -75,7 +75,7 @@ impl WAL {
         })
     }
 
-    pub fn append(&mut self, op: Operation, key: &[u8], value: Option<&[u8]>) -> io::Result<()> {
+    pub fn append(&mut self, op: Operation, key: &[u8], value: Option<&[u8]>) -> crate::Result<()> {
         let mut body = Vec::new();
         Self::write_entry(&mut body, op, key, value)?;
         self.write_framed(&body)?;
@@ -85,7 +85,7 @@ impl WAL {
 
     /// Append several operations as a single atomic record. On replay the
     /// whole batch is applied or, if a crash truncated it, none of it is.
-    pub fn append_batch(&mut self, entries: &[BatchEntry]) -> io::Result<()> {
+    pub fn append_batch(&mut self, entries: &[BatchEntry]) -> crate::Result<()> {
         let mut body = Vec::new();
         body.push(BATCH_MARKER);
         body.extend_from_slice(&(entries.len() as u32).to_le_bytes());
@@ -98,11 +98,12 @@ impl WAL {
     }
 
     /// Wrap a record body in the checksummed frame and append it.
-    fn write_framed(&mut self, body: &[u8]) -> io::Result<()> {
+    fn write_framed(&mut self, body: &[u8]) -> crate::Result<()> {
         self.file.write_all(&[CRC_MARKER])?;
         self.file.write_all(&crc32(body).to_le_bytes())?;
         self.file.write_all(&(body.len() as u32).to_le_bytes())?;
-        self.file.write_all(body)
+        self.file.write_all(body)?;
+        Ok(())
     }
 
     /// Write one `[op][key_size][key][value_size?][value?]` entry.
@@ -111,7 +112,7 @@ impl WAL {
         op: Operation,
         key: &[u8],
         value: Option<&[u8]>,
-    ) -> io::Result<()> {
+    ) -> crate::Result<()> {
         let op_byte = match op {
             Operation::Put => 0u8,
             Operation::Delete => 1u8,
@@ -128,7 +129,7 @@ impl WAL {
 
     /// Account one commit (a single append or a whole batch) and fsync
     /// according to the sync policy.
-    fn after_commit(&mut self) -> io::Result<()> {
+    fn after_commit(&mut self) -> crate::Result<()> {
         self.unsynced_writes += 1;
         match self.sync {
             WalSync::Always => self.sync_now()?,
@@ -142,7 +143,7 @@ impl WAL {
     }
 
     /// Force any batched appends to disk.
-    pub fn sync_now(&mut self) -> io::Result<()> {
+    pub fn sync_now(&mut self) -> crate::Result<()> {
         if self.unsynced_writes > 0 {
             self.file.sync_data()?;
             self.unsynced_writes = 0;
@@ -156,7 +157,7 @@ impl WAL {
     /// such a truncated tail — a single entry or an incomplete batch — is
     /// silently discarded rather than failing recovery of the complete
     /// records before it.
-    pub fn replay(&mut self) -> io::Result<Vec<WalRecord>> {
+    pub fn replay(&mut self) -> crate::Result<Vec<WalRecord>> {
         let mut records = Vec::new();
         let mut buffer = Vec::new();
 
@@ -218,33 +219,25 @@ impl WAL {
                         if end >= buffer.len() {
                             break;
                         }
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "WAL record checksum mismatch at offset {}: \
-                                 expected {:#010x}, got {:#010x}",
-                                pos,
-                                expected,
-                                crc32(body)
-                            ),
-                        ));
+                        return Err(crate::Error::corruption(format!(
+                            "WAL record checksum mismatch at offset {}: \
+                             expected {:#010x}, got {:#010x}",
+                            pos,
+                            expected,
+                            crc32(body)
+                        )));
                     }
 
                     let Some(record) = Self::parse_body(body) else {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("malformed WAL record body at offset {}", pos),
-                        ));
+                        return Err(crate::Error::corruption(format!(
+                            "malformed WAL record body at offset {}",
+                            pos
+                        )));
                     };
                     records.push(record);
                     pos = end;
                 }
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Invalid operation type",
-                    ))
-                }
+                _ => return Err(crate::Error::corruption("unrecognized WAL operation type")),
             }
         }
 
@@ -306,7 +299,7 @@ impl WAL {
         Some(u32::from_le_bytes(bytes.try_into().unwrap()))
     }
 
-    pub fn clear(&mut self) -> io::Result<()> {
+    pub fn clear(&mut self) -> crate::Result<()> {
         self.file = OpenOptions::new()
             .create(true)
             .write(true)

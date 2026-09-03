@@ -56,7 +56,7 @@ fn streaming_scan_matches_the_materializing_scan() {
     let streamed: Vec<_> = db
         .scan_iter(b"key", Some(b"kez"))
         .unwrap()
-        .collect::<std::io::Result<Vec<_>>>()
+        .collect::<lsm_rust::Result<Vec<_>>>()
         .unwrap();
     let materialized = db.scan(b"key", b"kez").unwrap();
 
@@ -115,7 +115,7 @@ fn prefix_iter_matches_prefix_scan() {
     let streamed: Vec<_> = db
         .scan_prefix_iter(b"user:")
         .unwrap()
-        .collect::<std::io::Result<Vec<_>>>()
+        .collect::<lsm_rust::Result<Vec<_>>>()
         .unwrap();
     assert_eq!(streamed, db.scan_prefix(b"user:").unwrap());
     assert_eq!(streamed.len(), 200);
@@ -233,12 +233,14 @@ fn shared_storage_streams_without_materializing() {
         .scan_prefix_for_each(b"k", |_k, _v| {
             seen += 1;
             if seen == 10 {
-                Err(std::io::Error::other("stop"))
+                Err(std::io::Error::other("stop").into())
             } else {
                 Ok(())
             }
         })
         .unwrap_err();
     assert_eq!(seen, 10);
-    assert_eq!(err.to_string(), "stop");
+    // The callback's own error reaches the caller unchanged, as `Error::Io`.
+    assert!(matches!(err, lsm_rust::Error::Io(_)), "{err:?}");
+    assert!(err.to_string().contains("stop"), "{err}");
 }

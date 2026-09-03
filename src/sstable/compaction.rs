@@ -2,7 +2,6 @@ use super::{SSTable, VersionedEntry};
 use crate::{Key, Seq};
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
-use std::io;
 
 /// Decides when a level needs compaction and merges its SSTables.
 pub struct CompactionManager {
@@ -55,7 +54,7 @@ impl CompactionManager {
         tables: &[SSTable],
         drop_tombstones: bool,
         gc_floor: Seq,
-    ) -> io::Result<Vec<VersionedEntry>> {
+    ) -> crate::Result<Vec<VersionedEntry>> {
         // Sorted by (key asc, seq desc). Inserting oldest table first means a
         // newer table's value wins for a colliding (key, seq) legacy entry.
         let mut merged: BTreeMap<(Key, Reverse<Seq>), Option<Vec<u8>>> = BTreeMap::new();
