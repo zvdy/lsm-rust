@@ -2,14 +2,17 @@ mod manifest;
 mod shared;
 mod snapshot;
 mod stats;
+mod transaction;
 use manifest::{Manifest, ManifestEntry};
 pub use shared::{CompactorHandle, SharedStorage};
 pub use snapshot::Snapshot;
 use snapshot::SnapshotRegistry;
 use stats::Metrics;
 pub use stats::{LevelStats, StorageStats};
+use transaction::CommitLog;
+pub use transaction::{Isolation, Transaction, TransactionError};
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -168,6 +171,8 @@ pub struct Storage {
     /// `seq_counter + 1`; a read or snapshot at "now" sees seqs `<= seq_counter`.
     seq_counter: Seq,
     snapshots: Arc<SnapshotRegistry>,
+    /// Write sets of recent commits, used to validate optimistic transactions.
+    commits: CommitLog,
     metrics: Metrics,
     compaction_manager: CompactionManager,
     block_cache: Option<Arc<BlockCache>>,
@@ -329,6 +334,7 @@ impl Storage {
             sstable_counter: counter,
             seq_counter,
             snapshots: Arc::new(SnapshotRegistry::default()),
+            commits: CommitLog::default(),
             metrics: Metrics::default(),
             compaction_manager,
             block_cache,
@@ -607,8 +613,10 @@ impl Storage {
 
         // Assign the next sequence number and record this version
         self.seq_counter += 1;
-        self.memtable.insert(key, self.seq_counter, value);
+        let seq = self.seq_counter;
+        self.memtable.insert(key.clone(), seq, value);
         Metrics::incr(&self.metrics.puts);
+        self.note_commit(seq, HashSet::from([key]));
 
         self.maybe_flush_memtable()
     }
@@ -627,8 +635,10 @@ impl Storage {
         // plain removal) is what shadows older values still living in SSTables
         // and is flushed to disk alongside regular entries.
         self.seq_counter += 1;
-        self.memtable.delete(key.clone(), self.seq_counter);
+        let seq = self.seq_counter;
+        self.memtable.delete(key.clone(), seq);
         Metrics::incr(&self.metrics.deletes);
+        self.note_commit(seq, HashSet::from([key.clone()]));
 
         self.maybe_flush_memtable()
     }
@@ -658,12 +668,73 @@ impl Storage {
         // later ops on a key supersede earlier ones (same seq, insert wins).
         self.seq_counter += 1;
         let seq = self.seq_counter;
+        let mut written = HashSet::with_capacity(batch.ops.len());
         for (op, key, value) in batch.ops {
+            written.insert(key.clone());
             apply_op(&mut self.memtable, seq, op, key, value);
         }
         Metrics::incr(&self.metrics.batches);
+        self.note_commit(seq, written);
 
         self.maybe_flush_memtable()
+    }
+
+    /// Record the keys a commit at `seq` wrote, so in-flight transactions can
+    /// detect that their snapshot went stale, then drop records no live
+    /// transaction could still be validated against.
+    ///
+    /// Every write path funnels through here — including plain `put`, `delete`
+    /// and `write_batch` — because a transaction must conflict with concurrent
+    /// non-transactional writes just as it does with transactional ones.
+    fn note_commit(&mut self, seq: Seq, keys: HashSet<Key>) {
+        self.commits.record(seq, keys);
+        let oldest_live = self.snapshots.oldest().unwrap_or(self.seq_counter);
+        self.commits.prune(oldest_live);
+    }
+
+    /// Validate an optimistic transaction against everything committed since
+    /// its snapshot and, if it still holds, apply its writes atomically.
+    ///
+    /// Runs entirely under the engine's exclusive lock, so validation and
+    /// application are a single atomic step: no other commit can slip between
+    /// deciding that a transaction is valid and making its writes visible.
+    pub(crate) fn commit_transaction(
+        &mut self,
+        snapshot_seq: Seq,
+        writes: BTreeMap<Key, Option<Value>>,
+        reads: HashSet<Key>,
+        ranges: Vec<(Key, Option<Key>)>,
+        isolation: Isolation,
+    ) -> Result<Seq, TransactionError> {
+        if let Some(key) =
+            self.commits
+                .find_conflict(snapshot_seq, &writes, &reads, &ranges, isolation)
+        {
+            return Err(TransactionError::Conflict { key });
+        }
+
+        // Apply as one atomic batch: a single sequence number and one WAL
+        // record, so the transaction is visible and durable all-or-nothing.
+        let mut batch = WriteBatch::new();
+        for (key, value) in writes {
+            match value {
+                Some(value) => {
+                    batch.put(key, value);
+                }
+                None => {
+                    batch.delete(key);
+                }
+            }
+        }
+        // `write_batch` records the write set and prunes for us.
+        self.write_batch(batch)?;
+
+        Ok(self.seq_counter)
+    }
+
+    /// Number of commit records currently retained for conflict detection.
+    pub fn tracked_commits(&self) -> usize {
+        self.commits.len()
     }
 
     fn maybe_flush_memtable(&mut self) -> io::Result<()> {
