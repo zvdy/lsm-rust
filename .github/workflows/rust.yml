@@ -41,13 +41,19 @@ jobs:
 
   test:
     name: Test Suite
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        # `stable` gates merges; `beta` is an early-warning signal for
-        # upcoming compiler changes and is allowed to fail.
-        toolchain: [ stable, beta ]
+        include:
+          # Linux on `stable` is the primary gate. macOS and Windows catch
+          # path, fsync and file-locking assumptions that Linux hides.
+          - { os: ubuntu-latest, toolchain: stable }
+          - { os: macos-latest, toolchain: stable }
+          - { os: windows-latest, toolchain: stable }
+          # `beta` is an early-warning signal for upcoming compiler changes
+          # and is allowed to fail.
+          - { os: ubuntu-latest, toolchain: beta }
     continue-on-error: ${{ matrix.toolchain == 'beta' }}
     steps:
       - uses: actions/checkout@v7
@@ -60,8 +66,10 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
+      # Invoked directly rather than through `make test` because the Windows
+      # runner has no make; this is exactly what that target runs.
       - name: Run tests
-        run: make test
+        run: cargo test --all-features
 
   docs:
     name: Docs
