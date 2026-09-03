@@ -7,6 +7,10 @@
 //! Reads consult the memtable first, then SSTables from newest to oldest,
 //! using per-table Bloom filters to skip tables that cannot contain the key.
 //!
+//! Every SSTable section, SSTable data block, and write-ahead log record
+//! carries a CRC-32 that is verified on read, so on-disk corruption surfaces
+//! as an error rather than as silently wrong data.
+//!
 //! # Example
 //!
 //! ```no_run
@@ -25,6 +29,7 @@
 //! ```
 
 pub mod bloom;
+pub mod checksum;
 pub mod memtable;
 pub mod server;
 pub mod sstable;

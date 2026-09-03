@@ -1,3 +1,4 @@
+use crate::checksum::crc32;
 use crate::{Key, Value};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
@@ -25,6 +26,13 @@ pub enum WalRecord {
 
 /// Marker byte introducing a batch record: `[2][count u32][entry...]`.
 const BATCH_MARKER: u8 = 2;
+
+/// Marker byte introducing a checksummed record:
+/// `[3][crc u32][body_len u32][body]`, where `body` is an unframed record
+/// (a single entry or a batch). Every record written now uses this framing;
+/// the unchecksummed markers above are still replayed so a log written by an
+/// older build stays readable.
+const CRC_MARKER: u8 = 3;
 
 /// When the write-ahead log fsyncs to disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -68,7 +76,9 @@ impl WAL {
     }
 
     pub fn append(&mut self, op: Operation, key: &[u8], value: Option<&[u8]>) -> io::Result<()> {
-        Self::write_entry(&mut self.file, op, key, value)?;
+        let mut body = Vec::new();
+        Self::write_entry(&mut body, op, key, value)?;
+        self.write_framed(&body)?;
         self.file.flush()?;
         self.after_commit()
     }
@@ -76,18 +86,28 @@ impl WAL {
     /// Append several operations as a single atomic record. On replay the
     /// whole batch is applied or, if a crash truncated it, none of it is.
     pub fn append_batch(&mut self, entries: &[BatchEntry]) -> io::Result<()> {
-        self.file.write_all(&[BATCH_MARKER])?;
-        self.file.write_all(&(entries.len() as u32).to_le_bytes())?;
+        let mut body = Vec::new();
+        body.push(BATCH_MARKER);
+        body.extend_from_slice(&(entries.len() as u32).to_le_bytes());
         for entry in entries {
-            Self::write_entry(&mut self.file, entry.op, entry.key, entry.value)?;
+            Self::write_entry(&mut body, entry.op, entry.key, entry.value)?;
         }
+        self.write_framed(&body)?;
         self.file.flush()?;
         self.after_commit()
     }
 
+    /// Wrap a record body in the checksummed frame and append it.
+    fn write_framed(&mut self, body: &[u8]) -> io::Result<()> {
+        self.file.write_all(&[CRC_MARKER])?;
+        self.file.write_all(&crc32(body).to_le_bytes())?;
+        self.file.write_all(&(body.len() as u32).to_le_bytes())?;
+        self.file.write_all(body)
+    }
+
     /// Write one `[op][key_size][key][value_size?][value?]` entry.
     fn write_entry(
-        file: &mut File,
+        file: &mut impl Write,
         op: Operation,
         key: &[u8],
         value: Option<&[u8]>,
@@ -177,6 +197,48 @@ impl WAL {
                     pos = p;
                     records.push(WalRecord::Batch(batch));
                 }
+                CRC_MARKER => {
+                    let mut p = pos + 1;
+                    let (Some(expected), Some(len)) = (
+                        Self::read_u32(&buffer, &mut p),
+                        Self::read_u32(&buffer, &mut p),
+                    ) else {
+                        break; // truncated tail
+                    };
+                    let Some(body) = buffer.get(p..p + len as usize) else {
+                        break; // truncated tail
+                    };
+                    let end = p + len as usize;
+
+                    if crc32(body) != expected {
+                        // A torn write while appending the last record leaves a
+                        // complete-looking frame with a bad checksum; that is
+                        // the same situation as a truncated tail, so drop it.
+                        // Anywhere else it is real corruption of durable data.
+                        if end >= buffer.len() {
+                            break;
+                        }
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "WAL record checksum mismatch at offset {}: \
+                                 expected {:#010x}, got {:#010x}",
+                                pos,
+                                expected,
+                                crc32(body)
+                            ),
+                        ));
+                    }
+
+                    let Some(record) = Self::parse_body(body) else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("malformed WAL record body at offset {}", pos),
+                        ));
+                    };
+                    records.push(record);
+                    pos = end;
+                }
                 _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -187,6 +249,28 @@ impl WAL {
         }
 
         Ok(records)
+    }
+
+    /// Parse an unframed record body: either a single entry or a batch.
+    /// Returns `None` if the body is malformed or incomplete.
+    fn parse_body(body: &[u8]) -> Option<WalRecord> {
+        let mut p = 0;
+        match *body.first()? {
+            0 | 1 => {
+                let (op, key, value) = Self::parse_entry(body, &mut p)?;
+                Some(WalRecord::Single(op, key, value))
+            }
+            BATCH_MARKER => {
+                p = 1;
+                let count = Self::read_u32(body, &mut p)?;
+                let mut batch = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    batch.push(Self::parse_entry(body, &mut p)?);
+                }
+                Some(WalRecord::Batch(batch))
+            }
+            _ => None,
+        }
     }
 
     /// Parse one `[op][key][value?]` entry, returning None if the buffer ends

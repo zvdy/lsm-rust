@@ -13,6 +13,9 @@ atomic write batches, and a Prometheus metrics endpoint.
 - **Durable, crash-safe writes** — a write-ahead log fsynced before ack;
   torn-tail entries and orphaned tables are cleaned up on recovery, tracked by
   a crash-atomic manifest.
+- **End-to-end checksums** — a CRC-32 on every SSTable section, every data
+  block, and every WAL record turns silent corruption into a clean error
+  instead of plausible-looking garbage.
 - **MVCC snapshot isolation** — every write is sequence-numbered; a `Snapshot`
   reads a consistent view unaffected by later writes, flushes, or compactions.
 - **Time-travel reads** — revisit the store as of any recorded sequence

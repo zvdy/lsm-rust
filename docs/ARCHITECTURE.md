@@ -135,19 +135,21 @@ write path or on a dedicated background thread.
 
 ## On-disk formats
 
-### SSTable (versioned, v3)
+### SSTable (versioned, v4)
 
-v3 stores a sequence number per entry (MVCC). v2 (no sequence) and pre-header
-legacy files remain readable through fallback paths, with their entries treated
-as sequence 0.
+v4 adds a CRC-32 to every section and every data block. v3 (sequence numbers,
+no checksums), v2 (no sequence numbers) and pre-header legacy files remain
+readable through fallback paths; v2 and legacy entries are treated as
+sequence 0.
 
 ```text
-┌───────┬─────────┬───────┬─────────────┬─────────────┬───────────────────┐
-│ magic │ version │ flags │ bloom       │ sparse      │ data blocks       │
-│ LSMT  │ u8 = 3  │ u8    │ len + bytes │ index       │ key-aligned, one  │
-│       │         │       │             │ len + bytes │ block per lookup  │
-└───────┴─────────┴───────┴─────────────┴─────────────┴───────────────────┘
+┌───────┬─────────┬───────┬───────────────────┬───────────────────┬─────────────────┐
+│ magic │ version │ flags │ bloom             │ sparse index      │ data blocks     │
+│ LSMT  │ u8 = 4  │ u8    │ len + crc + bytes │ len + crc + bytes │ crc + payload   │
+└───────┴─────────┴───────┴───────────────────┴───────────────────┴─────────────────┘
 
+section:      [len u32][crc32 u32][body]
+data block:   [crc32 u32][payload]        payload = entries, LZ4-compressed if flagged
 index entry:  [first_key_len u32][first_key][block_offset u64][block_len u32]
 data entry:   [key_len u32][key][seq u64][value_len u32][value]
 tombstone:    [key_len u32][key][seq u64][0xFFFFFFFF]
@@ -158,17 +160,31 @@ key's versions are never split across blocks, so a snapshot lookup reads a
 single block and returns the newest version at or below its sequence. The
 `flags` byte records per-block compression (e.g. LZ4).
 
+A block's checksum covers the bytes **as stored** — after compression — so
+corruption is caught before the decompressor is handed the data. Section
+checksums are verified while opening the table, so a damaged index or bloom
+filter fails loudly at open instead of silently mis-routing later lookups.
+
 ### Write-ahead log (WAL)
 
 ```text
-entry:  [op u8][key_len u32][key][value_len u32][value]
-batch:  [2][count u32] followed by `count` entries
+record: [3][crc32 u32][body_len u32][body]
+
+body — one of:
+  entry:  [op u8][key_len u32][key][value_len u32][value]
+  batch:  [2][count u32] followed by `count` entries
 ```
 
 `op` is `0` for a put (with value) and `1` for a delete (without). An atomic
-write batch is one framed record (`op` marker `2`) recovered whole or not at
-all. Replay tolerates a truncated final record, so a crash mid-write never
-corrupts recovery.
+write batch is a body introduced by marker `2`, recovered whole or not at all.
+
+Every record written is wrapped in the checksummed frame (marker `3`); the
+older unframed markers are still replayed so a log written by an earlier build
+stays readable. Replay tolerates a truncated final record, and a *checksum*
+failure on the final record is treated the same way — a torn write is
+indistinguishable from truncation, so it is dropped and recovery continues. A
+checksum failure anywhere earlier in the log is real corruption of durable data
+and is reported as an error.
 
 ### Manifest
 

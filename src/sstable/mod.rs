@@ -1,4 +1,5 @@
 use crate::bloom::BloomFilter;
+use crate::checksum::crc32;
 use crate::{Key, Seq, Value};
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -24,7 +25,7 @@ const FLAG_LZ4: u8 = 0b0000_0001;
 /// Current on-disk format version. v3 stores a sequence number per entry
 /// (MVCC). v2 is the same layout without the per-entry sequence; it is still
 /// read (all entries treated as sequence 0).
-const FORMAT_VERSION: u8 = 3;
+const FORMAT_VERSION: u8 = 4;
 /// Soft target for the number of entries per data block. A block is never
 /// split in the middle of a key's versions, so all versions of a key are
 /// always in one block and a point lookup reads a single block.
@@ -72,14 +73,16 @@ enum Layout {
     /// treated as sequence 0.
     Legacy { data_start: u64 },
     /// Versioned format: header + bloom + sparse index + data blocks.
-    /// `has_seq` distinguishes v3 (per-entry sequence) from v2 (no sequence,
-    /// treated as sequence 0). Lookups binary-search the index and read a
-    /// single block.
+    /// `has_seq` distinguishes v3/v4 (per-entry sequence) from v2 (no
+    /// sequence, treated as sequence 0); `has_block_crc` marks v4, whose
+    /// sections and data blocks each carry a CRC-32. Lookups binary-search
+    /// the index and read a single block.
     Versioned {
         data_start: u64,
         index: Vec<IndexEntry>,
         compression: Compression,
         has_seq: bool,
+        has_block_crc: bool,
     },
 }
 
@@ -217,9 +220,12 @@ impl SSTable {
             let mut version_flags = [0u8; 2];
             file.read_exact(&mut version_flags)?;
             let version = version_flags[0];
-            let has_seq = match version {
-                2 => false,
-                3 => true,
+            // v2: no sequence numbers. v3: per-entry sequence. v4: adds a
+            // CRC-32 over every section and data block.
+            let (has_seq, has_block_crc) = match version {
+                2 => (false, false),
+                3 => (true, false),
+                4 => (true, true),
                 _ => return Err(invalid_data("unsupported SSTable format version")),
             };
             let compression = if version_flags[1] & FLAG_LZ4 != 0 {
@@ -228,19 +234,13 @@ impl SSTable {
                 Compression::None
             };
 
-            // Bloom filter
-            let mut len_bytes = [0u8; 4];
-            file.read_exact(&mut len_bytes)?;
-            let bloom_len = u32::from_le_bytes(len_bytes) as usize;
-            let mut bloom_bytes = vec![0u8; bloom_len];
-            file.read_exact(&mut bloom_bytes)?;
+            // Bloom filter, then the sparse index. In v4 each section is
+            // preceded by its length and a CRC-32 verified before use, so a
+            // corrupted header fails loudly instead of yielding a bogus index.
+            let bloom_bytes = Self::read_section(&mut file, has_block_crc, "bloom filter")?;
             let bloom = BloomFilter::from_bytes(&bloom_bytes).ok();
 
-            // Sparse index
-            file.read_exact(&mut len_bytes)?;
-            let index_len = u32::from_le_bytes(len_bytes) as usize;
-            let mut index_bytes = vec![0u8; index_len];
-            file.read_exact(&mut index_bytes)?;
+            let index_bytes = Self::read_section(&mut file, has_block_crc, "sparse index")?;
             let index = Self::parse_index(&index_bytes)?;
 
             let data_start = file.stream_position()?;
@@ -251,6 +251,7 @@ impl SSTable {
                     index,
                     compression,
                     has_seq,
+                    has_block_crc,
                 },
             ))
         } else {
@@ -262,6 +263,44 @@ impl SSTable {
             let data_start = 4 + bloom_len as u64;
             Ok((bloom, Layout::Legacy { data_start }))
         }
+    }
+
+    /// Read a length-prefixed header section. In v4 the length is followed
+    /// by a CRC-32 of the section body, which is verified before the bytes
+    /// are handed on; older versions store the body alone.
+    fn read_section(file: &mut File, has_crc: bool, what: &str) -> io::Result<Vec<u8>> {
+        let mut len_bytes = [0u8; 4];
+        file.read_exact(&mut len_bytes)?;
+        let len = u32::from_le_bytes(len_bytes) as usize;
+
+        let expected = if has_crc {
+            let mut crc_bytes = [0u8; 4];
+            file.read_exact(&mut crc_bytes)?;
+            Some(u32::from_le_bytes(crc_bytes))
+        } else {
+            None
+        };
+
+        let mut body = vec![0u8; len];
+        file.read_exact(&mut body)?;
+
+        if let Some(expected) = expected {
+            let actual = crc32(&body);
+            if actual != expected {
+                return Err(invalid_data(&format!(
+                    "{} checksum mismatch: expected {:#010x}, got {:#010x}",
+                    what, expected, actual
+                )));
+            }
+        }
+        Ok(body)
+    }
+
+    /// Write a header section as `[len][crc][body]` (v4 framing).
+    fn write_section(file: &mut File, body: &[u8]) -> io::Result<()> {
+        file.write_all(&(body.len() as u32).to_le_bytes())?;
+        file.write_all(&crc32(body).to_le_bytes())?;
+        file.write_all(body)
     }
 
     fn parse_index(bytes: &[u8]) -> io::Result<Vec<IndexEntry>> {
@@ -355,12 +394,14 @@ impl SSTable {
             block_buf.clear();
             encode_entries(chunk, &mut block_buf);
             let offset = data_section.len() as u64;
-            match compression {
-                Compression::None => data_section.extend_from_slice(&block_buf),
-                Compression::Lz4 => {
-                    data_section.extend(lz4_flex::compress_prepend_size(&block_buf))
-                }
-            }
+            // The checksum covers the bytes as stored (after compression), so
+            // corruption is caught before the decompressor ever sees them.
+            let stored = match compression {
+                Compression::None => block_buf.clone(),
+                Compression::Lz4 => lz4_flex::compress_prepend_size(&block_buf),
+            };
+            data_section.extend_from_slice(&crc32(&stored).to_le_bytes());
+            data_section.extend_from_slice(&stored);
             let len = (data_section.len() as u64 - offset) as u32;
             index.push(IndexEntry {
                 first_key: chunk[0].0.clone(),
@@ -384,10 +425,8 @@ impl SSTable {
         let mut file = File::create(&self.path)?;
         file.write_all(MAGIC)?;
         file.write_all(&[FORMAT_VERSION, flags])?;
-        file.write_all(&(bloom_bytes.len() as u32).to_le_bytes())?;
-        file.write_all(&bloom_bytes)?;
-        file.write_all(&(index_bytes.len() as u32).to_le_bytes())?;
-        file.write_all(&index_bytes)?;
+        Self::write_section(&mut file, &bloom_bytes)?;
+        Self::write_section(&mut file, &index_bytes)?;
         let data_start = file.stream_position()?;
         file.write_all(&data_section)?;
         file.sync_all()?;
@@ -399,6 +438,7 @@ impl SSTable {
             index,
             compression,
             has_seq: true,
+            has_block_crc: true,
         };
         Ok(())
     }
@@ -410,6 +450,7 @@ impl SSTable {
         data_start: u64,
         entry: &IndexEntry,
         compression: Compression,
+        has_block_crc: bool,
     ) -> io::Result<Arc<Vec<u8>>> {
         if let Some(cache) = &self.cache {
             if let Some(block) = cache.get(&self.path, entry.offset) {
@@ -417,7 +458,27 @@ impl SSTable {
             }
         }
 
-        let raw = self.read_range(data_start + entry.offset, entry.len as usize)?;
+        let mut raw = self.read_range(data_start + entry.offset, entry.len as usize)?;
+
+        // v4 blocks are stored as `[crc u32][payload]`. Verify before doing
+        // anything else with the bytes: a corrupted block must surface as an
+        // error rather than as decompression garbage or bogus entries.
+        if has_block_crc {
+            if raw.len() < 4 {
+                return Err(invalid_data("data block too short to hold a checksum"));
+            }
+            let expected = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+            let payload = &raw[4..];
+            let actual = crc32(payload);
+            if actual != expected {
+                return Err(invalid_data(&format!(
+                    "data block checksum mismatch at offset {}: expected {:#010x}, got {:#010x}",
+                    entry.offset, expected, actual
+                )));
+            }
+            raw = payload.to_vec();
+        }
+
         let block = Arc::new(match compression {
             Compression::None => raw,
             Compression::Lz4 => lz4_flex::decompress_size_prepended(&raw)
@@ -461,10 +522,12 @@ impl SSTable {
                 index,
                 compression,
                 has_seq,
+                has_block_crc,
             } => {
                 let mut data = Vec::new();
                 for entry in index {
-                    let block = self.read_block(*data_start, entry, *compression)?;
+                    let block =
+                        self.read_block(*data_start, entry, *compression, *has_block_crc)?;
                     data.extend(parse_entries(&block, *has_seq)?);
                 }
                 Ok(data)
@@ -505,6 +568,7 @@ impl SSTable {
                 index,
                 compression,
                 has_seq,
+                has_block_crc,
             } => {
                 // Blocks before the candidate hold only keys < start; blocks
                 // whose first key is >= end hold only keys past the range.
@@ -516,7 +580,8 @@ impl SSTable {
                     if end.is_some_and(|e| entry.first_key.as_slice() >= e) {
                         break;
                     }
-                    let block = self.read_block(*data_start, entry, *compression)?;
+                    let block =
+                        self.read_block(*data_start, entry, *compression, *has_block_crc)?;
                     for (k, seq, v) in parse_entries(&block, *has_seq)? {
                         if in_range(&k) {
                             out.push((k, seq, v));
@@ -579,6 +644,7 @@ impl SSTable {
                 index,
                 compression,
                 has_seq,
+                has_block_crc,
             } => {
                 // The candidate block is the last one whose first key is
                 // <= the target; earlier blocks only hold smaller keys.
@@ -587,7 +653,7 @@ impl SSTable {
                     return Ok(SSTableLookup::NotFound);
                 }
                 let entry = &index[candidate - 1];
-                let block = self.read_block(*data_start, entry, *compression)?;
+                let block = self.read_block(*data_start, entry, *compression, *has_block_crc)?;
                 Self::scan_entries_at(&block, key, snapshot_seq, true, *has_seq)
             }
         }
