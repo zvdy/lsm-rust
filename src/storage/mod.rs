@@ -1,9 +1,11 @@
+pub mod checkpoint;
 mod manifest;
 mod scan;
 mod shared;
 mod snapshot;
 mod stats;
 mod transaction;
+pub use checkpoint::CheckpointInfo;
 use manifest::{Manifest, ManifestEntry};
 pub use scan::{ScanIter, SnapshotScan};
 pub use shared::{CompactorHandle, SharedStorage};
@@ -24,6 +26,9 @@ use crate::memtable::MemTable;
 use crate::sstable::{BlockCache, CompactionManager, Compression, SSTable, SSTableLookup};
 use crate::wal::{BatchEntry, Operation, WalRecord, WalSync, WAL};
 use crate::{Key, Seq, Value};
+
+/// Name of the write-ahead log inside the data directory.
+const WAL_FILE: &str = "wal";
 
 /// Smallest byte string strictly greater than every string with this
 /// prefix, or `None` if no such bound exists (prefix is empty or all 0xFF).
@@ -255,7 +260,7 @@ impl Storage {
             }
         }
 
-        let wal_path = data_dir.as_ref().join("wal");
+        let wal_path = data_dir.as_ref().join(WAL_FILE);
         let mut wal = WAL::with_sync(wal_path, config.wal_sync)?;
         let mut memtable = MemTable::new();
 
@@ -352,9 +357,8 @@ impl Storage {
         Ok(storage)
     }
 
-    /// Atomically record the current live table set in the manifest. Called
-    /// at every commit point where the table set changes.
-    fn persist_manifest(&self) -> crate::Result<()> {
+    /// The live table set as manifest entries, sorted by (level, seq).
+    fn manifest_entries(&self) -> Vec<ManifestEntry> {
         let mut entries = Vec::new();
         for (level, tables) in &self.sstables {
             for table in tables {
@@ -369,7 +373,14 @@ impl Storage {
             }
         }
         entries.sort_by_key(|e| (e.level, e.seq));
-        self.manifest.write(&entries, self.seq_counter)
+        entries
+    }
+
+    /// Atomically record the current live table set in the manifest. Called
+    /// at every commit point where the table set changes.
+    fn persist_manifest(&self) -> crate::Result<()> {
+        self.manifest
+            .write(&self.manifest_entries(), self.seq_counter)
     }
 
     /// Take a snapshot: a consistent, read-only view of the store as of now.
@@ -449,6 +460,7 @@ impl Storage {
             scans_total: self.metrics.scans.load(Relaxed),
             flushes_total: self.metrics.flushes.load(Relaxed),
             compactions_total: self.metrics.compactions.load(Relaxed),
+            checkpoints_total: self.metrics.checkpoints.load(Relaxed),
             sequence: self.seq_counter,
             live_snapshots: self.snapshots.live_count(),
             memtable_bytes: self.memtable.size() as u64,
@@ -844,6 +856,118 @@ impl Storage {
     /// Run any pending compactions across all levels, regardless of the
     /// `inline_compaction` setting. Returns once every level is within its
     /// threshold.
+    /// Write a consistent, point-in-time copy of the store to `target`.
+    ///
+    /// The store is held exclusively for the duration, so the SSTables, the
+    /// write-ahead log and the manifest captured are all from the same
+    /// instant — which is what copying a live data directory by hand cannot
+    /// guarantee. See the [`checkpoint`] module docs for
+    /// why that matters, and for what a checkpoint costs on disk over time.
+    ///
+    /// SSTables are immutable, so they are captured as hard links and cost
+    /// almost nothing up front; the WAL is appended to, so it is copied. If
+    /// `target` is on a different filesystem, linking is impossible and the
+    /// tables are copied in full instead — correct either way, and reported
+    /// as [`CheckpointInfo::hard_linked`].
+    ///
+    /// The result is a data directory in its own right: open it with
+    /// [`Storage::new`] to read the checkpointed state back.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`](crate::Error::InvalidArgument) if
+    /// `target` already exists and is not an empty directory, rather than
+    /// merging into whatever is there and producing a store that mixes two
+    /// generations of files.
+    pub fn checkpoint<P: AsRef<Path>>(&mut self, target: P) -> crate::Result<CheckpointInfo> {
+        let target = target.as_ref();
+
+        // Refuse to write into a populated directory: mixing files from two
+        // stores yields a manifest and a table set that disagree.
+        if target.exists() {
+            if !target.is_dir() {
+                return Err(crate::Error::invalid_argument(format!(
+                    "checkpoint target {:?} exists and is not a directory",
+                    target
+                )));
+            }
+            if fs::read_dir(target)?.next().is_some() {
+                return Err(crate::Error::invalid_argument(format!(
+                    "checkpoint target {:?} is not empty",
+                    target
+                )));
+            }
+        }
+        fs::create_dir_all(target)?;
+
+        // Make the source WAL whole on disk before copying it: under
+        // `WalSync::Batched` the most recent appends may not be fsynced yet.
+        self.wal.sync_now()?;
+
+        let entries = self.manifest_entries();
+        let mut table_bytes = 0u64;
+        let mut hard_linked = true;
+
+        for entry in &entries {
+            let src = self.data_dir.join(&entry.filename);
+            let dst = target.join(&entry.filename);
+            // Sharing the inode is what makes this cheap. Across filesystems
+            // it is not possible, so fall back to copying the bytes.
+            match fs::hard_link(&src, &dst) {
+                Ok(()) => {}
+                Err(_) => {
+                    fs::copy(&src, &dst)?;
+                    hard_linked = false;
+                }
+            }
+            table_bytes += fs::metadata(&dst)?.len();
+        }
+
+        // The WAL must be copied, never linked: it is still being appended
+        // to, and a shared inode would let later writes leak into the
+        // checkpoint and past its sequence.
+        let wal_src = self.data_dir.join(WAL_FILE);
+        let wal_bytes = if wal_src.exists() {
+            fs::copy(&wal_src, target.join(WAL_FILE))?
+        } else {
+            0
+        };
+
+        // The manifest's sequence must be the *persisted* high-water mark,
+        // not the in-memory counter. It deliberately lags: it is written at
+        // each flush, and the WAL carries the writes made since. Recovery
+        // reconstructs the current sequence as `manifest.last_seq + replayed
+        // records`, so pairing the copied WAL with the live counter instead
+        // would count those writes twice and restore a store whose sequence
+        // ran ahead of its data.
+        let persisted_seq = self.manifest.load()?.map_or(0, |state| state.last_seq);
+
+        // Written last, and atomically: the manifest is what makes the
+        // directory a store, so until it lands there is nothing to open.
+        Manifest::new(target).write(&entries, persisted_seq)?;
+
+        Metrics::incr(&self.metrics.checkpoints);
+        if self.config.verbose {
+            println!(
+                "Checkpoint -> {:?}: {} tables ({} bytes), WAL {} bytes, seq {}",
+                target,
+                entries.len(),
+                table_bytes,
+                wal_bytes,
+                self.seq_counter
+            );
+        }
+
+        Ok(CheckpointInfo {
+            path: target.to_path_buf(),
+            tables: entries.len(),
+            table_bytes,
+            wal_bytes,
+            sequence: self.seq_counter,
+            hard_linked,
+        })
+    }
+
     pub fn compact_now(&mut self) -> crate::Result<()> {
         let mut level = 0;
         loop {

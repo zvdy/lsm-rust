@@ -23,6 +23,7 @@ pub(super) struct Metrics {
     pub scans: AtomicU64,
     pub flushes: AtomicU64,
     pub compactions: AtomicU64,
+    pub checkpoints: AtomicU64,
 }
 
 impl Metrics {
@@ -69,6 +70,8 @@ pub struct StorageStats {
     pub flushes_total: u64,
     /// Total compaction runs across all levels.
     pub compactions_total: u64,
+    /// Total checkpoints taken.
+    pub checkpoints_total: u64,
     /// Highest MVCC sequence number assigned so far.
     pub sequence: u64,
     /// Number of live snapshots currently pinning versions.
@@ -152,6 +155,12 @@ impl StorageStats {
             "compactions_total",
             "Total compaction runs across all levels.",
             self.compactions_total,
+        );
+        counter(
+            &mut out,
+            "checkpoints_total",
+            "Total checkpoints taken.",
+            self.checkpoints_total,
         );
 
         gauge(
