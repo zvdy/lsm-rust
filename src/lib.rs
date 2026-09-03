@@ -7,6 +7,10 @@
 //! Reads consult the memtable first, then SSTables from newest to oldest,
 //! using per-table Bloom filters to skip tables that cannot contain the key.
 //!
+//! Concurrent, optimistic transactions ([`Transaction`]) layer on top of the
+//! engine's MVCC snapshots: they buffer writes privately, never block one
+//! another, and detect conflicts at commit time.
+//!
 //! # Example
 //!
 //! ```no_run
@@ -45,7 +49,7 @@ pub type Seq = u64;
 pub use server::{MetricsServer, RespServer};
 pub use sstable::{BlockCache, Compression};
 pub use storage::{
-    CompactorHandle, LevelStats, SharedStorage, Snapshot, Storage, StorageConfig, StorageStats,
-    WriteBatch,
+    CompactorHandle, Isolation, LevelStats, SharedStorage, Snapshot, Storage, StorageConfig,
+    StorageStats, Transaction, TransactionError, WriteBatch,
 };
 pub use wal::WalSync;

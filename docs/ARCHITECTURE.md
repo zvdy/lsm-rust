@@ -111,6 +111,66 @@ publishes the oldest live sequence as a garbage-collection floor: compaction
 keeps every version newer than the floor and the newest version at or below it,
 and drops the rest.
 
+## Transactions
+
+Transactions are **optimistic**: they never take locks while running, so any
+number can be in flight at once. A transaction reads from a snapshot taken when
+it began and buffers its writes privately; conflicts are resolved only at
+commit.
+
+```mermaid
+sequenceDiagram
+    participant T1 as Transaction A
+    participant T2 as Transaction B
+    participant E as Engine
+
+    T1->>E: begin() → snapshot @ seq 10
+    T2->>E: begin() → snapshot @ seq 10
+    T1->>T1: read k, buffer write k=1
+    T2->>T2: read k, buffer write k=2
+    T1->>E: commit()
+    E->>E: validate vs commits > 10 → none
+    E-->>T1: applied at seq 11
+    T2->>E: commit()
+    E->>E: validate vs commits > 10 → k written at 11
+    E-->>T2: Conflict { key: k } (retriable)
+```
+
+**Validation and application are one atomic step.** Both happen while the
+engine's exclusive lock is held, so no commit can slip in between deciding a
+transaction is valid and making its writes visible.
+
+### Conflict detection
+
+The engine keeps a `CommitLog`: the write set of each recent commit, keyed by
+the sequence it committed at. At commit time a transaction is checked against
+every entry newer than its snapshot:
+
+| Check | `Snapshot` | `Serializable` |
+| --- | --- | --- |
+| Write-write — someone wrote a key we wrote | ✓ | ✓ |
+| Read-write — someone wrote a key we read | | ✓ |
+| Phantom — someone wrote a key inside a range we scanned | | ✓ |
+
+Every write path feeds the commit log, including plain `put`, `delete` and
+`write_batch` — a transaction must conflict with concurrent non-transactional
+writes exactly as it does with transactional ones.
+
+The log is bounded, not unbounded history: entries at or below the oldest live
+snapshot are pruned, because no transaction can begin before them and so none
+can ever be validated against them. With no long-running transaction, only a
+couple of entries are retained.
+
+### Guarantees and limits
+
+- A committed transaction applies its whole write set at a single sequence
+  number, in one WAL record — atomic in both visibility and durability.
+- An aborted or dropped transaction has no effect at all.
+- `Serializable` (the default) rules out write skew and phantoms in scanned
+  ranges. `Snapshot` is cheaper and aborts less, but permits both.
+- Conflict detection is key-granular and range-granular; it does not track
+  reads made outside the transaction's own `get`/`scan` calls.
+
 ## Compaction
 
 ```mermaid
