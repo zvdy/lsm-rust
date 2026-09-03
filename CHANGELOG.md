@@ -12,6 +12,11 @@ crates.io yet.
 
 ### Added
 
+- **A unified error type.** Every fallible call now returns
+  `lsm_rust::Result<T>`, whose `Error` separates `Corruption`, `Conflict`,
+  `InvalidArgument` and `Io` — so a caller can tell a losing transaction from a
+  damaged file without matching on error strings. `Error::is_retriable()` and
+  `Error::is_corruption()` classify a failure without a `match`.
 - **Concurrent transactions.** Optimistic `begin`/`commit`/`rollback` with
   read-your-own-writes, buffered writes that are invisible until commit, and
   conflict detection at commit time with retriable aborts.
@@ -61,6 +66,15 @@ crates.io yet.
 
 ### Changed
 
+- **Breaking:** the public API returns `lsm_rust::Result<T>` instead of
+  `std::io::Result<T>`, and `TransactionError` is gone — its `Conflict` variant
+  is now `Error::Conflict` and its `Io` variant is now `Error::Io`.
+  `Error` converts to and from `std::io::Error` (`Corruption` maps to
+  `InvalidData`, `Conflict` to `WouldBlock`, `InvalidArgument` to
+  `InvalidInput`, and `Io` passes through unchanged), so callers whose own
+  functions still return `std::io::Result` compile without edits. Callers that
+  named `TransactionError` should use `lsm_rust::Error`; callers that matched
+  on `err.kind()` should match on the variant instead.
 - SSTable on-disk format evolved to v4 (checksums). v3, v2, and pre-header
   legacy files remain readable.
 - WAL records are now written in a checksummed frame; older unframed records

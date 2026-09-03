@@ -8,15 +8,14 @@
 //! Concurrency is optimistic: transactions never block each other while they
 //! run. Conflicts are detected at commit time by checking the transaction's
 //! read and write sets against everything committed since its snapshot. A
-//! losing transaction is aborted with [`TransactionError::Conflict`], which is
-//! retriable — see [`SharedStorage::transaction`](super::SharedStorage::transaction)
-//! for a helper that retries for you.
+//! losing transaction is aborted with [`Error::Conflict`](crate::Error::Conflict),
+//! which is retriable — see
+//! [`SharedStorage::transaction`](super::SharedStorage::transaction) for a
+//! helper that retries for you.
 
 use super::Snapshot;
 use crate::{Key, Seq, Value};
 use std::collections::{BTreeMap, HashSet, VecDeque};
-use std::fmt;
-use std::io;
 
 /// How strictly a transaction checks for conflicts when it commits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -35,63 +34,6 @@ pub enum Isolation {
     /// This rules out write skew and phantoms, at the cost of more aborts.
     #[default]
     Serializable,
-}
-
-/// Why a transaction could not commit.
-#[derive(Debug)]
-pub enum TransactionError {
-    /// Another transaction committed a conflicting write first. The
-    /// transaction had no effect and the operation can simply be retried.
-    Conflict {
-        /// A key that was concurrently modified.
-        key: Key,
-    },
-    /// The commit failed for an I/O reason; durability is unchanged.
-    Io(io::Error),
-}
-
-impl TransactionError {
-    /// Whether retrying the transaction could succeed.
-    pub fn is_retriable(&self) -> bool {
-        matches!(self, TransactionError::Conflict { .. })
-    }
-}
-
-impl fmt::Display for TransactionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TransactionError::Conflict { key } => write!(
-                f,
-                "transaction conflict on key {:?}",
-                String::from_utf8_lossy(key)
-            ),
-            TransactionError::Io(e) => write!(f, "transaction failed: {}", e),
-        }
-    }
-}
-
-impl std::error::Error for TransactionError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            TransactionError::Io(e) => Some(e),
-            TransactionError::Conflict { .. } => None,
-        }
-    }
-}
-
-impl From<io::Error> for TransactionError {
-    fn from(e: io::Error) -> Self {
-        TransactionError::Io(e)
-    }
-}
-
-impl From<TransactionError> for io::Error {
-    fn from(e: TransactionError) -> Self {
-        match e {
-            TransactionError::Io(e) => e,
-            conflict => io::Error::new(io::ErrorKind::WouldBlock, conflict.to_string()),
-        }
-    }
 }
 
 /// A half-open key range a transaction scanned, remembered so that a
@@ -180,7 +122,7 @@ impl CommitLog {
 /// ```no_run
 /// use lsm_rust::SharedStorage;
 ///
-/// fn main() -> std::io::Result<()> {
+/// fn main() -> lsm_rust::Result<()> {
 ///     let db = SharedStorage::new("./data", false)?;
 ///
 ///     let mut tx = db.begin()?;
@@ -229,7 +171,7 @@ impl Transaction {
 
     /// Read `key`, seeing this transaction's own uncommitted writes first and
     /// otherwise the snapshot it began at.
-    pub fn get(&mut self, key: &Key) -> io::Result<Option<Value>> {
+    pub fn get(&mut self, key: &Key) -> crate::Result<Option<Value>> {
         if let Some(buffered) = self.writes.get(key) {
             // Read-your-own-writes; a buffered delete reads back as absent.
             return Ok(buffered.clone());
@@ -250,17 +192,17 @@ impl Transaction {
 
     /// Range scan (`start <= key < end`) over the snapshot, merged with this
     /// transaction's buffered writes.
-    pub fn scan(&mut self, start: &[u8], end: &[u8]) -> io::Result<Vec<(Key, Value)>> {
+    pub fn scan(&mut self, start: &[u8], end: &[u8]) -> crate::Result<Vec<(Key, Value)>> {
         self.scan_inner(start, Some(end))
     }
 
     /// Prefix scan over the snapshot, merged with buffered writes.
-    pub fn scan_prefix(&mut self, prefix: &[u8]) -> io::Result<Vec<(Key, Value)>> {
+    pub fn scan_prefix(&mut self, prefix: &[u8]) -> crate::Result<Vec<(Key, Value)>> {
         let end = super::prefix_successor(prefix);
         self.scan_inner(prefix, end.as_deref())
     }
 
-    fn scan_inner(&mut self, start: &[u8], end: Option<&[u8]>) -> io::Result<Vec<(Key, Value)>> {
+    fn scan_inner(&mut self, start: &[u8], end: Option<&[u8]>) -> crate::Result<Vec<(Key, Value)>> {
         // Remember the range so a key inserted into it by a concurrent
         // transaction is treated as a conflict under Serializable isolation.
         self.ranges.push((start.to_vec(), end.map(|e| e.to_vec())));
@@ -307,9 +249,9 @@ impl Transaction {
     /// if it still holds, apply its writes atomically at a single sequence.
     ///
     /// Returns the sequence number the writes committed at. On
-    /// [`TransactionError::Conflict`] the transaction had no effect and may be
-    /// retried.
-    pub fn commit(self) -> Result<Seq, TransactionError> {
+    /// [`Error::Conflict`](crate::Error::Conflict) the transaction had no
+    /// effect and may be retried.
+    pub fn commit(self) -> crate::Result<Seq> {
         let Transaction {
             db,
             snapshot,

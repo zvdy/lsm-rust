@@ -11,7 +11,6 @@ use crate::sstable::{RangeCursor, SSTable, VersionedEntry};
 use crate::{Key, Seq, Value};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::io;
 
 /// One stream of `(key ascending, seq descending)` versions feeding the merge.
 enum Source<'a> {
@@ -22,7 +21,7 @@ enum Source<'a> {
 }
 
 impl Source<'_> {
-    fn next_entry(&mut self) -> Option<io::Result<VersionedEntry>> {
+    fn next_entry(&mut self) -> Option<crate::Result<VersionedEntry>> {
         match self {
             Source::Mem(iter) => iter.next().map(Ok),
             Source::Table(cursor) => cursor.next(),
@@ -64,8 +63,8 @@ impl Eq for HeapItem {}
 ///
 /// Yields live `(key, value)` pairs in ascending key order, showing for each
 /// key the newest version visible to the scan's snapshot. Deleted keys are
-/// skipped. Each item is an [`io::Result`] because blocks are read from disk
-/// as the scan advances; the first error ends the iteration.
+/// skipped. Each item is a [`Result`](crate::Result) because blocks are read
+/// from disk as the scan advances; the first error ends the iteration.
 pub struct ScanIter<'a> {
     sources: Vec<Source<'a>>,
     heap: BinaryHeap<HeapItem>,
@@ -80,7 +79,7 @@ impl<'a> ScanIter<'a> {
         start: &[u8],
         end: Option<&[u8]>,
         snapshot_seq: Seq,
-    ) -> io::Result<Self> {
+    ) -> crate::Result<Self> {
         let mut sources: Vec<Source<'a>> = Vec::new();
         sources.push(Source::Mem(Box::new(
             memtable
@@ -105,7 +104,7 @@ impl<'a> ScanIter<'a> {
     }
 
     /// Pull the next entry from `index` into the heap, if it has one.
-    fn refill(&mut self, index: usize) -> io::Result<()> {
+    fn refill(&mut self, index: usize) -> crate::Result<()> {
         if let Some(entry) = self.sources[index].next_entry() {
             let (key, seq, value) = entry?;
             self.heap.push(HeapItem {
@@ -120,7 +119,7 @@ impl<'a> ScanIter<'a> {
 }
 
 impl Iterator for ScanIter<'_> {
-    type Item = io::Result<(Key, Value)>;
+    type Item = crate::Result<(Key, Value)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.failed {
@@ -167,7 +166,7 @@ pub struct SnapshotScan<'a> {
 }
 
 impl Iterator for SnapshotScan<'_> {
-    type Item = io::Result<(Key, Value)>;
+    type Item = crate::Result<(Key, Value)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next()

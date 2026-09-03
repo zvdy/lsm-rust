@@ -41,7 +41,7 @@ pub struct RespServer {
 
 impl RespServer {
     /// Start serving `storage` on `listener` in background threads.
-    pub fn spawn(storage: SharedStorage, listener: TcpListener) -> io::Result<Self> {
+    pub fn spawn(storage: SharedStorage, listener: TcpListener) -> crate::Result<Self> {
         let local_addr = listener.local_addr()?;
         let stop = Arc::new(AtomicBool::new(false));
 

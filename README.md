@@ -12,6 +12,10 @@ atomic write batches, and a Prometheus metrics endpoint.
 
 ## Features
 
+- **One error type** — every call returns `Result<T, Error>`, and `Error`
+  separates corruption, transaction conflicts, invalid arguments and I/O, so
+  failures are classified rather than stringly-typed. It converts both ways
+  with `std::io::Error`.
 - **Durable, crash-safe writes** — a write-ahead log fsynced before ack;
   torn-tail entries and orphaned tables are cleaned up on recovery, tracked by
   a crash-atomic manifest.
@@ -80,7 +84,7 @@ MVCC/GC model, see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
 ```rust
 use lsm_rust::{Compression, Storage, StorageConfig, WriteBatch};
 
-fn main() -> std::io::Result<()> {
+fn main() -> lsm_rust::Result<()> {
     let mut db = Storage::new("./data", false)?;
 
     // Basic operations
@@ -156,6 +160,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+### Errors
+
+Every fallible call returns `lsm_rust::Result<T>`. `Error` says which kind of
+failure it was, so callers can act on it instead of parsing a message:
+
+| Variant | Means | Retriable |
+| --- | --- | --- |
+| `Error::Corruption` | on-disk bytes failed their checksum or would not parse | no |
+| `Error::Conflict { key }` | a transaction lost an optimistic race and had no effect | **yes** |
+| `Error::InvalidArgument` | the caller asked for something impossible | no |
+| `Error::Io` | the underlying filesystem or socket failed | no |
+
+`Error::is_retriable()` and `Error::is_corruption()` cover the common checks.
+`Error` converts to and from `std::io::Error` in both directions — an `Io`
+error passes through untouched — so code whose own signatures are still
+`std::io::Result` keeps compiling unchanged.
 
 | Isolation | Detects | Allows |
 | --- | --- | --- |

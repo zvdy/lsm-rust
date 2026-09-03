@@ -2,7 +2,7 @@ use crate::bloom::BloomFilter;
 use crate::checksum::crc32;
 use crate::{Key, Seq, Value};
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -94,34 +94,36 @@ pub struct SSTable {
     cache: Option<Arc<BlockCache>>,
 }
 
-fn invalid_data(msg: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, msg)
+/// Every parse failure in this module means the bytes on disk are not the
+/// bytes that were written, so they all surface as [`Error::Corruption`].
+fn corrupt(msg: &str) -> crate::Error {
+    crate::Error::corruption(msg)
 }
 
-fn read_u32(buffer: &[u8], pos: usize) -> io::Result<u32> {
+fn read_u32(buffer: &[u8], pos: usize) -> crate::Result<u32> {
     buffer
         .get(pos..pos + 4)
         .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
-        .ok_or_else(|| invalid_data("SSTable truncated: expected 4-byte length"))
+        .ok_or_else(|| corrupt("SSTable truncated: expected 4-byte length"))
 }
 
-fn read_u64(buffer: &[u8], pos: usize) -> io::Result<u64> {
+fn read_u64(buffer: &[u8], pos: usize) -> crate::Result<u64> {
     buffer
         .get(pos..pos + 8)
         .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
-        .ok_or_else(|| invalid_data("SSTable truncated: expected 8-byte field"))
+        .ok_or_else(|| corrupt("SSTable truncated: expected 8-byte field"))
 }
 
-fn read_slice(buffer: &[u8], pos: usize, len: usize) -> io::Result<&[u8]> {
+fn read_slice(buffer: &[u8], pos: usize, len: usize) -> crate::Result<&[u8]> {
     buffer
         .get(pos..pos + len)
-        .ok_or_else(|| invalid_data("SSTable truncated: entry data out of bounds"))
+        .ok_or_else(|| corrupt("SSTable truncated: entry data out of bounds"))
 }
 
 /// Parse a flat sequence of entries covering the whole buffer. When
 /// `has_seq` is false the format carries no sequence number and every entry
 /// is assigned sequence 0 (legacy / v2 data, which predates MVCC).
-fn parse_entries(buffer: &[u8], has_seq: bool) -> io::Result<Vec<VersionedEntry>> {
+fn parse_entries(buffer: &[u8], has_seq: bool) -> crate::Result<Vec<VersionedEntry>> {
     let mut data = Vec::new();
     let mut pos = 0;
     while pos < buffer.len() {
@@ -171,13 +173,13 @@ fn encode_entries(data: &[VersionedEntry], out: &mut Vec<u8>) {
 }
 
 impl SSTable {
-    pub fn new(path: PathBuf) -> io::Result<Self> {
+    pub fn new(path: PathBuf) -> crate::Result<Self> {
         Self::with_cache(path, None)
     }
 
     /// Open an SSTable that serves block reads through the given shared
     /// block cache.
-    pub fn with_cache(path: PathBuf, cache: Option<Arc<BlockCache>>) -> io::Result<Self> {
+    pub fn with_cache(path: PathBuf, cache: Option<Arc<BlockCache>>) -> crate::Result<Self> {
         if !path.exists() {
             return Ok(SSTable {
                 path,
@@ -210,7 +212,7 @@ impl SSTable {
     }
 
     /// Sniff the file header and load the bloom filter and index metadata.
-    fn open_layout(path: &Path) -> io::Result<(Option<BloomFilter>, Layout)> {
+    fn open_layout(path: &Path) -> crate::Result<(Option<BloomFilter>, Layout)> {
         let mut file = File::open(path)?;
         let mut magic = [0u8; 4];
         file.read_exact(&mut magic)?;
@@ -226,7 +228,7 @@ impl SSTable {
                 2 => (false, false),
                 3 => (true, false),
                 4 => (true, true),
-                _ => return Err(invalid_data("unsupported SSTable format version")),
+                _ => return Err(corrupt("unsupported SSTable format version")),
             };
             let compression = if version_flags[1] & FLAG_LZ4 != 0 {
                 Compression::Lz4
@@ -268,7 +270,7 @@ impl SSTable {
     /// Read a length-prefixed header section. In v4 the length is followed
     /// by a CRC-32 of the section body, which is verified before the bytes
     /// are handed on; older versions store the body alone.
-    fn read_section(file: &mut File, has_crc: bool, what: &str) -> io::Result<Vec<u8>> {
+    fn read_section(file: &mut File, has_crc: bool, what: &str) -> crate::Result<Vec<u8>> {
         let mut len_bytes = [0u8; 4];
         file.read_exact(&mut len_bytes)?;
         let len = u32::from_le_bytes(len_bytes) as usize;
@@ -287,7 +289,7 @@ impl SSTable {
         if let Some(expected) = expected {
             let actual = crc32(&body);
             if actual != expected {
-                return Err(invalid_data(&format!(
+                return Err(corrupt(&format!(
                     "{} checksum mismatch: expected {:#010x}, got {:#010x}",
                     what, expected, actual
                 )));
@@ -297,13 +299,14 @@ impl SSTable {
     }
 
     /// Write a header section as `[len][crc][body]` (v4 framing).
-    fn write_section(file: &mut File, body: &[u8]) -> io::Result<()> {
+    fn write_section(file: &mut File, body: &[u8]) -> crate::Result<()> {
         file.write_all(&(body.len() as u32).to_le_bytes())?;
         file.write_all(&crc32(body).to_le_bytes())?;
-        file.write_all(body)
+        file.write_all(body)?;
+        Ok(())
     }
 
-    fn parse_index(bytes: &[u8]) -> io::Result<Vec<IndexEntry>> {
+    fn parse_index(bytes: &[u8]) -> crate::Result<Vec<IndexEntry>> {
         let count = read_u32(bytes, 0)? as usize;
         let mut index = Vec::with_capacity(count);
         let mut pos = 4;
@@ -339,7 +342,7 @@ impl SSTable {
 
     /// Write single-version entries (sequence 0) uncompressed. Convenience
     /// for callers that don't track sequence numbers (and tests).
-    pub fn write(&mut self, data: &[(Key, Option<Value>)]) -> io::Result<()> {
+    pub fn write(&mut self, data: &[(Key, Option<Value>)]) -> crate::Result<()> {
         self.write_with(data, Compression::None)
     }
 
@@ -348,7 +351,7 @@ impl SSTable {
         &mut self,
         data: &[(Key, Option<Value>)],
         compression: Compression,
-    ) -> io::Result<()> {
+    ) -> crate::Result<()> {
         let versioned: Vec<VersionedEntry> = data
             .iter()
             .map(|(k, v)| (k.clone(), 0, v.clone()))
@@ -365,7 +368,7 @@ impl SSTable {
         &mut self,
         data: &[VersionedEntry],
         compression: Compression,
-    ) -> io::Result<()> {
+    ) -> crate::Result<()> {
         // Build the bloom filter over all keys (including tombstones, so
         // that deletions are found and can shadow older values)
         let mut bloom = BloomFilter::new(
@@ -451,7 +454,7 @@ impl SSTable {
         entry: &IndexEntry,
         compression: Compression,
         has_block_crc: bool,
-    ) -> io::Result<Arc<Vec<u8>>> {
+    ) -> crate::Result<Arc<Vec<u8>>> {
         if let Some(cache) = &self.cache {
             if let Some(block) = cache.get(&self.path, entry.offset) {
                 return Ok(block);
@@ -465,13 +468,13 @@ impl SSTable {
         // error rather than as decompression garbage or bogus entries.
         if has_block_crc {
             if raw.len() < 4 {
-                return Err(invalid_data("data block too short to hold a checksum"));
+                return Err(corrupt("data block too short to hold a checksum"));
             }
             let expected = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
             let payload = &raw[4..];
             let actual = crc32(payload);
             if actual != expected {
-                return Err(invalid_data(&format!(
+                return Err(corrupt(&format!(
                     "data block checksum mismatch at offset {}: expected {:#010x}, got {:#010x}",
                     entry.offset, expected, actual
                 )));
@@ -482,7 +485,7 @@ impl SSTable {
         let block = Arc::new(match compression {
             Compression::None => raw,
             Compression::Lz4 => lz4_flex::decompress_size_prepended(&raw)
-                .map_err(|e| invalid_data(&format!("failed to decompress block: {}", e)))?,
+                .map_err(|e| corrupt(&format!("failed to decompress block: {}", e)))?,
         });
 
         if let Some(cache) = &self.cache {
@@ -492,7 +495,7 @@ impl SSTable {
     }
 
     /// Read `len` bytes at `offset` from the start of the file.
-    fn read_range(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+    fn read_range(&self, offset: u64, len: usize) -> crate::Result<Vec<u8>> {
         let mut file = File::open(&self.path)?;
         file.seek(SeekFrom::Start(offset))?;
         let mut buffer = vec![0u8; len];
@@ -501,7 +504,7 @@ impl SSTable {
     }
 
     /// Read the whole file from `offset` to the end.
-    fn read_to_end_from(&self, offset: u64) -> io::Result<Vec<u8>> {
+    fn read_to_end_from(&self, offset: u64) -> crate::Result<Vec<u8>> {
         let mut file = File::open(&self.path)?;
         file.seek(SeekFrom::Start(offset))?;
         let mut buffer = Vec::new();
@@ -510,7 +513,7 @@ impl SSTable {
     }
 
     /// Read every stored version (including tombstones) from this SSTable.
-    pub fn read_versioned(&self) -> io::Result<Vec<VersionedEntry>> {
+    pub fn read_versioned(&self) -> crate::Result<Vec<VersionedEntry>> {
         match &self.layout {
             Layout::Empty => Ok(Vec::new()),
             Layout::Legacy { data_start } => {
@@ -537,7 +540,7 @@ impl SSTable {
 
     /// Read all entries as `(key, value_or_tombstone)`, dropping sequence
     /// numbers. Convenience for single-version callers and tests.
-    pub fn read(&self) -> io::Result<Vec<(Key, Option<Value>)>> {
+    pub fn read(&self) -> crate::Result<Vec<(Key, Option<Value>)>> {
         Ok(self
             .read_versioned()?
             .into_iter()
@@ -552,7 +555,7 @@ impl SSTable {
         &self,
         start: &[u8],
         end: Option<&[u8]>,
-    ) -> io::Result<Vec<VersionedEntry>> {
+    ) -> crate::Result<Vec<VersionedEntry>> {
         self.range_cursor(start, end)?.collect()
     }
 
@@ -566,7 +569,7 @@ impl SSTable {
         &'a self,
         start: &[u8],
         end: Option<&[u8]>,
-    ) -> io::Result<RangeCursor<'a>> {
+    ) -> crate::Result<RangeCursor<'a>> {
         let state = match &self.layout {
             Layout::Empty => CursorState::Buffered(Vec::new().into_iter()),
             // Legacy files have no index to seek with, so there is nothing to
@@ -613,7 +616,7 @@ impl SSTable {
         &self,
         start: &[u8],
         end: Option<&[u8]>,
-    ) -> io::Result<Vec<(Key, Option<Value>)>> {
+    ) -> crate::Result<Vec<(Key, Option<Value>)>> {
         let mut out: Vec<(Key, Option<Value>)> = Vec::new();
         for (k, _seq, v) in self.scan_range_versioned(start, end)? {
             // Versions are (key asc, seq desc): the first entry seen for a
@@ -638,7 +641,7 @@ impl SSTable {
     /// Look up the newest version of `key` visible at `snapshot_seq`,
     /// distinguishing "deleted here" from "not present here" so that
     /// tombstones shadow older SSTables.
-    pub fn get_at(&self, key: &[u8], snapshot_seq: Seq) -> io::Result<SSTableLookup> {
+    pub fn get_at(&self, key: &[u8], snapshot_seq: Seq) -> crate::Result<SSTableLookup> {
         // First check the bloom filter
         if let Some(filter) = &self.bloom_filter {
             if !filter.might_contain(key) {
@@ -673,7 +676,7 @@ impl SSTable {
     }
 
     /// Look up the latest version of `key` (highest sequence).
-    pub fn get(&self, key: &[u8]) -> io::Result<SSTableLookup> {
+    pub fn get(&self, key: &[u8]) -> crate::Result<SSTableLookup> {
         self.get_at(key, Seq::MAX)
     }
 
@@ -688,7 +691,7 @@ impl SSTable {
         snapshot_seq: Seq,
         sorted: bool,
         has_seq: bool,
-    ) -> io::Result<SSTableLookup> {
+    ) -> crate::Result<SSTableLookup> {
         let mut pos = 0;
         while pos < buffer.len() {
             let key_size = read_u32(buffer, pos)? as usize;
@@ -744,8 +747,9 @@ impl SSTable {
     }
 
     #[allow(dead_code)]
-    pub fn delete(self) -> io::Result<()> {
-        fs::remove_file(self.path)
+    pub fn delete(self) -> crate::Result<()> {
+        fs::remove_file(self.path)?;
+        Ok(())
     }
 }
 
@@ -783,7 +787,7 @@ impl RangeCursor<'_> {
 }
 
 impl Iterator for RangeCursor<'_> {
-    type Item = io::Result<VersionedEntry>;
+    type Item = crate::Result<VersionedEntry>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {

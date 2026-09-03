@@ -1,6 +1,5 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::io;
 
 /// A simple Bloom filter implementation
 pub struct BloomFilter {
@@ -96,11 +95,10 @@ impl BloomFilter {
     }
 
     /// Deserialize a Bloom filter from bytes
-    pub fn from_bytes(bytes: &[u8]) -> io::Result<Self> {
+    pub fn from_bytes(bytes: &[u8]) -> crate::Result<Self> {
         if bytes.len() < 8 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Invalid Bloom filter data",
+            return Err(crate::Error::corruption(
+                "Bloom filter block truncated: fewer than 8 header bytes",
             ));
         }
 

@@ -12,11 +12,10 @@ use snapshot::SnapshotRegistry;
 use stats::Metrics;
 pub use stats::{LevelStats, StorageStats};
 use transaction::CommitLog;
-pub use transaction::{Isolation, Transaction, TransactionError};
+pub use transaction::{Isolation, Transaction};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -187,7 +186,7 @@ impl Storage {
     ///
     /// Existing SSTables are loaded and any pending write-ahead-log entries
     /// are replayed into the memtable.
-    pub fn new<P: AsRef<Path>>(data_dir: P, verbose: bool) -> io::Result<Self> {
+    pub fn new<P: AsRef<Path>>(data_dir: P, verbose: bool) -> crate::Result<Self> {
         Self::with_config(
             data_dir,
             StorageConfig {
@@ -198,7 +197,7 @@ impl Storage {
     }
 
     /// Open (or create) a store at `data_dir` with explicit tuning options.
-    pub fn with_config<P: AsRef<Path>>(data_dir: P, config: StorageConfig) -> io::Result<Self> {
+    pub fn with_config<P: AsRef<Path>>(data_dir: P, config: StorageConfig) -> crate::Result<Self> {
         let verbose = config.verbose;
         if verbose {
             println!("Initializing storage at {:?}", data_dir.as_ref());
@@ -355,7 +354,7 @@ impl Storage {
 
     /// Atomically record the current live table set in the manifest. Called
     /// at every commit point where the table set changes.
-    fn persist_manifest(&self) -> io::Result<()> {
+    fn persist_manifest(&self) -> crate::Result<()> {
         let mut entries = Vec::new();
         for (level, tables) in &self.sstables {
             for table in tables {
@@ -411,15 +410,12 @@ impl Storage {
     /// such a sequence sees the oldest version still on disk. To guarantee a
     /// past sequence stays readable, open the time-travel snapshot before the
     /// compaction that would collapse it, or keep a snapshot pinned meanwhile.
-    pub fn snapshot_at(&self, seq: Seq) -> io::Result<Snapshot> {
+    pub fn snapshot_at(&self, seq: Seq) -> crate::Result<Snapshot> {
         if seq > self.seq_counter {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "cannot time-travel to sequence {} beyond the current sequence {}",
-                    seq, self.seq_counter
-                ),
-            ));
+            return Err(crate::Error::invalid_argument(format!(
+                "cannot time-travel to sequence {} beyond the current sequence {}",
+                seq, self.seq_counter
+            )));
         }
         Ok(self.snapshots.acquire(seq))
     }
@@ -463,13 +459,13 @@ impl Storage {
 
     /// Look up the current value for `key`, or `None` if the key does not
     /// exist or has been deleted.
-    pub fn get(&self, key: &Key) -> io::Result<Option<Value>> {
+    pub fn get(&self, key: &Key) -> crate::Result<Option<Value>> {
         self.get_at_seq(key, self.seq_counter)
     }
 
     /// Look up `key` as seen by `snapshot`, ignoring any writes that
     /// committed after the snapshot was taken.
-    pub fn get_at(&self, snapshot: &Snapshot, key: &Key) -> io::Result<Option<Value>> {
+    pub fn get_at(&self, snapshot: &Snapshot, key: &Key) -> crate::Result<Option<Value>> {
         self.get_at_seq(key, snapshot.sequence())
     }
 
@@ -479,7 +475,7 @@ impl Storage {
     /// a higher sequence number always lives in a newer (shallower) table, so
     /// scanning newest-to-oldest and returning at the first visible version
     /// yields the newest version the snapshot can see.
-    fn get_at_seq(&self, key: &Key, snapshot_seq: Seq) -> io::Result<Option<Value>> {
+    fn get_at_seq(&self, key: &Key, snapshot_seq: Seq) -> crate::Result<Option<Value>> {
         Metrics::incr(&self.metrics.gets);
         if self.config.verbose {
             println!("GET {:?} @ {}", String::from_utf8_lossy(key), snapshot_seq);
@@ -517,13 +513,13 @@ impl Storage {
     /// Return all live key-value pairs with `start <= key < end`, in key
     /// order. Deleted keys are excluded; the newest value wins when a key
     /// exists at several levels.
-    pub fn scan(&self, start: &[u8], end: &[u8]) -> io::Result<Vec<(Key, Value)>> {
+    pub fn scan(&self, start: &[u8], end: &[u8]) -> crate::Result<Vec<(Key, Value)>> {
         self.scan_at_seq(start, Some(end), self.seq_counter)
     }
 
     /// Return all live key-value pairs whose key starts with `prefix`,
     /// in key order.
-    pub fn scan_prefix(&self, prefix: &[u8]) -> io::Result<Vec<(Key, Value)>> {
+    pub fn scan_prefix(&self, prefix: &[u8]) -> crate::Result<Vec<(Key, Value)>> {
         let end = prefix_successor(prefix);
         self.scan_at_seq(prefix, end.as_deref(), self.seq_counter)
     }
@@ -534,7 +530,7 @@ impl Storage {
         snapshot: &Snapshot,
         start: &[u8],
         end: &[u8],
-    ) -> io::Result<Vec<(Key, Value)>> {
+    ) -> crate::Result<Vec<(Key, Value)>> {
         self.scan_at_seq(start, Some(end), snapshot.sequence())
     }
 
@@ -543,7 +539,7 @@ impl Storage {
         &self,
         snapshot: &Snapshot,
         prefix: &[u8],
-    ) -> io::Result<Vec<(Key, Value)>> {
+    ) -> crate::Result<Vec<(Key, Value)>> {
         let end = prefix_successor(prefix);
         self.scan_at_seq(prefix, end.as_deref(), snapshot.sequence())
     }
@@ -553,7 +549,7 @@ impl Storage {
         start: &[u8],
         end: Option<&[u8]>,
         snapshot_seq: Seq,
-    ) -> io::Result<Vec<(Key, Value)>> {
+    ) -> crate::Result<Vec<(Key, Value)>> {
         self.scan_iter_at_seq(start, end, snapshot_seq)?.collect()
     }
 
@@ -567,7 +563,7 @@ impl Storage {
     /// disk lazily; the first error ends the iteration.
     ///
     /// ```no_run
-    /// # fn main() -> std::io::Result<()> {
+    /// # fn main() -> lsm_rust::Result<()> {
     /// let db = lsm_rust::Storage::new("./data", false)?;
     /// for entry in db.scan_iter(b"user:", Some(b"user;"))? {
     ///     let (key, value) = entry?;
@@ -576,12 +572,12 @@ impl Storage {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn scan_iter(&self, start: &[u8], end: Option<&[u8]>) -> io::Result<ScanIter<'_>> {
+    pub fn scan_iter(&self, start: &[u8], end: Option<&[u8]>) -> crate::Result<ScanIter<'_>> {
         self.scan_iter_at_seq(start, end, self.seq_counter)
     }
 
     /// Stream live entries whose key starts with `prefix`, in key order.
-    pub fn scan_prefix_iter(&self, prefix: &[u8]) -> io::Result<ScanIter<'_>> {
+    pub fn scan_prefix_iter(&self, prefix: &[u8]) -> crate::Result<ScanIter<'_>> {
         let end = prefix_successor(prefix);
         self.scan_iter_at_seq(prefix, end.as_deref(), self.seq_counter)
     }
@@ -595,7 +591,7 @@ impl Storage {
         snapshot: &'a Snapshot,
         start: &[u8],
         end: Option<&[u8]>,
-    ) -> io::Result<SnapshotScan<'a>> {
+    ) -> crate::Result<SnapshotScan<'a>> {
         Ok(SnapshotScan {
             inner: self.scan_iter_at_seq(start, end, snapshot.sequence())?,
             _snapshot: snapshot,
@@ -607,7 +603,7 @@ impl Storage {
         start: &[u8],
         end: Option<&[u8]>,
         snapshot_seq: Seq,
-    ) -> io::Result<ScanIter<'_>> {
+    ) -> crate::Result<ScanIter<'_>> {
         Metrics::incr(&self.metrics.scans);
         ScanIter::new(
             &self.memtable,
@@ -620,7 +616,7 @@ impl Storage {
 
     /// Insert or update `key` with `value`. The write is durable (recorded
     /// in the write-ahead log) once this returns.
-    pub fn put(&mut self, key: Key, value: Value) -> io::Result<()> {
+    pub fn put(&mut self, key: Key, value: Value) -> crate::Result<()> {
         if self.config.verbose {
             let count = PUT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
             let bytes = TOTAL_BYTES.fetch_add(key.len() + value.len(), Ordering::Relaxed)
@@ -655,7 +651,7 @@ impl Storage {
 
     /// Delete `key`. The deletion is durable once this returns and shadows
     /// any older value still stored in SSTables.
-    pub fn delete(&mut self, key: &Key) -> io::Result<()> {
+    pub fn delete(&mut self, key: &Key) -> crate::Result<()> {
         if self.config.verbose {
             println!("DELETE {:?}", String::from_utf8_lossy(key));
         }
@@ -677,7 +673,7 @@ impl Storage {
 
     /// Apply a [`WriteBatch`] atomically: all of its operations commit at a
     /// single sequence number and are recovered together on a crash.
-    pub fn write_batch(&mut self, batch: WriteBatch) -> io::Result<()> {
+    pub fn write_batch(&mut self, batch: WriteBatch) -> crate::Result<()> {
         if batch.ops.is_empty() {
             return Ok(());
         }
@@ -737,12 +733,12 @@ impl Storage {
         reads: HashSet<Key>,
         ranges: Vec<(Key, Option<Key>)>,
         isolation: Isolation,
-    ) -> Result<Seq, TransactionError> {
+    ) -> crate::Result<Seq> {
         if let Some(key) =
             self.commits
                 .find_conflict(snapshot_seq, &writes, &reads, &ranges, isolation)
         {
-            return Err(TransactionError::Conflict { key });
+            return Err(crate::Error::Conflict { key });
         }
 
         // Apply as one atomic batch: a single sequence number and one WAL
@@ -769,7 +765,7 @@ impl Storage {
         self.commits.len()
     }
 
-    fn maybe_flush_memtable(&mut self) -> io::Result<()> {
+    fn maybe_flush_memtable(&mut self) -> crate::Result<()> {
         let memtable_size = self.memtable.size();
         if memtable_size >= self.config.memtable_size_threshold {
             if self.config.verbose {
@@ -785,7 +781,7 @@ impl Storage {
         Ok(())
     }
 
-    fn flush_memtable(&mut self) -> io::Result<()> {
+    fn flush_memtable(&mut self) -> crate::Result<()> {
         if self.memtable.is_empty() {
             return Ok(());
         }
@@ -848,7 +844,7 @@ impl Storage {
     /// Run any pending compactions across all levels, regardless of the
     /// `inline_compaction` setting. Returns once every level is within its
     /// threshold.
-    pub fn compact_now(&mut self) -> io::Result<()> {
+    pub fn compact_now(&mut self) -> crate::Result<()> {
         let mut level = 0;
         loop {
             let max_level = self.sstables.keys().max().copied().unwrap_or(0);
@@ -861,7 +857,7 @@ impl Storage {
         Ok(())
     }
 
-    fn maybe_compact(&mut self, level: usize) -> io::Result<()> {
+    fn maybe_compact(&mut self, level: usize) -> crate::Result<()> {
         let Some(tables) = self.sstables.get(&level) else {
             return Ok(());
         };

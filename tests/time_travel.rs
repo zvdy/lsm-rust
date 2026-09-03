@@ -49,7 +49,10 @@ fn snapshot_at_future_sequence_is_rejected() {
 
     let now = db.current_sequence();
     let err = db.snapshot_at(now + 1).unwrap_err();
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(
+        matches!(err, lsm_rust::Error::InvalidArgument(_)),
+        "expected InvalidArgument, got {err:?}"
+    );
 }
 
 #[test]

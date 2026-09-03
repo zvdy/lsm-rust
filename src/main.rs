@@ -1,11 +1,10 @@
 use std::env;
 use std::fs;
-use std::io;
 use std::net::TcpListener;
 
-use lsm_rust::{MetricsServer, RespServer, SharedStorage, Storage};
+use lsm_rust::{Error, MetricsServer, RespServer, SharedStorage, Storage};
 
-fn main() -> io::Result<()> {
+fn main() -> lsm_rust::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     let verbose = args.iter().any(|a| a == "-v" || a == "--verbose");
 
@@ -40,7 +39,7 @@ fn print_usage() {
 }
 
 /// `lsm-rust serve [--addr HOST:PORT] [--data DIR] [-v]`
-fn serve(args: &[String], verbose: bool) -> io::Result<()> {
+fn serve(args: &[String], verbose: bool) -> lsm_rust::Result<()> {
     let mut addr = "127.0.0.1:6379".to_string();
     let mut data_dir = "./data".to_string();
     let mut metrics_addr: Option<String> = None;
@@ -51,37 +50,30 @@ fn serve(args: &[String], verbose: bool) -> io::Result<()> {
             "--addr" => {
                 addr = iter
                     .next()
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidInput, "--addr needs a value")
-                    })?
+                    .ok_or_else(|| Error::InvalidArgument("--addr needs a value".to_string()))?
                     .clone();
             }
             "--data" => {
                 data_dir = iter
                     .next()
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidInput, "--data needs a value")
-                    })?
+                    .ok_or_else(|| Error::InvalidArgument("--data needs a value".to_string()))?
                     .clone();
             }
             "--metrics-addr" => {
                 metrics_addr = Some(
                     iter.next()
                         .ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                "--metrics-addr needs a value",
-                            )
+                            Error::InvalidArgument("--metrics-addr needs a value".to_string())
                         })?
                         .clone(),
                 );
             }
             "-v" | "--verbose" => {}
             other => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unknown serve option: {}", other),
-                ));
+                return Err(Error::InvalidArgument(format!(
+                    "unknown serve option: {}",
+                    other
+                )));
             }
         }
     }
@@ -114,7 +106,7 @@ fn serve(args: &[String], verbose: bool) -> io::Result<()> {
 }
 
 /// `lsm-rust demo [-v]` — the original scripted example.
-fn demo(verbose: bool) -> io::Result<()> {
+fn demo(verbose: bool) -> lsm_rust::Result<()> {
     println!("LSM Tree Database Example");
     if verbose {
         println!("Verbose mode enabled");
@@ -135,7 +127,7 @@ fn demo(verbose: bool) -> io::Result<()> {
     Ok(())
 }
 
-fn basic_operations_test(db: &mut Storage) -> io::Result<()> {
+fn basic_operations_test(db: &mut Storage) -> lsm_rust::Result<()> {
     println!("Inserting initial data...");
     db.put(b"name".to_vec(), b"John Doe".to_vec())?;
     db.put(b"age".to_vec(), b"30".to_vec())?;
@@ -165,9 +157,9 @@ fn basic_operations_test(db: &mut Storage) -> io::Result<()> {
     Ok(())
 }
 
-fn compaction_test(db: &mut Storage) -> io::Result<()> {
+fn compaction_test(db: &mut Storage) -> lsm_rust::Result<()> {
     // Helper function to count SST files
-    fn count_sst_files() -> io::Result<(usize, Vec<String>)> {
+    fn count_sst_files() -> lsm_rust::Result<(usize, Vec<String>)> {
         let mut count = 0;
         let mut files = Vec::new();
         for entry in fs::read_dir("./data")? {
