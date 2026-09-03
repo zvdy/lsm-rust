@@ -33,8 +33,10 @@ atomic write batches, and a Prometheus metrics endpoint.
   cache, and optional LZ4 block compression.
 - **Leveled compaction** — newest-value-wins merging with tombstone GC, inline
   or on a background thread.
-- **Range and prefix scans** — ordered, newest-wins merges across the memtable
-  and every level.
+- **Streaming range and prefix scans** — ordered, newest-wins merges across
+  the memtable and every level. `scan_iter` streams one SSTable block at a
+  time, so a wide range costs memory proportional to the number of tables, not
+  to the size of the range.
 - **Concurrency** — a cloneable `SharedStorage` handle: concurrent reads,
   serialized writes.
 - **Redis-protocol server** — `lsm-rust serve` speaks RESP, so `redis-cli` and
@@ -98,7 +100,12 @@ fn main() -> std::io::Result<()> {
     let mut batch = WriteBatch::new();
     batch.put(b"a".to_vec(), b"1".to_vec()).delete(b"k".to_vec());
     db.write_batch(batch)?;
-    let _range = db.scan(b"a", b"z")?;
+    let _range = db.scan(b"a", b"z")?;              // collected into a Vec
+
+    // ...or stream it, without materializing the range
+    for entry in db.scan_iter(b"a", Some(b"z"))? {
+        let (_key, _value) = entry?;
+    }
 
     // Tuned construction
     let _tuned = Storage::with_config(

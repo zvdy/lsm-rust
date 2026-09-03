@@ -553,15 +553,27 @@ impl SSTable {
         start: &[u8],
         end: Option<&[u8]>,
     ) -> io::Result<Vec<VersionedEntry>> {
-        let in_range = |k: &[u8]| k >= start && end.is_none_or(|e| k < e);
-        match &self.layout {
-            Layout::Empty => Ok(Vec::new()),
+        self.range_cursor(start, end)?.collect()
+    }
+
+    /// A cursor over every stored version whose key lies in `[start, end)`,
+    /// yielded in `(key ascending, seq descending)` order.
+    ///
+    /// Unlike [`SSTable::scan_range_versioned`], this reads one data block at
+    /// a time as the cursor advances, so scanning a wide range does not pull
+    /// the whole table into memory.
+    pub fn range_cursor<'a>(
+        &'a self,
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> io::Result<RangeCursor<'a>> {
+        let state = match &self.layout {
+            Layout::Empty => CursorState::Buffered(Vec::new().into_iter()),
+            // Legacy files have no index to seek with, so there is nothing to
+            // stream: parse the one flat section up front.
             Layout::Legacy { data_start } => {
                 let buffer = self.read_to_end_from(*data_start)?;
-                Ok(parse_entries(&buffer, false)?
-                    .into_iter()
-                    .filter(|(k, _, _)| in_range(k))
-                    .collect())
+                CursorState::Buffered(parse_entries(&buffer, false)?.into_iter())
             }
             Layout::Versioned {
                 data_start,
@@ -575,22 +587,23 @@ impl SSTable {
                 let first = index
                     .partition_point(|e| e.first_key.as_slice() <= start)
                     .saturating_sub(1);
-                let mut out = Vec::new();
-                for entry in &index[first..] {
-                    if end.is_some_and(|e| entry.first_key.as_slice() >= e) {
-                        break;
-                    }
-                    let block =
-                        self.read_block(*data_start, entry, *compression, *has_block_crc)?;
-                    for (k, seq, v) in parse_entries(&block, *has_seq)? {
-                        if in_range(&k) {
-                            out.push((k, seq, v));
-                        }
-                    }
+                CursorState::Blocks {
+                    table: self,
+                    data_start: *data_start,
+                    index,
+                    pos: first,
+                    compression: *compression,
+                    has_seq: *has_seq,
+                    has_block_crc: *has_block_crc,
+                    current: Vec::new().into_iter(),
                 }
-                Ok(out)
             }
-        }
+        };
+        Ok(RangeCursor {
+            start: start.to_vec(),
+            end: end.map(|e| e.to_vec()),
+            state,
+        })
     }
 
     /// Return the newest value per key in `[start, end)`, dropping sequence
@@ -733,6 +746,94 @@ impl SSTable {
     #[allow(dead_code)]
     pub fn delete(self) -> io::Result<()> {
         fs::remove_file(self.path)
+    }
+}
+
+/// How a [`RangeCursor`] sources its entries.
+enum CursorState<'a> {
+    /// Everything already parsed (empty or legacy tables).
+    Buffered(std::vec::IntoIter<VersionedEntry>),
+    /// Stream block by block through the sparse index.
+    Blocks {
+        table: &'a SSTable,
+        data_start: u64,
+        index: &'a [IndexEntry],
+        pos: usize,
+        compression: Compression,
+        has_seq: bool,
+        has_block_crc: bool,
+        current: std::vec::IntoIter<VersionedEntry>,
+    },
+}
+
+/// A lazy cursor over one SSTable's versions within a key range.
+///
+/// Yields `(key ascending, seq descending)`, reading at most one data block
+/// at a time. Created by [`SSTable::range_cursor`].
+pub struct RangeCursor<'a> {
+    start: Key,
+    end: Option<Key>,
+    state: CursorState<'a>,
+}
+
+impl RangeCursor<'_> {
+    fn in_range(&self, key: &[u8]) -> bool {
+        key >= self.start.as_slice() && self.end.as_ref().is_none_or(|e| key < e.as_slice())
+    }
+}
+
+impl Iterator for RangeCursor<'_> {
+    type Item = io::Result<VersionedEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            // Take the next already-parsed entry, whichever state we are in.
+            let candidate = match &mut self.state {
+                CursorState::Buffered(iter) => iter.next(),
+                CursorState::Blocks { current, .. } => current.next(),
+            };
+            if let Some((key, seq, value)) = candidate {
+                if self.in_range(&key) {
+                    return Some(Ok((key, seq, value)));
+                }
+                continue; // outside the range; keep going
+            }
+
+            // Buffer exhausted: for block cursors, load the next block.
+            let CursorState::Blocks {
+                table,
+                data_start,
+                index,
+                pos,
+                compression,
+                has_seq,
+                has_block_crc,
+                current,
+            } = &mut self.state
+            else {
+                return None; // buffered source is finished
+            };
+
+            let entry = index.get(*pos)?;
+            // Blocks whose first key is at or past `end` hold nothing we want.
+            if self
+                .end
+                .as_ref()
+                .is_some_and(|e| entry.first_key.as_slice() >= e.as_slice())
+            {
+                return None;
+            }
+            *pos += 1;
+
+            let block = match table.read_block(*data_start, entry, *compression, *has_block_crc) {
+                Ok(block) => block,
+                Err(e) => return Some(Err(e)),
+            };
+            match parse_entries(&block, *has_seq) {
+                Ok(entries) => *current = entries.into_iter(),
+                Err(e) => return Some(Err(e)),
+            }
+        }
     }
 }
 

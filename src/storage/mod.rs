@@ -1,9 +1,11 @@
 mod manifest;
+mod scan;
 mod shared;
 mod snapshot;
 mod stats;
 mod transaction;
 use manifest::{Manifest, ManifestEntry};
+pub use scan::{ScanIter, SnapshotScan};
 pub use shared::{CompactorHandle, SharedStorage};
 pub use snapshot::Snapshot;
 use snapshot::SnapshotRegistry;
@@ -552,38 +554,68 @@ impl Storage {
         end: Option<&[u8]>,
         snapshot_seq: Seq,
     ) -> io::Result<Vec<(Key, Value)>> {
+        self.scan_iter_at_seq(start, end, snapshot_seq)?.collect()
+    }
+
+    /// Stream live entries in `[start, end)` in key order, newest visible
+    /// version per key, without materializing the whole range.
+    ///
+    /// Prefer this over [`Storage::scan`] for wide ranges: the returned
+    /// iterator reads one SSTable block at a time as it advances, so memory
+    /// stays proportional to the number of tables rather than to the number of
+    /// matching keys. Each item is a [`Result`] because blocks are read from
+    /// disk lazily; the first error ends the iteration.
+    ///
+    /// ```no_run
+    /// # fn main() -> std::io::Result<()> {
+    /// let db = lsm_rust::Storage::new("./data", false)?;
+    /// for entry in db.scan_iter(b"user:", Some(b"user;"))? {
+    ///     let (key, value) = entry?;
+    ///     println!("{} bytes at {:?}", value.len(), String::from_utf8_lossy(&key));
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn scan_iter(&self, start: &[u8], end: Option<&[u8]>) -> io::Result<ScanIter<'_>> {
+        self.scan_iter_at_seq(start, end, self.seq_counter)
+    }
+
+    /// Stream live entries whose key starts with `prefix`, in key order.
+    pub fn scan_prefix_iter(&self, prefix: &[u8]) -> io::Result<ScanIter<'_>> {
+        let end = prefix_successor(prefix);
+        self.scan_iter_at_seq(prefix, end.as_deref(), self.seq_counter)
+    }
+
+    /// Stream live entries in `[start, end)` as seen by `snapshot`.
+    ///
+    /// The snapshot is borrowed for the life of the iterator, so the versions
+    /// the scan needs stay pinned against compaction while it runs.
+    pub fn scan_iter_at<'a>(
+        &'a self,
+        snapshot: &'a Snapshot,
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> io::Result<SnapshotScan<'a>> {
+        Ok(SnapshotScan {
+            inner: self.scan_iter_at_seq(start, end, snapshot.sequence())?,
+            _snapshot: snapshot,
+        })
+    }
+
+    fn scan_iter_at_seq(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        snapshot_seq: Seq,
+    ) -> io::Result<ScanIter<'_>> {
         Metrics::incr(&self.metrics.scans);
-        // For each key, keep the newest version visible to the snapshot
-        // (largest seq <= snapshot_seq). A BTreeMap keeps the output sorted.
-        let mut best: BTreeMap<Key, (Seq, Option<Value>)> = BTreeMap::new();
-        let mut consider = |key: Key, seq: Seq, value: Option<Value>| {
-            if seq > snapshot_seq {
-                return;
-            }
-            match best.get(&key) {
-                Some((best_seq, _)) if *best_seq >= seq => {}
-                _ => {
-                    best.insert(key, (seq, value));
-                }
-            }
-        };
-
-        for tables in self.sstables.values() {
-            for table in tables {
-                for (key, seq, value) in table.scan_range_versioned(start, end)? {
-                    consider(key, seq, value);
-                }
-            }
-        }
-        for (key, seq, value) in self.memtable.range(start, end) {
-            consider(key.clone(), seq, value.clone());
-        }
-
-        // Tombstones shadow older values, then drop out of the result
-        Ok(best
-            .into_iter()
-            .filter_map(|(k, (_seq, v))| v.map(|v| (k, v)))
-            .collect())
+        ScanIter::new(
+            &self.memtable,
+            self.sstables.values().flatten(),
+            start,
+            end,
+            snapshot_seq,
+        )
     }
 
     /// Insert or update `key` with `value`. The write is durable (recorded
