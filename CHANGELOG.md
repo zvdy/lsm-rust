@@ -12,6 +12,12 @@ crates.io yet.
 
 ### Added
 
+- **Concurrent transactions.** Optimistic `begin`/`commit`/`rollback` with
+  read-your-own-writes, buffered writes that are invisible until commit, and
+  conflict detection at commit time with retriable aborts.
+  `Isolation::Serializable` (the default) catches write-write, read-write and
+  phantom conflicts; `Isolation::Snapshot` catches write-write only.
+  `SharedStorage::transaction` retries aborts for you.
 - **End-to-end checksums.** A CRC-32 on every SSTable section, every SSTable
   data block, and every write-ahead log record, verified on read, so on-disk
   corruption surfaces as an error instead of silently wrong data. SSTable
