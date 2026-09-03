@@ -13,6 +13,9 @@ atomic write batches, and a Prometheus metrics endpoint.
 - **Durable, crash-safe writes** — a write-ahead log fsynced before ack;
   torn-tail entries and orphaned tables are cleaned up on recovery, tracked by
   a crash-atomic manifest.
+- **End-to-end checksums** — a CRC-32 on every SSTable section, every data
+  block, and every WAL record turns silent corruption into a clean error
+  instead of plausible-looking garbage.
 - **Concurrent transactions** — optimistic (`begin`/`commit`/`rollback`) with
   read-your-own-writes, conflict detection at commit, and retriable aborts.
   Serializable by default (catching write skew and phantoms), or snapshot

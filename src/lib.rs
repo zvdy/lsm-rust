@@ -11,6 +11,10 @@
 //! engine's MVCC snapshots: they buffer writes privately, never block one
 //! another, and detect conflicts at commit time.
 //!
+//! Every SSTable section, SSTable data block, and write-ahead log record
+//! carries a CRC-32 that is verified on read, so on-disk corruption surfaces
+//! as an error rather than as silently wrong data.
+//!
 //! # Example
 //!
 //! ```no_run
@@ -29,6 +33,7 @@
 //! ```
 
 pub mod bloom;
+pub mod checksum;
 pub mod memtable;
 pub mod server;
 pub mod sstable;
