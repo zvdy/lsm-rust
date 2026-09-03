@@ -16,6 +16,10 @@ atomic write batches, and a Prometheus metrics endpoint.
 - **End-to-end checksums** — a CRC-32 on every SSTable section, every data
   block, and every WAL record turns silent corruption into a clean error
   instead of plausible-looking garbage.
+- **Concurrent transactions** — optimistic (`begin`/`commit`/`rollback`) with
+  read-your-own-writes, conflict detection at commit, and retriable aborts.
+  Serializable by default (catching write skew and phantoms), or snapshot
+  isolation when you want fewer aborts.
 - **MVCC snapshot isolation** — every write is sequence-numbered; a `Snapshot`
   reads a consistent view unaffected by later writes, flushes, or compactions.
 - **Time-travel reads** — revisit the store as of any recorded sequence
@@ -110,6 +114,48 @@ fn main() -> std::io::Result<()> {
 A `SharedStorage` handle (via `Storage::into_shared()` or `SharedStorage::new`)
 is `Clone + Send + Sync` for concurrent use, and exposes the same API plus
 `spawn_compactor()` for background compaction.
+
+### Transactions
+
+Transactions are optimistic: they never block each other while running, and
+conflicts are resolved at commit time. `transaction()` retries aborts for you,
+so contention is handled without lost updates:
+
+```rust
+use lsm_rust::SharedStorage;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let db = SharedStorage::new("./data", false)?;
+
+    // Read-modify-write that is safe under concurrency.
+    db.transaction(8, |tx| {
+        let current = tx.get(&b"counter".to_vec())?.unwrap_or_else(|| b"0".to_vec());
+        let n: u64 = String::from_utf8_lossy(&current).parse().unwrap_or(0);
+        tx.put(b"counter".to_vec(), (n + 1).to_string().into_bytes());
+        Ok(())
+    })?;
+
+    // Or drive one by hand.
+    let mut tx = db.begin()?;                   // Serializable by default
+    tx.put(b"a".to_vec(), b"1".to_vec());
+    assert_eq!(tx.get(&b"a".to_vec())?, Some(b"1".to_vec())); // reads its own writes
+    match tx.commit() {
+        Ok(seq) => println!("committed at {seq}"),
+        Err(e) if e.is_retriable() => println!("conflict — retry"),
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
+}
+```
+
+| Isolation | Detects | Allows |
+| --- | --- | --- |
+| `Isolation::Snapshot` | write-write conflicts | write skew, phantoms |
+| `Isolation::Serializable` (default) | write-write, read-write, phantoms in scanned ranges | — |
+
+Uncommitted writes are invisible to everyone else and are discarded if the
+transaction is dropped or rolled back. A commit applies the whole write set at
+one sequence number, as a single WAL record — all-or-nothing.
 
 ### Command line
 
