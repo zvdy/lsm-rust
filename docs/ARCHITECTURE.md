@@ -209,6 +209,69 @@ level. Tombstones are only dropped when no level at or below the output could
 still contain an older value for the key. Compaction can run inline on the
 write path or on a dedicated background thread.
 
+### Deciding whether the merge is worth it
+
+The thresholds above decide *when* a level is compacted. They say nothing about
+whether the merge can achieve anything, and the answer is not always yes.
+
+A merge earns its cost by collapsing keys that appear in more than one table.
+When a level's tables are mutually disjoint there are no such keys, so reading
+and rewriting every byte produces the same entries in a different file. This is
+not a corner case: it is the steady state for append-only and time-ordered keys,
+where each flush covers a range strictly above the last.
+
+The signal is the **maximum overlap depth** — the largest number of tables whose
+key ranges cover any single point. Depth 1 means mutually disjoint. It is
+computed by sweeping the range endpoints, using each table's `key_range()`,
+whose minimum is free from the in-memory sparse index and whose maximum costs
+one block read, memoised per table.
+
+```mermaid
+flowchart TB
+    D{"max overlap depth<br/>of the level"}
+    D -->|"= 1 (disjoint)"| P["Promote:<br/>relink each table one level down.<br/>No data read or written."]
+    D -->|"> 1 (keys shadowed)"| M2["Merge:<br/>read, collapse, write one table."]
+    P -.->|"lone table, full destination,<br/>or unknown range"| M2
+```
+
+Promotion requires all three of:
+
+- **No overlap**, so nothing can be collapsed.
+- **More than one table.** A lone table merged with itself is not busywork —
+  that is where several versions of a key collapse and where tombstones are
+  finally dropped. Promotion would skip both, so this case is left alone.
+- **Room at the destination** (`MAX_TABLES_PER_LEVEL`, 16). Promoted tables are
+  disjoint, so a lookup is filtered by their Bloom filters rather than reading
+  them — but it still *checks* every filter in the level. Without a ceiling an
+  append-only workload would promote for ever and grow that per-lookup cost
+  without bound.
+
+Every other case merges, so the fallback is always the previous behaviour. A
+table whose range cannot be read counts as maximally overlapping, which can
+only ever cause more merging, never less.
+
+**Promotion preserves read order.** Reads walk a level's tables in reverse, so
+the last pushed is consulted first. Promoted tables come from a shallower level
+and are therefore the newer versions, so they are *appended* to the destination
+— exactly where a merge output would go. Getting this backwards returns stale
+data for keys the destination already held, which is what
+`promotion_into_a_populated_level_keeps_the_newest_version` exists to catch.
+
+**Crash safety is the merge path's, unchanged.** Each table is linked under its
+new level's name, the manifest rename commits, and only then is the old name
+unlinked. A crash before the commit leaves the new names unreferenced; a crash
+after leaves the old ones unreferenced; startup deletes unreferenced tables
+either way. Renaming rather than only relabelling in the manifest keeps a
+filename from ever disagreeing with the level recorded for it, which matters
+because a store that loses its manifest falls back to reading levels out of
+filenames.
+
+The trade-off is honest: promotion defers the version collapsing and tombstone
+dropping a merge would have done. Deferred, not skipped — the data still meets
+overlapping tables eventually, and the destination ceiling bounds how long that
+can take. `lsm_compaction_moves_total` reports how many compaction runs were
+promotions, as a subset of `lsm_compactions_total`.
+
 ## On-disk formats
 
 ### SSTable (versioned, v4)

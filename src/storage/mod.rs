@@ -23,7 +23,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::memtable::MemTable;
-use crate::sstable::{BlockCache, CompactionManager, Compression, SSTable, SSTableLookup};
+use crate::sstable::{
+    BlockCache, CompactionManager, CompactionPlan, Compression, SSTable, SSTableLookup,
+};
 use crate::wal::{BatchEntry, Operation, WalRecord, WalSync, WAL};
 use crate::{Key, Seq, Value};
 
@@ -460,6 +462,7 @@ impl Storage {
             scans_total: self.metrics.scans.load(Relaxed),
             flushes_total: self.metrics.flushes.load(Relaxed),
             compactions_total: self.metrics.compactions.load(Relaxed),
+            compaction_moves_total: self.metrics.compaction_moves.load(Relaxed),
             checkpoints_total: self.metrics.checkpoints.load(Relaxed),
             sequence: self.seq_counter,
             live_snapshots: self.snapshots.live_count(),
@@ -981,6 +984,94 @@ impl Storage {
         Ok(())
     }
 
+    /// Promote every table at `level` to the next level without reading or
+    /// rewriting their contents, returning whether the promotion happened.
+    ///
+    /// Only correct when the level's tables are mutually disjoint, which the
+    /// caller establishes: with no key in two tables there is nothing for a
+    /// merge to collapse, and the tables can be reinterpreted one level down
+    /// as they are. They are appended after whatever the next level already
+    /// holds, so they are still consulted first — data flows downward, so
+    /// they are the newer versions.
+    ///
+    /// Returns `false` without touching anything if the level cannot be
+    /// promoted safely (an unparseable filename, or a name already taken at
+    /// the destination), leaving the caller to fall back to a real merge.
+    ///
+    /// Crash safety mirrors the merge path exactly. Each table is *linked*
+    /// under its new name, the manifest rename commits, and only then is the
+    /// old name unlinked. A crash before the commit leaves the new names
+    /// unreferenced and the old ones live; a crash after leaves the old names
+    /// unreferenced. Startup deletes unreferenced tables either way.
+    fn move_level_down(&mut self, level: usize) -> crate::Result<bool> {
+        let next_level = level + 1;
+
+        let Some(tables) = self.sstables.get(&level) else {
+            return Ok(false);
+        };
+        if tables.is_empty() {
+            return Ok(false);
+        }
+
+        let mut pairs: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(tables.len());
+        for table in tables {
+            let old_path = table.get_path().clone();
+            let Some((_, seq)) = parse_sst_filename(&old_path) else {
+                return Ok(false);
+            };
+            let new_path = self.data_dir.join(format!("L{}_{}.sst", next_level, seq));
+            // Sequence numbers are unique across the whole store, so this
+            // should never collide; refuse rather than clobber if it does.
+            if new_path.exists() {
+                return Ok(false);
+            }
+            pairs.push((old_path, new_path));
+        }
+
+        // Link every table under its new name before anything is committed.
+        // On failure, undo the links already made: they are not yet
+        // referenced by any manifest, so removing them loses nothing.
+        for (index, (old_path, new_path)) in pairs.iter().enumerate() {
+            let linked = fs::hard_link(old_path, new_path)
+                .or_else(|_| fs::copy(old_path, new_path).map(|_| ()));
+            if let Err(e) = linked {
+                for (_, created) in &pairs[..index] {
+                    let _ = fs::remove_file(created);
+                }
+                return Err(e.into());
+            }
+        }
+
+        let mut promoted = Vec::with_capacity(pairs.len());
+        for (_, new_path) in &pairs {
+            promoted.push(SSTable::with_cache(
+                new_path.clone(),
+                self.block_cache.clone(),
+            )?);
+        }
+
+        self.sstables.get_mut(&level).unwrap().clear();
+        // Appended, not prepended: reads walk a level's tables in reverse, so
+        // the last pushed is consulted first. These came from a shallower
+        // level, which makes them the newer versions.
+        self.sstables
+            .entry(next_level)
+            .or_default()
+            .extend(promoted);
+
+        // The manifest rename is the commit point, exactly as for a merge.
+        self.persist_manifest()?;
+
+        for (old_path, _) in &pairs {
+            fs::remove_file(old_path)?;
+            if let Some(cache) = &self.block_cache {
+                cache.purge_file(old_path);
+            }
+        }
+
+        Ok(true)
+    }
+
     fn maybe_compact(&mut self, level: usize) -> crate::Result<()> {
         let Some(tables) = self.sstables.get(&level) else {
             return Ok(());
@@ -998,6 +1089,31 @@ impl Storage {
             return Ok(());
         }
         Metrics::incr(&self.metrics.compactions);
+
+        // A merge earns its cost by collapsing keys that appear in more than
+        // one table. When the level's tables are mutually disjoint there are
+        // no such keys, so reading and rewriting every byte would produce the
+        // same entries in a different file. Promote them instead: the level
+        // is what changes, and the data does not move at all.
+        //
+        // This is the common shape for append-only and time-ordered keys,
+        // where each flush covers a key range strictly above the last.
+        let destination_tables = self.sstables.get(&(level + 1)).map_or(0, |t| t.len());
+        let plan = self.compaction_manager.plan(tables, destination_tables);
+        if plan == CompactionPlan::Promote && self.move_level_down(level)? {
+            Metrics::incr(&self.metrics.compaction_moves);
+            if self.config.verbose {
+                println!(
+                    "\n=== Compaction: Level {} -> {} (disjoint, promoted without rewriting) ===",
+                    level,
+                    level + 1
+                );
+            }
+            return Ok(());
+        }
+        let Some(tables) = self.sstables.get(&level) else {
+            return Ok(());
+        };
 
         if self.config.verbose {
             println!("\n=== Starting Compaction ===");

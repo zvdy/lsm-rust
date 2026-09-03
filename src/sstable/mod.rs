@@ -4,12 +4,12 @@ use crate::{Key, Seq, Value};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 mod cache;
 mod compaction;
 pub use cache::BlockCache;
-pub use compaction::CompactionManager;
+pub use compaction::{CompactionManager, CompactionPlan, MAX_TABLES_PER_LEVEL};
 
 const BLOOM_FALSE_POSITIVE_RATE: f64 = 0.01;
 const EXPECTED_ENTRIES_PER_SSTABLE: usize = 1000;
@@ -92,6 +92,10 @@ pub struct SSTable {
     bloom_filter: Option<BloomFilter>,
     layout: Layout,
     cache: Option<Arc<BlockCache>>,
+    /// Memoised `(min_key, max_key)`. Computing it needs one data-block read,
+    /// so it is done at most once per table per process. See
+    /// [`SSTable::key_range`].
+    key_range: OnceLock<Option<(Key, Key)>>,
 }
 
 /// Every parse failure in this module means the bytes on disk are not the
@@ -187,6 +191,7 @@ impl SSTable {
                 bloom_filter: None,
                 layout: Layout::Empty,
                 cache,
+                key_range: OnceLock::new(),
             });
         }
 
@@ -198,6 +203,7 @@ impl SSTable {
                 bloom_filter: None,
                 layout: Layout::Empty,
                 cache,
+                key_range: OnceLock::new(),
             });
         }
 
@@ -208,6 +214,7 @@ impl SSTable {
             bloom_filter,
             layout,
             cache,
+            key_range: OnceLock::new(),
         })
     }
 
@@ -730,6 +737,58 @@ impl SSTable {
             }
         }
         Ok(SSTableLookup::NotFound)
+    }
+
+    /// The smallest and largest key stored in this table, or `None` if the
+    /// table is empty or its range could not be read.
+    ///
+    /// Computed at most once per table and then memoised. The minimum is free
+    /// — it is the first key of the first block, already held in the sparse
+    /// index — but the maximum lives in the final data block, so the first
+    /// call reads exactly one block.
+    ///
+    /// Used by compaction to tell whether a level's tables overlap in key
+    /// space. `None` is deliberately treated by callers as "unknown, assume
+    /// the worst" rather than "empty", so a table whose range cannot be read
+    /// never causes work to be skipped.
+    pub fn key_range(&self) -> Option<&(Key, Key)> {
+        self.key_range
+            .get_or_init(|| self.compute_key_range().ok().flatten())
+            .as_ref()
+    }
+
+    fn compute_key_range(&self) -> crate::Result<Option<(Key, Key)>> {
+        match &self.layout {
+            Layout::Empty => Ok(None),
+            Layout::Legacy { data_start } => {
+                // Legacy tables have no index, so there is no cheaper way in.
+                let buffer = self.read_to_end_from(*data_start)?;
+                let entries = parse_entries(&buffer, false)?;
+                Ok(match (entries.first(), entries.last()) {
+                    (Some((min, _, _)), Some((max, _, _))) => Some((min.clone(), max.clone())),
+                    _ => None,
+                })
+            }
+            Layout::Versioned {
+                data_start,
+                index,
+                compression,
+                has_seq,
+                has_block_crc,
+            } => {
+                let (Some(first), Some(last)) = (index.first(), index.last()) else {
+                    return Ok(None);
+                };
+                // Blocks are ordered by key and entries within a block are
+                // `(key asc, seq desc)`, so the very last entry of the last
+                // block holds the largest key.
+                let block = self.read_block(*data_start, last, *compression, *has_block_crc)?;
+                let entries = parse_entries(&block, *has_seq)?;
+                Ok(entries
+                    .last()
+                    .map(|(max, _, _)| (first.first_key.clone(), max.clone())))
+            }
+        }
     }
 
     pub fn size(&self) -> usize {
