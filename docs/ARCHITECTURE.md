@@ -331,3 +331,76 @@ are still `io::Result` therefore need no changes.
 The RESP and metrics servers keep their private wire helpers on `io::Result`,
 since parsing a socket is pure I/O; their public `spawn` entry points return
 `lsm_rust::Result`, so the crate's public surface speaks one error type.
+
+## Checkpoints
+
+Crash recovery and backup are different problems, and the sections above only
+cover the first. A process that dies is handled by the WAL and the manifest
+commit point; neither helps when the data itself is destroyed — a deleted
+directory, a failed disk, a bad deploy. Checksums do not close that gap
+either: a CRC-32 *detects* a rotted block and turns it into `Corruption`
+instead of plausible data, but it cannot reconstruct the bytes.
+
+Copying a live data directory is not a substitute, because it races
+compaction, and each way it loses yields a copy that opens cleanly and is
+silently wrong:
+
+- the manifest is replaced between copying `MANIFEST` and copying the tables,
+  so the copy names tables that were never captured;
+- compaction unlinks an input table mid-read, truncating it;
+- the old manifest is captured beside newly written tables, which are then
+  unreferenced and deleted as orphans when the copy is opened.
+
+`Storage::checkpoint` holds the engine exclusively for the duration, so the
+table set, the WAL and the manifest it writes are all from one instant.
+
+```mermaid
+flowchart LR
+    subgraph live["Live data dir"]
+        LT["SSTables<br/>(immutable)"]
+        LW["WAL<br/>(appended to)"]
+        LM["MANIFEST"]
+    end
+    subgraph cp["Checkpoint dir"]
+        CT["same inodes"]
+        CW["copied bytes"]
+        CM["MANIFEST<br/>@ persisted seq"]
+    end
+    LT -->|hard link| CT
+    LW -->|copy| CW
+    LM -->|persisted last_seq| CM
+```
+
+**Tables are linked, the WAL is copied.** An SSTable never changes after it is
+written, so sharing its inode is safe and nearly free. The WAL is the opposite:
+it is still being appended to, and a shared inode would let writes made *after*
+the checkpoint bleed into it and past its sequence. It only holds writes since
+the last flush, so copying it is cheap.
+
+**The manifest records the persisted sequence, not the live counter.** This is
+the subtle part. A manifest's `last_seq` deliberately lags `seq_counter`: it is
+written at each flush, and the WAL carries the writes made since, so recovery
+rebuilds the current sequence as `manifest.last_seq + replayed records`. A
+checkpoint that stamped the live counter into its manifest *and* copied that
+WAL would count those writes twice, restoring a store whose sequence had run
+ahead of its data — reads would return the right values, but every time-travel
+coordinate would be off by the number of unflushed writes. Copying the
+persisted sequence keeps the invariant, which is why a restored checkpoint's
+`current_sequence()` equals the `CheckpointInfo::sequence` it reported.
+
+**Restoring is just opening it.** A checkpoint directory satisfies every
+invariant a data directory has, so `Storage::new` reads it back with no
+special path — and therefore no separate restore path to drift out of sync.
+
+**Cost over time.** A checkpoint starts at roughly the size of its manifest
+plus the WAL. It grows only as compaction rewrites the tables it linked: an
+unlink that would have freed extents merely decrements a link count while the
+checkpoint holds one. So the steady-state cost is the volume compaction has
+rewritten since the checkpoint was taken, and deleting the directory reclaims
+all of it. This is the same lazy pinning a long-held `Snapshot` applies to
+logical versions, one level down — physical files rather than MVCC versions.
+
+There is deliberately no "bytes currently pinned" gauge. The bytes that matter
+are in files the engine has already unlinked and forgotten, so it cannot
+account for them from the inside; a gauge over the live table set would report
+a number that looks authoritative and answers a different question.

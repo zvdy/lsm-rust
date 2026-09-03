@@ -1,4 +1,7 @@
-use super::{Isolation, Snapshot, Storage, StorageConfig, StorageStats, Transaction, WriteBatch};
+use super::{
+    CheckpointInfo, Isolation, Snapshot, Storage, StorageConfig, StorageStats, Transaction,
+    WriteBatch,
+};
 use crate::Seq;
 use crate::{Key, Value};
 use std::collections::{BTreeMap, HashSet};
@@ -276,6 +279,22 @@ impl SharedStorage {
     /// Run any pending compactions now, under the write lock.
     pub fn compact_now(&self) -> crate::Result<()> {
         self.inner.write().map_err(|_| poisoned())?.compact_now()
+    }
+
+    /// Write a consistent, point-in-time copy of the store to `target`.
+    ///
+    /// Takes the exclusive lock, so writes are blocked for the duration —
+    /// which is what makes the captured tables, WAL and manifest agree. The
+    /// work is linking files and copying the WAL, not rewriting data, so the
+    /// pause is short even for a large store.
+    ///
+    /// See [`Storage::checkpoint`] for the disk-cost model and for how to
+    /// restore.
+    pub fn checkpoint<P: AsRef<Path>>(&self, target: P) -> crate::Result<CheckpointInfo> {
+        self.inner
+            .write()
+            .map_err(|_| poisoned())?
+            .checkpoint(target)
     }
 
     /// Spawn a background thread that runs pending compactions every

@@ -61,7 +61,7 @@ pub use error::{Error, Result};
 pub use server::{MetricsServer, RespServer};
 pub use sstable::{BlockCache, Compression};
 pub use storage::{
-    CompactorHandle, Isolation, LevelStats, ScanIter, SharedStorage, Snapshot, SnapshotScan,
-    Storage, StorageConfig, StorageStats, Transaction, WriteBatch,
+    CheckpointInfo, CompactorHandle, Isolation, LevelStats, ScanIter, SharedStorage, Snapshot,
+    SnapshotScan, Storage, StorageConfig, StorageStats, Transaction, WriteBatch,
 };
 pub use wal::WalSync;

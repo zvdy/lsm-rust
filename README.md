@@ -31,6 +31,9 @@ atomic write batches, and a Prometheus metrics endpoint.
 - **Time-travel reads** — revisit the store as of any recorded sequence
   checkpoint with `snapshot_at`; the sequence is persisted, so it survives
   restarts.
+- **Consistent checkpoints** — `checkpoint()` writes a point-in-time copy you
+  can open as a store. SSTables are hard-linked, so it costs almost nothing up
+  front; the WAL is copied, so writes made afterwards cannot leak in.
 - **Atomic write batches** — multiple puts and deletes commit all-or-nothing,
   durably and visibly.
 - **Fast reads** — per-table Bloom filters, sparse block indexes, an LRU block
@@ -161,6 +164,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### Checkpoints and backup
+
+Crash recovery and backup are different problems. A process dying is already
+handled — the WAL is fsynced before ack and the manifest rename is the commit
+point. What that cannot survive is the data itself being destroyed: a deleted
+directory, a failed disk, a bad deploy. Checksums do not help either; a CRC-32
+turns a rotted block into a clean `Error::Corruption` instead of plausible
+garbage, but it cannot rebuild the bytes.
+
+Copying a live data directory by hand does not work — it races compaction, and
+every way it loses produces a copy that *opens cleanly* while being silently
+wrong. `checkpoint()` holds the store exclusively so the tables, WAL and
+manifest it captures are from one instant:
+
+```rust
+use lsm_rust::SharedStorage;
+
+fn main() -> lsm_rust::Result<()> {
+    let db = SharedStorage::new("./data", false)?;
+    let info = db.checkpoint("./backups/2026-09-03")?;
+    println!("{} tables, consistent as of seq {}", info.tables, info.sequence);
+    Ok(())
+}
+```
+
+A checkpoint directory *is* a data directory — restore by opening it with
+`Storage::new`. There is no separate restore call.
+
+**What it costs.** Almost nothing at first. SSTables are immutable, so they are
+captured as hard links rather than copied — a checkpoint of a 10 GB store is
+initially some directory entries plus a manifest. The cost accrues later:
+when compaction unlinks a table, a checkpoint holding a link keeps the extents
+alive, so the real cost is *the bytes compaction has rewritten since the
+checkpoint was taken*, not the size of the store. Deleting the checkpoint
+directory reclaims it. Checkpoints are therefore meant to be short-lived —
+take one, copy it to where backups live, remove it — rather than kept by the
+dozen on the same volume.
+
 ### Errors
 
 Every fallible call returns `lsm_rust::Result<T>`. `Error` says which kind of
@@ -217,7 +258,7 @@ cargo run --release -- serve --addr 127.0.0.1:6379 --metrics-addr 127.0.0.1:9898
 ```
 
 Metrics include operation counters (`lsm_puts_total`, `lsm_gets_total`,
-`lsm_flushes_total`, `lsm_compactions_total`, …) and gauges for the MVCC
+`lsm_flushes_total`, `lsm_compactions_total`, `lsm_checkpoints_total`, …) and gauges for the MVCC
 sequence, live snapshots, memtable occupancy, and per-level SSTable counts and
 sizes — readable in process via `Storage::stats()` too.
 
@@ -283,7 +324,7 @@ src/
 ├── wal/                # Write-ahead log
 └── server/             # RESP server + Prometheus metrics endpoint
 benches/storage.rs      # Criterion benchmarks
-tests/                  # Recovery, snapshot, write-batch, time-travel, metrics
+tests/                  # Recovery, checkpoint, snapshot, write-batch, errors, …
 docs/ARCHITECTURE.md    # Design deep-dive and on-disk formats
 ```
 

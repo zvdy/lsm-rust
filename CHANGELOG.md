@@ -12,6 +12,14 @@ crates.io yet.
 
 ### Added
 
+- **Consistent checkpoints.** `Storage::checkpoint(dir)` /
+  `SharedStorage::checkpoint(dir)` write a point-in-time copy of the store
+  under the exclusive lock, so the captured tables, write-ahead log and
+  manifest are all from the same instant. SSTables are hard-linked (immutable,
+  so sharing the inode is safe and nearly free); the WAL is copied, since it is
+  still being appended to. A checkpoint directory is itself a data directory —
+  restore by opening it. `CheckpointInfo` reports what was captured and how
+  much disk was genuinely duplicated. New `lsm_checkpoints_total` metric.
 - **A unified error type.** Every fallible call now returns
   `lsm_rust::Result<T>`, whose `Error` separates `Corruption`, `Conflict`,
   `InvalidArgument` and `Io` — so a caller can tell a losing transaction from a
