@@ -1,5 +1,10 @@
-use super::{Snapshot, Storage, StorageConfig, StorageStats, WriteBatch};
+use super::{
+    Isolation, Snapshot, Storage, StorageConfig, StorageStats, Transaction, TransactionError,
+    WriteBatch,
+};
+use crate::Seq;
 use crate::{Key, Value};
+use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -144,6 +149,84 @@ impl SharedStorage {
             .read()
             .map_err(|_| poisoned())?
             .scan_prefix_at(snapshot, prefix)
+    }
+
+    /// Begin an optimistic transaction at [`Isolation::Serializable`].
+    ///
+    /// The transaction reads from a snapshot taken now and buffers its writes
+    /// privately until [`Transaction::commit`]. Transactions never block each
+    /// other while they run; conflicts are resolved at commit time.
+    pub fn begin(&self) -> io::Result<Transaction> {
+        self.begin_with(Isolation::default())
+    }
+
+    /// Begin an optimistic transaction at an explicit isolation level.
+    pub fn begin_with(&self, isolation: Isolation) -> io::Result<Transaction> {
+        let snapshot = self.snapshot()?;
+        Ok(Transaction::new(self.clone(), snapshot, isolation))
+    }
+
+    /// Run `body` in a transaction, retrying while it aborts on a conflict.
+    ///
+    /// This is the ergonomic way to use optimistic concurrency: contention
+    /// shows up as a retry rather than as an error the caller must handle.
+    /// `body` may run more than once, so it should not have side effects
+    /// outside the transaction. Gives up after `max_retries` conflicts and
+    /// returns the last [`TransactionError::Conflict`].
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use lsm_rust::SharedStorage;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let db = SharedStorage::new("./data", false)?;
+    /// db.transaction(8, |tx| {
+    ///     let current = tx.get(&b"counter".to_vec())?.unwrap_or_else(|| b"0".to_vec());
+    ///     let next = String::from_utf8_lossy(&current).parse::<u64>().unwrap_or(0) + 1;
+    ///     tx.put(b"counter".to_vec(), next.to_string().into_bytes());
+    ///     Ok(())
+    /// })?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn transaction<T, F>(&self, max_retries: usize, mut body: F) -> Result<T, TransactionError>
+    where
+        F: FnMut(&mut Transaction) -> Result<T, TransactionError>,
+    {
+        let mut attempt = 0;
+        loop {
+            let mut tx = self.begin()?;
+            let value = body(&mut tx)?;
+            match tx.commit() {
+                Ok(_) => return Ok(value),
+                Err(e) if e.is_retriable() && attempt < max_retries => {
+                    attempt += 1;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Validate and apply a transaction under the exclusive lock.
+    pub(super) fn commit_transaction(
+        &self,
+        snapshot: &Snapshot,
+        writes: BTreeMap<Key, Option<Value>>,
+        reads: HashSet<Key>,
+        ranges: Vec<(Key, Option<Key>)>,
+        isolation: Isolation,
+    ) -> Result<Seq, TransactionError> {
+        self.inner
+            .write()
+            .map_err(|_| poisoned())?
+            .commit_transaction(snapshot.sequence(), writes, reads, ranges, isolation)
+    }
+
+    /// Number of commit records retained for transaction conflict detection.
+    pub fn tracked_commits(&self) -> io::Result<usize> {
+        Ok(self.inner.read().map_err(|_| poisoned())?.tracked_commits())
     }
 
     /// Take a point-in-time snapshot of the store's operational metrics.
