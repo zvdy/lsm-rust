@@ -86,6 +86,42 @@ impl SharedStorage {
         self.inner.read().map_err(|_| poisoned())?.scan(start, end)
     }
 
+    /// Stream entries in `[start, end)` to `visit`, in key order, without
+    /// materializing the range.
+    ///
+    /// The store's read lock is held for the whole traversal, so this is the
+    /// memory-safe way to walk a wide range through a shared handle: entries
+    /// are produced one SSTable block at a time rather than collected into a
+    /// `Vec` first. `visit` returning an error stops the scan and propagates.
+    ///
+    /// Because the lock is held throughout, keep `visit` cheap — do not block
+    /// on I/O or attempt to write to the same store from inside it.
+    pub fn scan_for_each<F>(&self, start: &[u8], end: Option<&[u8]>, mut visit: F) -> io::Result<()>
+    where
+        F: FnMut(Key, Value) -> io::Result<()>,
+    {
+        let storage = self.inner.read().map_err(|_| poisoned())?;
+        for entry in storage.scan_iter(start, end)? {
+            let (key, value) = entry?;
+            visit(key, value)?;
+        }
+        Ok(())
+    }
+
+    /// Stream entries whose key starts with `prefix` to `visit`, in key order.
+    /// See [`SharedStorage::scan_for_each`] for the locking caveat.
+    pub fn scan_prefix_for_each<F>(&self, prefix: &[u8], mut visit: F) -> io::Result<()>
+    where
+        F: FnMut(Key, Value) -> io::Result<()>,
+    {
+        let storage = self.inner.read().map_err(|_| poisoned())?;
+        for entry in storage.scan_prefix_iter(prefix)? {
+            let (key, value) = entry?;
+            visit(key, value)?;
+        }
+        Ok(())
+    }
+
     /// Prefix scan. Concurrent with other reads.
     pub fn scan_prefix(&self, prefix: &[u8]) -> io::Result<Vec<(Key, Value)>> {
         self.inner

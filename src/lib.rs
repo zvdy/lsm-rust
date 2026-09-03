@@ -54,7 +54,7 @@ pub type Seq = u64;
 pub use server::{MetricsServer, RespServer};
 pub use sstable::{BlockCache, Compression};
 pub use storage::{
-    CompactorHandle, Isolation, LevelStats, SharedStorage, Snapshot, Storage, StorageConfig,
-    StorageStats, Transaction, TransactionError, WriteBatch,
+    CompactorHandle, Isolation, LevelStats, ScanIter, SharedStorage, Snapshot, SnapshotScan,
+    Storage, StorageConfig, StorageStats, Transaction, TransactionError, WriteBatch,
 };
 pub use wal::WalSync;

@@ -96,6 +96,22 @@ tombstone found anywhere along the way ends the search immediately, which is
 what keeps deleted keys deleted even when older SSTables still hold values for
 them.
 
+### Streaming scans
+
+A range scan merges every source — the memtable and one cursor per SSTable —
+through a binary heap ordered by `(key ascending, seq descending)`. All
+versions of a key therefore arrive contiguously, newest first, so the merge
+takes the first version visible to the scan's snapshot and skips the rest; a
+tombstone found there shadows everything older and the key is omitted.
+
+Each SSTable cursor walks the sparse index and reads **one data block at a
+time** as the scan advances, so memory is proportional to the number of
+sources rather than to the size of the range. `scan_iter` exposes this
+directly; `scan` is a convenience wrapper that collects it into a `Vec`.
+Because blocks are read lazily, each item is a `Result` — a checksum failure
+part-way through a scan surfaces as an error item rather than as a panic or as
+silently truncated output.
+
 ### Snapshots and time-travel
 
 Every version is tagged with its sequence number, and a read carries a
