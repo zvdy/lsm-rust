@@ -854,6 +854,30 @@ impl SSTable {
         Ok(SSTableLookup::NotFound)
     }
 
+    /// Whether this table could hold any key in `[start, end)`.
+    ///
+    /// A table whose whole key range falls outside the scan contributes
+    /// nothing to it, so the caller can skip opening a cursor over it. The
+    /// answer is exact, not an estimate: it compares the scan's bounds against
+    /// the table's real first and last keys.
+    ///
+    /// A table whose range is unknown answers `true`. Skipping on a guess
+    /// would drop matching keys, so uncertainty always costs work rather than
+    /// correctness.
+    pub fn may_contain_range(&self, start: &[u8], end: Option<&[u8]>) -> bool {
+        let Some((min, max)) = self.key_range() else {
+            return true;
+        };
+        // Entirely below the scan, or entirely at or above its exclusive end.
+        if max.as_slice() < start {
+            return false;
+        }
+        if end.is_some_and(|e| min.as_slice() >= e) {
+            return false;
+        }
+        true
+    }
+
     /// The earliest deadline stored anywhere in this table, or `None` if
     /// nothing in it expires.
     ///
@@ -896,10 +920,17 @@ impl SSTable {
             Layout::Empty => Ok(None),
             Layout::Legacy { data_start } => {
                 // Legacy tables have no index, so there is no cheaper way in.
+                // Scan for the extremes rather than taking the first and last
+                // entry: nothing guarantees a legacy file is ordered, which is
+                // why point lookups read them with `sorted: false` too. An
+                // overstated range only costs work; an understated one would
+                // let a table be skipped that holds matching keys.
                 let buffer = self.read_to_end_from(*data_start)?;
                 let entries = parse_entries(&buffer, false)?;
-                Ok(match (entries.first(), entries.last()) {
-                    (Some((min, _, _)), Some((max, _, _))) => Some((min.clone(), max.clone())),
+                let min = entries.iter().map(|(k, _, _)| k).min();
+                let max = entries.iter().map(|(k, _, _)| k).max();
+                Ok(match (min, max) {
+                    (Some(min), Some(max)) => Some((min.clone(), max.clone())),
                     _ => None,
                 })
             }
@@ -1366,6 +1397,64 @@ mod tests {
             reopened.get(b"key0100").unwrap(),
             SSTableLookup::Found(b"value50".to_vec())
         );
+    }
+
+    /// Build a legacy (pre-versioned) file holding `entries` in exactly the
+    /// order given — including an order that is not sorted.
+    fn write_legacy_file(path: &Path, entries: &[(&[u8], Option<&[u8]>)]) {
+        let mut bloom = BloomFilter::new(EXPECTED_ENTRIES_PER_SSTABLE, BLOOM_FALSE_POSITIVE_RATE);
+        for (key, _) in entries {
+            bloom.insert(key);
+        }
+        let bloom_bytes = bloom.to_bytes();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(bloom_bytes.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&bloom_bytes);
+        for (key, value) in entries {
+            bytes.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(key);
+            match value {
+                Some(v) => {
+                    bytes.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                    bytes.extend_from_slice(v);
+                }
+                None => bytes.extend_from_slice(&TOMBSTONE_MARKER.to_le_bytes()),
+            }
+        }
+        fs::write(path, &bytes).unwrap();
+    }
+
+    #[test]
+    fn legacy_key_range_does_not_assume_the_file_is_sorted() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("unsorted.sst");
+        // Deliberately out of order: taking the first and last entry would
+        // report ("m", "b") — a range that excludes both the real minimum and
+        // the real maximum, which would let a scan skip this table and lose
+        // keys it holds. Point lookups already read legacy files with
+        // `sorted: false` for the same reason.
+        write_legacy_file(
+            &path,
+            &[
+                (b"m", Some(b"1")),
+                (b"z", Some(b"2")),
+                (b"a", Some(b"3")),
+                (b"b", Some(b"4")),
+            ],
+        );
+
+        let table = SSTable::new(path).unwrap();
+        assert_eq!(
+            table.key_range().cloned(),
+            Some((b"a".to_vec(), b"z".to_vec()))
+        );
+
+        // And the table is therefore never ruled out of a range it covers.
+        assert!(table.may_contain_range(b"a", Some(b"b")));
+        assert!(table.may_contain_range(b"y", Some(b"zz")));
+        assert!(!table.may_contain_range(b"zz", None));
+        assert!(!table.may_contain_range(b"", Some(b"a")));
     }
 
     #[test]
