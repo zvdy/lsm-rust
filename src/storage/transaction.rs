@@ -14,8 +14,9 @@
 //! helper that retries for you.
 
 use super::Snapshot;
-use crate::{Key, Seq, Value};
+use crate::{Expiry, Key, Seq, Value, Version};
 use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::time::Duration;
 
 /// How strictly a transaction checks for conflicts when it commits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -78,7 +79,7 @@ impl CommitLog {
     pub(super) fn find_conflict(
         &self,
         snapshot_seq: Seq,
-        writes: &BTreeMap<Key, Option<Value>>,
+        writes: &BTreeMap<Key, Version>,
         reads: &HashSet<Key>,
         ranges: &[ReadRange],
         isolation: Isolation,
@@ -140,8 +141,8 @@ impl CommitLog {
 pub struct Transaction {
     db: super::SharedStorage,
     snapshot: Snapshot,
-    /// Buffered writes; `None` is a delete.
-    writes: BTreeMap<Key, Option<Value>>,
+    /// Buffered writes; a tombstone is a delete.
+    writes: BTreeMap<Key, Version>,
     reads: HashSet<Key>,
     ranges: Vec<ReadRange>,
     isolation: Isolation,
@@ -173,8 +174,9 @@ impl Transaction {
     /// otherwise the snapshot it began at.
     pub fn get(&mut self, key: &Key) -> crate::Result<Option<Value>> {
         if let Some(buffered) = self.writes.get(key) {
-            // Read-your-own-writes; a buffered delete reads back as absent.
-            return Ok(buffered.clone());
+            // Read-your-own-writes; a buffered delete — or a buffered write
+            // whose deadline has already passed — reads back as absent.
+            return Ok(buffered.visible_at(crate::version::now_ms()).cloned());
         }
         self.reads.insert(key.clone());
         self.db.get_at(&self.snapshot, key)
@@ -182,12 +184,26 @@ impl Transaction {
 
     /// Buffer a put. Nothing is written until [`Transaction::commit`].
     pub fn put(&mut self, key: Key, value: Value) {
-        self.writes.insert(key, Some(value));
+        self.writes.insert(key, Version::live(value));
+    }
+
+    /// Buffer a put that expires after `ttl`. Nothing is written until
+    /// [`Transaction::commit`]; the deadline is resolved when this is called,
+    /// not when the transaction commits.
+    pub fn put_with_ttl(&mut self, key: Key, value: Value, ttl: Duration) {
+        self.put_with_expiry(key, value, crate::version::ttl_to_expiry(ttl));
+    }
+
+    /// Buffer a put that expires at `expires_at`, an absolute deadline in
+    /// milliseconds since the Unix epoch.
+    pub fn put_with_expiry(&mut self, key: Key, value: Value, expires_at: Expiry) {
+        self.writes
+            .insert(key, Version::expiring(value, expires_at));
     }
 
     /// Buffer a delete. Nothing is written until [`Transaction::commit`].
     pub fn delete(&mut self, key: Key) {
-        self.writes.insert(key, None);
+        self.writes.insert(key, Version::tombstone());
     }
 
     /// Range scan (`start <= key < end`) over the snapshot, merged with this
@@ -215,11 +231,12 @@ impl Transaction {
         let in_range = |k: &[u8]| k >= start && end.is_none_or(|e| k < e);
 
         let mut merged: BTreeMap<Key, Value> = committed.into_iter().collect();
-        for (key, value) in &self.writes {
+        let now = crate::version::now_ms();
+        for (key, version) in &self.writes {
             if !in_range(key) {
                 continue;
             }
-            match value {
+            match version.visible_at(now) {
                 Some(v) => {
                     merged.insert(key.clone(), v.clone());
                 }
@@ -279,10 +296,10 @@ mod tests {
         items.iter().map(|k| k.as_bytes().to_vec()).collect()
     }
 
-    fn writes(items: &[&str]) -> BTreeMap<Key, Option<Value>> {
+    fn writes(items: &[&str]) -> BTreeMap<Key, Version> {
         items
             .iter()
-            .map(|k| (k.as_bytes().to_vec(), Some(b"v".to_vec())))
+            .map(|k| (k.as_bytes().to_vec(), Version::live(b"v".to_vec())))
             .collect()
     }
 

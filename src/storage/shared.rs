@@ -2,7 +2,7 @@ use super::{
     CheckpointInfo, Isolation, Snapshot, Storage, StorageConfig, StorageStats, Transaction,
     WriteBatch,
 };
-use crate::Seq;
+use crate::{Expiry, Seq, Version};
 use crate::{Key, Value};
 use std::collections::{BTreeMap, HashSet};
 use std::io;
@@ -254,7 +254,7 @@ impl SharedStorage {
     pub(super) fn commit_transaction(
         &self,
         snapshot: &Snapshot,
-        writes: BTreeMap<Key, Option<Value>>,
+        writes: BTreeMap<Key, Version>,
         reads: HashSet<Key>,
         ranges: Vec<(Key, Option<Key>)>,
         isolation: Isolation,
@@ -268,6 +268,42 @@ impl SharedStorage {
     /// Number of commit records retained for transaction conflict detection.
     pub fn tracked_commits(&self) -> crate::Result<usize> {
         Ok(self.inner.read().map_err(|_| poisoned())?.tracked_commits())
+    }
+
+    /// Insert or update `key` with `value`, hiding it once `ttl` has elapsed.
+    ///
+    /// The TTL is resolved to an absolute deadline immediately, so it survives
+    /// restarts without being refreshed.
+    pub fn put_with_ttl(
+        &self,
+        key: crate::Key,
+        value: crate::Value,
+        ttl: Duration,
+    ) -> crate::Result<()> {
+        self.inner
+            .write()
+            .map_err(|_| poisoned())?
+            .put_with_ttl(key, value, ttl)
+    }
+
+    /// Insert or update `key` with `value`, hiding it after `expires_at` — an
+    /// absolute deadline in milliseconds since the Unix epoch.
+    pub fn put_with_expiry(
+        &self,
+        key: crate::Key,
+        value: crate::Value,
+        expires_at: Expiry,
+    ) -> crate::Result<()> {
+        self.inner
+            .write()
+            .map_err(|_| poisoned())?
+            .put_with_expiry(key, value, expires_at)
+    }
+
+    /// When `key`'s visible version expires: `None` if there is no visible
+    /// version, `Some(None)` if it has no deadline, `Some(Some(ms))` otherwise.
+    pub fn expiry(&self, key: &crate::Key) -> crate::Result<Option<Option<Expiry>>> {
+        self.inner.read().map_err(|_| poisoned())?.expiry(key)
     }
 
     /// Take a point-in-time snapshot of the store's operational metrics.

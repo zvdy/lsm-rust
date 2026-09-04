@@ -274,25 +274,32 @@ promotions, as a subset of `lsm_compactions_total`.
 
 ## On-disk formats
 
-### SSTable (versioned, v4)
+### SSTable (versioned, v5)
 
-v4 adds a CRC-32 to every section and every data block. v3 (sequence numbers,
-no checksums), v2 (no sequence numbers) and pre-header legacy files remain
-readable through fallback paths; v2 and legacy entries are treated as
-sequence 0.
+v5 adds per-entry expiry and an 8-byte header field holding the earliest
+deadline in the table. v4 (CRC-32 on every section and data block), v3
+(sequence numbers, no checksums), v2 (no sequence numbers) and pre-header
+legacy files remain readable through fallback paths; v2 and legacy entries are
+treated as sequence 0, and anything before v5 has no deadlines.
 
 ```text
-┌───────┬─────────┬───────┬───────────────────┬───────────────────┬─────────────────┐
-│ magic │ version │ flags │ bloom             │ sparse index      │ data blocks     │
-│ LSMT  │ u8 = 4  │ u8    │ len + crc + bytes │ len + crc + bytes │ crc + payload   │
-└───────┴─────────┴───────┴───────────────────┴───────────────────┴─────────────────┘
+┌───────┬─────────┬───────┬────────────┬───────────────────┬───────────────────┬───────────────┐
+│ magic │ version │ flags │ min_expiry │ bloom             │ sparse index      │ data blocks   │
+│ LSMT  │ u8 = 5  │ u8    │ u64        │ len + crc + bytes │ len + crc + bytes │ crc + payload │
+└───────┴─────────┴───────┴────────────┴───────────────────┴───────────────────┴───────────────┘
 
 section:      [len u32][crc32 u32][body]
 data block:   [crc32 u32][payload]        payload = entries, LZ4-compressed if flagged
 index entry:  [first_key_len u32][first_key][block_offset u64][block_len u32]
 data entry:   [key_len u32][key][seq u64][value_len u32][value]
+expiring:     [key_len u32][key][seq u64][0xFFFFFFFE][expires_at u64][value_len u32][value]
 tombstone:    [key_len u32][key][seq u64][0xFFFFFFFF]
 ```
+
+The deadline hides inside the value-length slot rather than becoming a field
+of its own, so an entry *without* one costs exactly what it did before. The
+header's `min_expiry` (0 when nothing in the table expires) lets compaction
+tell that a table has something to reclaim without reading a byte of it.
 
 Within a block, entries are sorted by `(key ascending, seq descending)` and a
 key's versions are never split across blocks, so a snapshot lookup reads a
@@ -333,6 +340,59 @@ atomically at every flush and compaction commit point; on startup, `.sst` files
 not referenced by the manifest are treated as orphans from an interrupted
 operation and removed. The persisted `last_seq` is what lets a recorded
 sequence checkpoint remain meaningful across restarts for time-travel reads.
+
+## Expiry (TTL)
+
+A version may carry an absolute deadline — Unix milliseconds, not a countdown —
+resolved when the write happens. It therefore survives a restart without being
+refreshed and does not reset when the store reopens.
+
+**Expiry is evaluated on read, against the wall clock.** The consequence worth
+stating plainly is that **a snapshot isolates a reader from writes, not from
+time**: a snapshot taken before a key expired stops returning it once the
+deadline passes. Sequence numbers order writes against one another and say
+nothing about the clock, so the two are deliberately independent. A point
+lookup and a scan each sample the clock once, so a single operation sees one
+consistent instant rather than letting keys wink out midway through.
+
+**An expired version shadows; it does not vanish.** This is the property the
+whole design turns on. A key often has several versions, and hiding the newest
+one must not reveal the one underneath:
+
+```mermaid
+flowchart TB
+    R["read k"] --> N["newest version ≤ snapshot"]
+    N --> Q{"kind?"}
+    Q -->|"value, no deadline"| V["return it"]
+    Q -->|"value, deadline passed"| A["absent — and stop:<br/>older versions stay hidden"]
+    Q -->|tombstone| A
+    A -.->|"never"| O["older version of k"]
+```
+
+So an expired version reads as *deleted*, not as *not present here*, at every
+layer: the memtable, a table's point lookup, and the merge behind a scan. Get
+this wrong at any one of them and expiry resurrects whatever the key held
+before.
+
+**Compaction is where expired data is actually reclaimed.** Until then it is
+only hidden. A merge rewrites an expired version as a tombstone rather than
+dropping it — dropping would uncover the older version and bring back a value
+the deadline retired — and the ordinary tombstone rules then decide when it is
+safe to drop outright. `lsm_expired_total` counts versions collected this way.
+
+That interacts with the promotion path above, and the interaction is not
+optional. A promotion never reads the data, so it can collect nothing; and an
+append-only, time-ordered workload — precisely the shape that promotes most
+eagerly — is also the one most likely to use TTLs. A level holding anything
+past its deadline is therefore merged rather than promoted, which the header's
+`min_expiry` makes free to detect.
+
+The RESP server exposes this as `SET key value EX seconds | PX milliseconds`
+and `TTL key`, the latter following Redis's convention: `-2` for no such key,
+`-1` for a key with no deadline, otherwise the whole seconds remaining. A
+malformed expiry option is an error rather than a silently ignored argument —
+a client that asked for a deadline must never be told `OK` for a key that
+would live for ever.
 
 ## Concurrency model
 

@@ -178,3 +178,71 @@ fn concurrent_clients_and_persistence() {
         Some(b"v".to_vec())
     );
 }
+
+#[test]
+fn set_with_ex_expires_the_key() {
+    let (_temp_dir, server) = start_server();
+    let mut client = Client::connect(server.local_addr());
+
+    // PX keeps the test fast while still exercising the real clock.
+    client.send(&[b"SET", b"quick", b"v", b"PX", b"80"]);
+    assert_eq!(client.read_reply(), vec!["+OK"]);
+    client.send(&[b"GET", b"quick"]);
+    assert_eq!(client.read_reply(), vec!["v"]);
+
+    std::thread::sleep(std::time::Duration::from_millis(160));
+
+    client.send(&[b"GET", b"quick"]);
+    assert_eq!(client.read_reply(), vec!["nil"]);
+    // EXISTS must agree with GET rather than reporting the hidden version.
+    client.send(&[b"EXISTS", b"quick"]);
+    assert_eq!(client.read_reply(), vec![":0"]);
+}
+
+#[test]
+fn ttl_reports_redis_style_states() {
+    let (_temp_dir, server) = start_server();
+    let mut client = Client::connect(server.local_addr());
+
+    client.send(&[b"TTL", b"missing"]);
+    assert_eq!(client.read_reply(), vec![":-2"], "no such key");
+
+    client.send(&[b"SET", b"permanent", b"v"]);
+    client.read_reply();
+    client.send(&[b"TTL", b"permanent"]);
+    assert_eq!(client.read_reply(), vec![":-1"], "no deadline");
+
+    client.send(&[b"SET", b"expiring", b"v", b"EX", b"100"]);
+    assert_eq!(client.read_reply(), vec!["+OK"]);
+    client.send(&[b"TTL", b"expiring"]);
+    let reply = client.read_reply();
+    let seconds: i64 = reply[0][1..].parse().unwrap();
+    assert!(
+        (95..=100).contains(&seconds),
+        "expected roughly 100s left, got {seconds}"
+    );
+}
+
+#[test]
+fn a_malformed_expiry_is_rejected_rather_than_silently_ignored() {
+    let (_temp_dir, server) = start_server();
+    let mut client = Client::connect(server.local_addr());
+
+    // A client asking for an expiry must never be told OK for a key that
+    // would then live for ever.
+    client.send(&[b"SET", b"k", b"v", b"EX", b"nonsense"]);
+    assert!(client.read_reply()[0].starts_with('-'));
+
+    client.send(&[b"SET", b"k", b"v", b"EX", b"0"]);
+    assert!(client.read_reply()[0].starts_with('-'));
+
+    client.send(&[b"SET", b"k", b"v", b"NX", b"5"]);
+    assert!(client.read_reply()[0].starts_with('-'), "unknown option");
+
+    client.send(&[b"GET", b"k"]);
+    assert_eq!(client.read_reply(), vec!["nil"], "nothing was written");
+
+    // Wrong arity still reports the usual arity error.
+    client.send(&[b"SET", b"k", b"v", b"EX"]);
+    assert!(client.read_reply()[0].starts_with('-'));
+}

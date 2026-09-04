@@ -1,5 +1,5 @@
 use super::{SSTable, VersionedEntry};
-use crate::{Key, Seq};
+use crate::{Expiry, Key, Seq, Version};
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 
@@ -57,6 +57,13 @@ impl CompactionManager {
     ///
     /// [`CompactionPlan::Promote`] needs all three of:
     ///
+    /// - **Nothing expired.** Deduplication is not the only thing a merge
+    ///   reclaims: it is also where versions past their deadline are
+    ///   collected. A promotion never reads the data, so it can collect
+    ///   nothing — and an append-only workload with TTLs, which is exactly the
+    ///   shape that promotes most eagerly, would otherwise keep expired data
+    ///   for ever. Each table's earliest deadline sits in its header, so this
+    ///   check is free.
     /// - **No overlap.** With every key in exactly one table there is nothing
     ///   for a merge to collapse, so rewriting is pure cost.
     /// - **More than one table.** A lone table is merged with itself, which is
@@ -66,11 +73,19 @@ impl CompactionManager {
     /// - **Room at the destination.** See [`MAX_TABLES_PER_LEVEL`].
     ///
     /// Anything else merges, so the fallback is always today's behaviour.
-    pub fn plan(&self, tables: &[SSTable], destination_tables: usize) -> CompactionPlan {
+    pub fn plan(
+        &self,
+        tables: &[SSTable],
+        destination_tables: usize,
+        now: Expiry,
+    ) -> CompactionPlan {
         if tables.len() < 2 {
             return CompactionPlan::Merge;
         }
         if destination_tables + tables.len() > MAX_TABLES_PER_LEVEL {
+            return CompactionPlan::Merge;
+        }
+        if tables.iter().any(|t| t.has_expired_at(now)) {
             return CompactionPlan::Merge;
         }
         if Self::max_overlap_depth(tables) > 1 {
@@ -141,18 +156,35 @@ impl CompactionManager {
     /// Tombstones are only discarded when `drop_tombstones` is set (no data
     /// below the output level) *and* there are no live snapshots — otherwise a
     /// snapshot could still need to observe the deletion.
+    ///
+    /// A version whose expiry has passed at `now` is rewritten as a tombstone
+    /// before any of the above is applied. It cannot simply be dropped:
+    /// removing it would uncover an older version of the same key and
+    /// resurrect a value the deadline was meant to retire. As a tombstone it
+    /// keeps shadowing what lies beneath, and the rules above then decide when
+    /// it is safe to drop outright — which is how expired data is eventually
+    /// reclaimed rather than merely hidden. The count of versions collected
+    /// this way is returned alongside the entries.
     pub fn compact(
         &self,
         tables: &[SSTable],
         drop_tombstones: bool,
         gc_floor: Seq,
-    ) -> crate::Result<Vec<VersionedEntry>> {
+        now: Expiry,
+    ) -> crate::Result<(Vec<VersionedEntry>, u64)> {
         // Sorted by (key asc, seq desc). Inserting oldest table first means a
         // newer table's value wins for a colliding (key, seq) legacy entry.
-        let mut merged: BTreeMap<(Key, Reverse<Seq>), Option<Vec<u8>>> = BTreeMap::new();
+        let mut merged: BTreeMap<(Key, Reverse<Seq>), Version> = BTreeMap::new();
+        let mut expired = 0u64;
         for table in tables {
-            for (key, seq, value) in table.read_versioned()? {
-                merged.insert((key, Reverse(seq)), value);
+            for (key, seq, version) in table.read_versioned()? {
+                let collected = if version.is_expired_at(now) {
+                    expired += 1;
+                    version.collect_if_expired(now)
+                } else {
+                    version
+                };
+                merged.insert((key, Reverse(seq)), collected);
             }
         }
 
@@ -161,7 +193,7 @@ impl CompactionManager {
         let mut out: Vec<VersionedEntry> = Vec::new();
         let mut current_key: Option<Key> = None;
         let mut kept_floor_version = false;
-        for ((key, Reverse(seq)), value) in merged {
+        for ((key, Reverse(seq)), version) in merged {
             // Reset per-key bookkeeping when the key changes
             if current_key.as_ref() != Some(&key) {
                 current_key = Some(key.clone());
@@ -169,7 +201,7 @@ impl CompactionManager {
             }
 
             if seq > gc_floor {
-                out.push((key, seq, value));
+                out.push((key, seq, version));
                 continue;
             }
 
@@ -179,14 +211,14 @@ impl CompactionManager {
             }
             kept_floor_version = true;
 
-            if can_drop_tombstones && value.is_none() {
+            if can_drop_tombstones && version.is_tombstone() {
                 // Safe to garbage-collect the deletion entirely
                 continue;
             }
-            out.push((key, seq, value));
+            out.push((key, seq, version));
         }
 
-        Ok(out)
+        Ok((out, expired))
     }
 }
 
@@ -214,7 +246,7 @@ mod tests {
     fn table_spanning(dir: &TempDir, name: &str, keys: &[&str]) -> SSTable {
         let data: Vec<VersionedEntry> = keys
             .iter()
-            .map(|k| (k.as_bytes().to_vec(), 1, Some(b"v".to_vec())))
+            .map(|k| (k.as_bytes().to_vec(), 1, Version::live(b"v".to_vec())))
             .collect();
         write_versioned_table(dir, name, &data)
     }
@@ -308,29 +340,62 @@ mod tests {
             table_spanning(&dir, "a.sst", &["a1", "a2"]),
             table_spanning(&dir, "b.sst", &["b1", "b2"]),
         ];
-        assert_eq!(manager.plan(&disjoint, 0), CompactionPlan::Promote);
+        assert_eq!(manager.plan(&disjoint, 0, 0), CompactionPlan::Promote);
 
         // Overlapping: a merge actually collapses keys, so it is worth doing.
         let overlapping = vec![
             table_spanning(&dir, "c.sst", &["a", "z"]),
             table_spanning(&dir, "d.sst", &["a", "z"]),
         ];
-        assert_eq!(manager.plan(&overlapping, 0), CompactionPlan::Merge);
+        assert_eq!(manager.plan(&overlapping, 0, 0), CompactionPlan::Merge);
 
         // A lone table is merged with itself: that is where versions collapse
         // and tombstones are dropped, which promotion would skip.
         let single = vec![table_spanning(&dir, "e.sst", &["a", "b"])];
-        assert_eq!(manager.plan(&single, 0), CompactionPlan::Merge);
+        assert_eq!(manager.plan(&single, 0, 0), CompactionPlan::Merge);
 
         // Disjoint, but the destination is already full enough that promoting
         // would grow per-lookup Bloom checks: consolidate instead.
         assert_eq!(
-            manager.plan(&disjoint, MAX_TABLES_PER_LEVEL - 1),
+            manager.plan(&disjoint, MAX_TABLES_PER_LEVEL - 1, 0),
             CompactionPlan::Merge
         );
         assert_eq!(
-            manager.plan(&disjoint, MAX_TABLES_PER_LEVEL - 2),
+            manager.plan(&disjoint, MAX_TABLES_PER_LEVEL - 2, 0),
             CompactionPlan::Promote
+        );
+    }
+
+    #[test]
+    fn plan_merges_a_disjoint_level_that_has_something_to_expire() {
+        let dir = TempDir::new().unwrap();
+        let manager = CompactionManager::new(4, 1024, 4);
+
+        // Disjoint, so overlap alone would say "promote" — but promotion never
+        // reads the data, so the expired version would survive for ever.
+        let tables = vec![
+            write_versioned_table(
+                &dir,
+                "a.sst",
+                &[(b"a".to_vec(), 1, Version::expiring(b"v".to_vec(), 500))],
+            ),
+            write_versioned_table(
+                &dir,
+                "b.sst",
+                &[(b"b".to_vec(), 1, Version::live(b"v".to_vec()))],
+            ),
+        ];
+        assert_eq!(CompactionManager::max_overlap_depth(&tables), 1);
+
+        assert_eq!(
+            manager.plan(&tables, 0, 499),
+            CompactionPlan::Promote,
+            "nothing has expired yet, so there is still nothing to reclaim"
+        );
+        assert_eq!(
+            manager.plan(&tables, 0, 501),
+            CompactionPlan::Merge,
+            "a passed deadline is reclaimable work a promotion cannot do"
         );
     }
 
@@ -341,21 +406,21 @@ mod tests {
         let old = write_versioned_table(
             &temp_dir,
             "old.sst",
-            &[(b"key".to_vec(), 1, Some(b"old_value".to_vec()))],
+            &[(b"key".to_vec(), 1, Version::live(b"old_value".to_vec()))],
         );
         let new = write_versioned_table(
             &temp_dir,
             "new.sst",
-            &[(b"key".to_vec(), 2, Some(b"new_value".to_vec()))],
+            &[(b"key".to_vec(), 2, Version::live(b"new_value".to_vec()))],
         );
 
         let manager = CompactionManager::new(4, 1024, 4);
         // No snapshots: collapse to the newest version
-        let merged = manager.compact(&[old, new], false, Seq::MAX).unwrap();
+        let merged = manager.compact(&[old, new], false, Seq::MAX, 0).unwrap().0;
 
         assert_eq!(
             merged,
-            vec![(b"key".to_vec(), 2, Some(b"new_value".to_vec()))]
+            vec![(b"key".to_vec(), 2, Version::live(b"new_value".to_vec()))]
         );
     }
 
@@ -365,15 +430,19 @@ mod tests {
         let old = write_versioned_table(
             &temp_dir,
             "old.sst",
-            &[(b"key".to_vec(), 1, Some(b"value".to_vec()))],
+            &[(b"key".to_vec(), 1, Version::live(b"value".to_vec()))],
         );
-        let new = write_versioned_table(&temp_dir, "new.sst", &[(b"key".to_vec(), 2, None)]);
+        let new = write_versioned_table(
+            &temp_dir,
+            "new.sst",
+            &[(b"key".to_vec(), 2, Version::tombstone())],
+        );
 
         let manager = CompactionManager::new(4, 1024, 4);
 
         // With older data possibly below (drop_tombstones = false), keep it
-        let merged = manager.compact(&[old, new], false, Seq::MAX).unwrap();
-        assert_eq!(merged, vec![(b"key".to_vec(), 2, None)]);
+        let merged = manager.compact(&[old, new], false, Seq::MAX, 0).unwrap().0;
+        assert_eq!(merged, vec![(b"key".to_vec(), 2, Version::tombstone())]);
     }
 
     #[test]
@@ -383,17 +452,24 @@ mod tests {
             &temp_dir,
             "old.sst",
             &[
-                (b"deleted".to_vec(), 1, Some(b"value".to_vec())),
-                (b"kept".to_vec(), 1, Some(b"value".to_vec())),
+                (b"deleted".to_vec(), 1, Version::live(b"value".to_vec())),
+                (b"kept".to_vec(), 1, Version::live(b"value".to_vec())),
             ],
         );
-        let new = write_versioned_table(&temp_dir, "new.sst", &[(b"deleted".to_vec(), 2, None)]);
+        let new = write_versioned_table(
+            &temp_dir,
+            "new.sst",
+            &[(b"deleted".to_vec(), 2, Version::tombstone())],
+        );
 
         let manager = CompactionManager::new(4, 1024, 4);
         // Last level, no snapshots: tombstone is garbage-collected
-        let merged = manager.compact(&[old, new], true, Seq::MAX).unwrap();
+        let merged = manager.compact(&[old, new], true, Seq::MAX, 0).unwrap().0;
 
-        assert_eq!(merged, vec![(b"kept".to_vec(), 1, Some(b"value".to_vec()))]);
+        assert_eq!(
+            merged,
+            vec![(b"kept".to_vec(), 1, Version::live(b"value".to_vec()))]
+        );
     }
 
     #[test]
@@ -403,21 +479,21 @@ mod tests {
             &temp_dir,
             "t.sst",
             &[
-                (b"k".to_vec(), 9, Some(b"v9".to_vec())),
-                (b"k".to_vec(), 5, Some(b"v5".to_vec())),
-                (b"k".to_vec(), 1, Some(b"v1".to_vec())),
+                (b"k".to_vec(), 9, Version::live(b"v9".to_vec())),
+                (b"k".to_vec(), 5, Version::live(b"v5".to_vec())),
+                (b"k".to_vec(), 1, Version::live(b"v1".to_vec())),
             ],
         );
         let manager = CompactionManager::new(4, 1024, 4);
 
         // A snapshot at seq 5 is live (gc_floor = 5): keep everything with
         // seq > 5 plus the newest version <= 5. v1 is shadowed by v5 and dropped.
-        let merged = manager.compact(&[table], false, 5).unwrap();
+        let merged = manager.compact(&[table], false, 5, 0).unwrap().0;
         assert_eq!(
             merged,
             vec![
-                (b"k".to_vec(), 9, Some(b"v9".to_vec())),
-                (b"k".to_vec(), 5, Some(b"v5".to_vec())),
+                (b"k".to_vec(), 9, Version::live(b"v9".to_vec())),
+                (b"k".to_vec(), 5, Version::live(b"v5".to_vec())),
             ]
         );
     }
@@ -429,16 +505,19 @@ mod tests {
             &temp_dir,
             "t.sst",
             &[
-                (b"k".to_vec(), 9, Some(b"v9".to_vec())),
-                (b"k".to_vec(), 5, Some(b"v5".to_vec())),
-                (b"k".to_vec(), 1, Some(b"v1".to_vec())),
+                (b"k".to_vec(), 9, Version::live(b"v9".to_vec())),
+                (b"k".to_vec(), 5, Version::live(b"v5".to_vec())),
+                (b"k".to_vec(), 1, Version::live(b"v1".to_vec())),
             ],
         );
         let manager = CompactionManager::new(4, 1024, 4);
 
         // No snapshots: only the newest version survives
-        let merged = manager.compact(&[table], false, Seq::MAX).unwrap();
-        assert_eq!(merged, vec![(b"k".to_vec(), 9, Some(b"v9".to_vec()))]);
+        let merged = manager.compact(&[table], false, Seq::MAX, 0).unwrap().0;
+        assert_eq!(
+            merged,
+            vec![(b"k".to_vec(), 9, Version::live(b"v9".to_vec()))]
+        );
     }
 
     #[test]
@@ -457,7 +536,10 @@ mod tests {
         );
 
         let manager = CompactionManager::new(4, 1024, 4);
-        let merged = manager.compact(&[old, new], false, Seq::MAX).unwrap();
-        assert_eq!(merged, vec![(b"key".to_vec(), 0, Some(b"new".to_vec()))]);
+        let merged = manager.compact(&[old, new], false, Seq::MAX, 0).unwrap().0;
+        assert_eq!(
+            merged,
+            vec![(b"key".to_vec(), 0, Version::live(b"new".to_vec()))]
+        );
     }
 }

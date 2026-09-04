@@ -8,7 +8,7 @@
 use super::Snapshot;
 use crate::memtable::MemTable;
 use crate::sstable::{RangeCursor, SSTable, VersionedEntry};
-use crate::{Key, Seq, Value};
+use crate::{Expiry, Key, Seq, Value, Version};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
@@ -33,7 +33,7 @@ impl Source<'_> {
 struct HeapItem {
     key: Key,
     seq: Seq,
-    value: Option<Value>,
+    version: Version,
     source: usize,
 }
 
@@ -69,6 +69,10 @@ pub struct ScanIter<'a> {
     sources: Vec<Source<'a>>,
     heap: BinaryHeap<HeapItem>,
     snapshot_seq: Seq,
+    /// Wall-clock time the scan reads at, sampled once when it is created so
+    /// that a long traversal sees one consistent instant rather than letting
+    /// keys wink out midway through.
+    now: Expiry,
     failed: bool,
 }
 
@@ -94,6 +98,7 @@ impl<'a> ScanIter<'a> {
             sources,
             heap: BinaryHeap::new(),
             snapshot_seq,
+            now: crate::version::now_ms(),
             failed: false,
         };
         // Prime the heap with the head of every source.
@@ -106,11 +111,11 @@ impl<'a> ScanIter<'a> {
     /// Pull the next entry from `index` into the heap, if it has one.
     fn refill(&mut self, index: usize) -> crate::Result<()> {
         if let Some(entry) = self.sources[index].next_entry() {
-            let (key, seq, value) = entry?;
+            let (key, seq, version) = entry?;
             self.heap.push(HeapItem {
                 key,
                 seq,
-                value,
+                version,
                 source: index,
             });
         }
@@ -136,7 +141,7 @@ impl Iterator for ScanIter<'_> {
             // first one visible to the snapshot is the answer — a tombstone
             // included, which shadows everything older.
             let key = item.key;
-            let mut chosen = (item.seq <= self.snapshot_seq).then_some(item.value);
+            let mut chosen = (item.seq <= self.snapshot_seq).then_some(item.version);
 
             while self.heap.peek().is_some_and(|next| next.key == key) {
                 let next = self.heap.pop().expect("peeked");
@@ -145,14 +150,17 @@ impl Iterator for ScanIter<'_> {
                     return Some(Err(e));
                 }
                 if chosen.is_none() && next.seq <= self.snapshot_seq {
-                    chosen = Some(next.value);
+                    chosen = Some(next.version);
                 }
             }
 
-            match chosen {
-                Some(Some(value)) => return Some(Ok((key, value))),
-                // Deleted, or no version this snapshot can see.
-                Some(None) | None => continue,
+            // An expired version reads as absent here just as a tombstone
+            // does — and, like a tombstone, it has already shadowed every
+            // older version of the key, so the key is skipped rather than
+            // falling through to what it replaced.
+            match chosen.as_ref().and_then(|v| v.visible_at(self.now)) {
+                Some(value) => return Some(Ok((key, value.clone()))),
+                None => continue,
             }
         }
     }

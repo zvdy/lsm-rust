@@ -1,6 +1,6 @@
 use crate::bloom::BloomFilter;
 use crate::checksum::crc32;
-use crate::{Key, Seq, Value};
+use crate::{Expiry, Key, Seq, Value, Version};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -17,6 +17,10 @@ const EXPECTED_ENTRIES_PER_SSTABLE: usize = 1000;
 /// Sentinel value length that marks a tombstone (deleted key) on disk.
 /// Real values are limited to less than u32::MAX bytes.
 const TOMBSTONE_MARKER: u32 = u32::MAX;
+/// Written in the value-length slot to mean `[expires_at u64][len u32][value]`
+/// follows, rather than a bare `[value]`. Only v5 tables contain it, so the
+/// common case — a value with no deadline — still costs no extra bytes.
+const EXPIRING_MARKER: u32 = u32::MAX - 1;
 
 /// Magic bytes identifying the versioned SSTable format.
 const MAGIC: &[u8; 4] = b"LSMT";
@@ -25,7 +29,7 @@ const FLAG_LZ4: u8 = 0b0000_0001;
 /// Current on-disk format version. v3 stores a sequence number per entry
 /// (MVCC). v2 is the same layout without the per-entry sequence; it is still
 /// read (all entries treated as sequence 0).
-const FORMAT_VERSION: u8 = 4;
+const FORMAT_VERSION: u8 = 5;
 /// Soft target for the number of entries per data block. A block is never
 /// split in the middle of a key's versions, so all versions of a key are
 /// always in one block and a point lookup reads a single block.
@@ -33,7 +37,7 @@ const BLOCK_ENTRY_COUNT: usize = 16;
 
 /// A single stored version: key, its sequence number, and either a value or
 /// a tombstone (`None`).
-pub type VersionedEntry = (Key, Seq, Option<Value>);
+pub type VersionedEntry = (Key, Seq, Version);
 
 /// Block compression applied to SSTable data blocks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -83,6 +87,9 @@ enum Layout {
         compression: Compression,
         has_seq: bool,
         has_block_crc: bool,
+        /// Earliest deadline anywhere in the table, or `None` if nothing in
+        /// it expires. Read straight from the v5 header.
+        min_expiry: Option<Expiry>,
     },
 }
 
@@ -146,15 +153,32 @@ fn parse_entries(buffer: &[u8], has_seq: bool) -> crate::Result<Vec<VersionedEnt
 
         let value_size = read_u32(buffer, pos)?;
         pos += 4;
-        let value = if value_size == TOMBSTONE_MARKER {
-            None
+        let version = if value_size == TOMBSTONE_MARKER {
+            Version::tombstone()
         } else {
-            let value = read_slice(buffer, pos, value_size as usize)?.to_vec();
-            pos += value_size as usize;
-            Some(value)
+            let expires_at = if value_size == EXPIRING_MARKER {
+                let deadline = read_u64(buffer, pos)?;
+                pos += 8;
+                Some(deadline)
+            } else {
+                None
+            };
+            let len = if expires_at.is_some() {
+                let len = read_u32(buffer, pos)? as usize;
+                pos += 4;
+                len
+            } else {
+                value_size as usize
+            };
+            let value = read_slice(buffer, pos, len)?.to_vec();
+            pos += len;
+            Version {
+                value: Some(value),
+                expires_at,
+            }
         };
 
-        data.push((key, seq, value));
+        data.push((key, seq, version));
     }
     Ok(data)
 }
@@ -162,16 +186,22 @@ fn parse_entries(buffer: &[u8], has_seq: bool) -> crate::Result<Vec<VersionedEnt
 /// Encode versioned entries in the flat on-disk entry format (v3, with
 /// sequence numbers).
 fn encode_entries(data: &[VersionedEntry], out: &mut Vec<u8>) {
-    for (key, seq, value) in data {
+    for (key, seq, version) in data {
         out.extend_from_slice(&(key.len() as u32).to_le_bytes());
         out.extend_from_slice(key);
         out.extend_from_slice(&seq.to_le_bytes());
-        match value {
-            Some(value) => {
+        match (&version.value, version.expires_at) {
+            (None, _) => out.extend_from_slice(&TOMBSTONE_MARKER.to_le_bytes()),
+            (Some(value), None) => {
                 out.extend_from_slice(&(value.len() as u32).to_le_bytes());
                 out.extend_from_slice(value);
             }
-            None => out.extend_from_slice(&TOMBSTONE_MARKER.to_le_bytes()),
+            (Some(value), Some(deadline)) => {
+                out.extend_from_slice(&EXPIRING_MARKER.to_le_bytes());
+                out.extend_from_slice(&deadline.to_le_bytes());
+                out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                out.extend_from_slice(value);
+            }
         }
     }
 }
@@ -230,17 +260,33 @@ impl SSTable {
             file.read_exact(&mut version_flags)?;
             let version = version_flags[0];
             // v2: no sequence numbers. v3: per-entry sequence. v4: adds a
-            // CRC-32 over every section and data block.
+            // CRC-32 over every section and data block. v5: adds optional
+            // per-entry expiry, plus an 8-byte header field holding the
+            // earliest deadline in the table.
             let (has_seq, has_block_crc) = match version {
                 2 => (false, false),
                 3 => (true, false),
-                4 => (true, true),
+                4 | 5 => (true, true),
                 _ => return Err(corrupt("unsupported SSTable format version")),
             };
             let compression = if version_flags[1] & FLAG_LZ4 != 0 {
                 Compression::Lz4
             } else {
                 Compression::None
+            };
+
+            // v5 records the earliest deadline held anywhere in the table, so
+            // compaction can tell whether the table has anything to reclaim
+            // without reading it. 0 means nothing here ever expires.
+            let min_expiry = if version >= 5 {
+                let mut bytes = [0u8; 8];
+                file.read_exact(&mut bytes)?;
+                match Expiry::from_le_bytes(bytes) {
+                    0 => None,
+                    deadline => Some(deadline),
+                }
+            } else {
+                None
             };
 
             // Bloom filter, then the sparse index. In v4 each section is
@@ -261,6 +307,7 @@ impl SSTable {
                     compression,
                     has_seq,
                     has_block_crc,
+                    min_expiry,
                 },
             ))
         } else {
@@ -361,7 +408,13 @@ impl SSTable {
     ) -> crate::Result<()> {
         let versioned: Vec<VersionedEntry> = data
             .iter()
-            .map(|(k, v)| (k.clone(), 0, v.clone()))
+            .map(|(k, v)| {
+                let version = match v {
+                    Some(value) => Version::live(value.clone()),
+                    None => Version::tombstone(),
+                };
+                (k.clone(), 0, version)
+            })
             .collect();
         self.write_versioned(&versioned, compression)
     }
@@ -432,9 +485,17 @@ impl SSTable {
             Compression::None => 0,
             Compression::Lz4 => FLAG_LZ4,
         };
+        // The earliest deadline in the table, so a later compaction can see
+        // that there is something here to reclaim without reading the data.
+        let min_expiry = data
+            .iter()
+            .filter_map(|(_, _, version)| version.expires_at)
+            .min();
+
         let mut file = File::create(&self.path)?;
         file.write_all(MAGIC)?;
         file.write_all(&[FORMAT_VERSION, flags])?;
+        file.write_all(&min_expiry.unwrap_or(0).to_le_bytes())?;
         Self::write_section(&mut file, &bloom_bytes)?;
         Self::write_section(&mut file, &index_bytes)?;
         let data_start = file.stream_position()?;
@@ -449,6 +510,7 @@ impl SSTable {
             compression,
             has_seq: true,
             has_block_crc: true,
+            min_expiry,
         };
         Ok(())
     }
@@ -533,6 +595,7 @@ impl SSTable {
                 compression,
                 has_seq,
                 has_block_crc,
+                ..
             } => {
                 let mut data = Vec::new();
                 for entry in index {
@@ -551,7 +614,7 @@ impl SSTable {
         Ok(self
             .read_versioned()?
             .into_iter()
-            .map(|(k, _seq, v)| (k, v))
+            .map(|(k, _seq, v)| (k, v.value))
             .collect())
     }
 
@@ -591,6 +654,7 @@ impl SSTable {
                 compression,
                 has_seq,
                 has_block_crc,
+                ..
             } => {
                 // Blocks before the candidate hold only keys < start; blocks
                 // whose first key is >= end hold only keys past the range.
@@ -631,7 +695,7 @@ impl SSTable {
             if out.last().is_some_and(|(lk, _)| *lk == k) {
                 continue;
             }
-            out.push((k, v));
+            out.push((k, v.value));
         }
         Ok(out)
     }
@@ -645,10 +709,20 @@ impl SSTable {
         }
     }
 
-    /// Look up the newest version of `key` visible at `snapshot_seq`,
-    /// distinguishing "deleted here" from "not present here" so that
-    /// tombstones shadow older SSTables.
-    pub fn get_at(&self, key: &[u8], snapshot_seq: Seq) -> crate::Result<SSTableLookup> {
+    /// Look up the newest version of `key` visible at `snapshot_seq` and at
+    /// wall-clock time `now`, distinguishing "deleted here" from "not present
+    /// here" so that tombstones shadow older SSTables.
+    ///
+    /// A version whose expiry has passed reports as
+    /// [`SSTableLookup::Deleted`], not `NotFound`: it has to keep shadowing
+    /// older versions of the key, exactly as a tombstone does, or expiry would
+    /// uncover the value it replaced.
+    pub fn get_at(
+        &self,
+        key: &[u8],
+        snapshot_seq: Seq,
+        now: Expiry,
+    ) -> crate::Result<SSTableLookup> {
         // First check the bloom filter
         if let Some(filter) = &self.bloom_filter {
             if !filter.might_contain(key) {
@@ -660,7 +734,7 @@ impl SSTable {
             Layout::Empty => Ok(SSTableLookup::NotFound),
             Layout::Legacy { data_start } => {
                 let buffer = self.read_to_end_from(*data_start)?;
-                Self::scan_entries_at(&buffer, key, snapshot_seq, false, false)
+                Self::scan_entries_at(&buffer, key, snapshot_seq, now, false, false)
             }
             Layout::Versioned {
                 data_start,
@@ -668,6 +742,7 @@ impl SSTable {
                 compression,
                 has_seq,
                 has_block_crc,
+                ..
             } => {
                 // The candidate block is the last one whose first key is
                 // <= the target; earlier blocks only hold smaller keys.
@@ -677,14 +752,36 @@ impl SSTable {
                 }
                 let entry = &index[candidate - 1];
                 let block = self.read_block(*data_start, entry, *compression, *has_block_crc)?;
-                Self::scan_entries_at(&block, key, snapshot_seq, true, *has_seq)
+                Self::scan_entries_at(&block, key, snapshot_seq, now, true, *has_seq)
             }
         }
     }
 
-    /// Look up the latest version of `key` (highest sequence).
+    /// The newest stored version of `key` at or below `snapshot_seq`,
+    /// *including* one whose deadline has passed.
+    ///
+    /// Unlike [`SSTable::get_at`] this does not hide expired versions, because
+    /// its callers need to inspect the deadline itself rather than read
+    /// through it. Returns `None` when this table holds no version of the key
+    /// at that sequence.
+    pub fn version_at(&self, key: &[u8], snapshot_seq: Seq) -> crate::Result<Option<Version>> {
+        // `key` followed by a zero byte is the smallest key strictly greater
+        // than `key`, so this half-open range holds exactly that one key.
+        let mut end = key.to_vec();
+        end.push(0);
+        for entry in self.range_cursor(key, Some(&end))? {
+            let (found, seq, version) = entry?;
+            if found == key && seq <= snapshot_seq {
+                // Versions arrive newest first, so this is the answer.
+                return Ok(Some(version));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Look up the latest version of `key` (highest sequence) as of now.
     pub fn get(&self, key: &[u8]) -> crate::Result<SSTableLookup> {
-        self.get_at(key, Seq::MAX)
+        self.get_at(key, Seq::MAX, crate::version::now_ms())
     }
 
     /// Scan a flat entry buffer for the newest version of `key` with
@@ -696,6 +793,7 @@ impl SSTable {
         buffer: &[u8],
         key: &[u8],
         snapshot_seq: Seq,
+        now: Expiry,
         sorted: bool,
         has_seq: bool,
     ) -> crate::Result<SSTableLookup> {
@@ -717,13 +815,32 @@ impl SSTable {
             let value_size = read_u32(buffer, pos)?;
             pos += 4;
 
+            // An expiring entry stores `[deadline u64][len u32]` before its
+            // bytes; everything else stores the length in `value_size`.
+            let (expires_at, value_len) = if value_size == EXPIRING_MARKER {
+                let deadline = read_u64(buffer, pos)?;
+                pos += 8;
+                let len = read_u32(buffer, pos)? as usize;
+                pos += 4;
+                (Some(deadline), len)
+            } else if value_size == TOMBSTONE_MARKER {
+                (None, 0)
+            } else {
+                (None, value_size as usize)
+            };
+
             if current_key == key {
                 if seq <= snapshot_seq {
-                    // Newest version visible to this snapshot
+                    // Newest version visible to this snapshot. An expired one
+                    // reads as deleted: it must shadow older versions rather
+                    // than uncover them.
                     if value_size == TOMBSTONE_MARKER {
                         return Ok(SSTableLookup::Deleted);
                     }
-                    let value = read_slice(buffer, pos, value_size as usize)?.to_vec();
+                    if expires_at.is_some_and(|deadline| now > deadline) {
+                        return Ok(SSTableLookup::Deleted);
+                    }
+                    let value = read_slice(buffer, pos, value_len)?.to_vec();
                     return Ok(SSTableLookup::Found(value));
                 }
                 // Version is too new for this snapshot; keep looking at
@@ -732,11 +849,28 @@ impl SSTable {
                 return Ok(SSTableLookup::NotFound);
             }
 
-            if value_size != TOMBSTONE_MARKER {
-                pos += value_size as usize;
-            }
+            pos += value_len;
         }
         Ok(SSTableLookup::NotFound)
+    }
+
+    /// The earliest deadline stored anywhere in this table, or `None` if
+    /// nothing in it expires.
+    ///
+    /// Read straight from the v5 header, so this costs nothing. Tables
+    /// written before v5 report `None`: they cannot contain deadlines.
+    pub fn min_expiry(&self) -> Option<Expiry> {
+        match &self.layout {
+            Layout::Versioned { min_expiry, .. } => *min_expiry,
+            _ => None,
+        }
+    }
+
+    /// Whether this table holds at least one version whose deadline has
+    /// already passed at `now` — that is, whether a merge would reclaim
+    /// something a promotion would not.
+    pub fn has_expired_at(&self, now: Expiry) -> bool {
+        self.min_expiry().is_some_and(|earliest| now > earliest)
     }
 
     /// The smallest and largest key stored in this table, or `None` if the
@@ -775,6 +909,7 @@ impl SSTable {
                 compression,
                 has_seq,
                 has_block_crc,
+                ..
             } => {
                 let (Some(first), Some(last)) = (index.first(), index.last()) else {
                     return Ok(None);
@@ -1068,29 +1203,29 @@ mod tests {
 
         // Three versions of "k" plus a deleted "gone", sorted key asc, seq desc
         let data: Vec<VersionedEntry> = vec![
-            (b"gone".to_vec(), 7, None),
-            (b"k".to_vec(), 9, Some(b"v9".to_vec())),
-            (b"k".to_vec(), 5, Some(b"v5".to_vec())),
-            (b"k".to_vec(), 1, Some(b"v1".to_vec())),
+            (b"gone".to_vec(), 7, Version::tombstone()),
+            (b"k".to_vec(), 9, Version::live(b"v9".to_vec())),
+            (b"k".to_vec(), 5, Version::live(b"v5".to_vec())),
+            (b"k".to_vec(), 1, Version::live(b"v1".to_vec())),
         ];
         table.write_versioned(&data, Compression::None).unwrap();
 
         // Snapshot reads pick the newest version at or below the snapshot seq
-        assert_eq!(table.get_at(b"k", 0).unwrap(), SSTableLookup::NotFound);
+        assert_eq!(table.get_at(b"k", 0, 0).unwrap(), SSTableLookup::NotFound);
         assert_eq!(
-            table.get_at(b"k", 1).unwrap(),
+            table.get_at(b"k", 1, 0).unwrap(),
             SSTableLookup::Found(b"v1".to_vec())
         );
         assert_eq!(
-            table.get_at(b"k", 4).unwrap(),
+            table.get_at(b"k", 4, 0).unwrap(),
             SSTableLookup::Found(b"v1".to_vec())
         );
         assert_eq!(
-            table.get_at(b"k", 6).unwrap(),
+            table.get_at(b"k", 6, 0).unwrap(),
             SSTableLookup::Found(b"v5".to_vec())
         );
         assert_eq!(
-            table.get_at(b"k", 100).unwrap(),
+            table.get_at(b"k", 100, 0).unwrap(),
             SSTableLookup::Found(b"v9".to_vec())
         );
         assert_eq!(
@@ -1099,14 +1234,17 @@ mod tests {
         );
 
         // Tombstone visibility follows the snapshot too
-        assert_eq!(table.get_at(b"gone", 6).unwrap(), SSTableLookup::NotFound);
-        assert_eq!(table.get_at(b"gone", 7).unwrap(), SSTableLookup::Deleted);
+        assert_eq!(
+            table.get_at(b"gone", 6, 0).unwrap(),
+            SSTableLookup::NotFound
+        );
+        assert_eq!(table.get_at(b"gone", 7, 0).unwrap(), SSTableLookup::Deleted);
 
         // Round-trips through disk
         let reopened = SSTable::new(path).unwrap();
         assert_eq!(reopened.read_versioned().unwrap(), data);
         assert_eq!(
-            reopened.get_at(b"k", 5).unwrap(),
+            reopened.get_at(b"k", 5, 0).unwrap(),
             SSTableLookup::Found(b"v5".to_vec())
         );
     }
@@ -1125,28 +1263,32 @@ mod tests {
                 (
                     b"hot".to_vec(),
                     s as Seq,
-                    Some(format!("v{}", s).into_bytes()),
+                    Version::live(format!("v{}", s).into_bytes()),
                 )
             })
             .collect();
         // Plus neighbouring keys to force multiple blocks around it
         for i in 0..40 {
-            data.push((format!("z{:03}", i).into_bytes(), 100, Some(b"z".to_vec())));
+            data.push((
+                format!("z{:03}", i).into_bytes(),
+                100,
+                Version::live(b"z".to_vec()),
+            ));
         }
         data.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
 
         table.write_versioned(&data, Compression::Lz4).unwrap();
 
         assert_eq!(
-            table.get_at(b"hot", 25).unwrap(),
+            table.get_at(b"hot", 25, 0).unwrap(),
             SSTableLookup::Found(b"v25".to_vec())
         );
         assert_eq!(
-            table.get_at(b"hot", 50).unwrap(),
+            table.get_at(b"hot", 50, 0).unwrap(),
             SSTableLookup::Found(b"v50".to_vec())
         );
         assert_eq!(
-            table.get_at(b"z039", 100).unwrap(),
+            table.get_at(b"z039", 100, 0).unwrap(),
             SSTableLookup::Found(b"z".to_vec())
         );
     }

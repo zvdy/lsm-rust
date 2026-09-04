@@ -21,13 +21,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::memtable::MemTable;
 use crate::sstable::{
     BlockCache, CompactionManager, CompactionPlan, Compression, SSTable, SSTableLookup,
 };
 use crate::wal::{BatchEntry, Operation, WalRecord, WalSync, WAL};
-use crate::{Key, Seq, Value};
+use crate::{Expiry, Key, Seq, Value, Version};
 
 /// Name of the write-ahead log inside the data directory.
 const WAL_FILE: &str = "wal";
@@ -58,11 +59,25 @@ fn parse_sst_filename(path: &Path) -> Option<(usize, u64)> {
 }
 
 /// Apply a single replayed/batched operation to the memtable at `seq`.
-fn apply_op(memtable: &mut MemTable, seq: Seq, op: Operation, key: Key, value: Option<Value>) {
+fn apply_op(
+    memtable: &mut MemTable,
+    seq: Seq,
+    op: Operation,
+    key: Key,
+    value: Option<Value>,
+    expires_at: Option<Expiry>,
+) {
     match op {
         Operation::Put => {
             if let Some(value) = value {
-                memtable.insert(key, seq, value);
+                memtable.insert_version(
+                    key,
+                    seq,
+                    Version {
+                        value: Some(value),
+                        expires_at,
+                    },
+                );
             }
         }
         Operation::Delete => memtable.delete(key, seq),
@@ -82,7 +97,7 @@ fn apply_op(memtable: &mut MemTable, seq: Seq, op: Operation, key: Key, value: O
 /// Within a batch, a later op on a key supersedes an earlier one.
 #[derive(Default)]
 pub struct WriteBatch {
-    ops: Vec<(Operation, Key, Option<Value>)>,
+    ops: Vec<(Operation, Key, Option<Value>, Option<Expiry>)>,
 }
 
 impl WriteBatch {
@@ -91,15 +106,28 @@ impl WriteBatch {
         Self::default()
     }
 
-    /// Queue a put of `key` = `value`.
+    /// Queue a put of `key` = `value`, with no expiry.
     pub fn put(&mut self, key: Key, value: Value) -> &mut Self {
-        self.ops.push((Operation::Put, key, Some(value)));
+        self.ops.push((Operation::Put, key, Some(value), None));
+        self
+    }
+
+    /// Queue a put of `key` = `value` that expires after `ttl`.
+    pub fn put_with_ttl(&mut self, key: Key, value: Value, ttl: Duration) -> &mut Self {
+        self.put_with_expiry(key, value, crate::version::ttl_to_expiry(ttl))
+    }
+
+    /// Queue a put of `key` = `value` that expires at `expires_at`, an
+    /// absolute deadline in Unix milliseconds.
+    pub fn put_with_expiry(&mut self, key: Key, value: Value, expires_at: Expiry) -> &mut Self {
+        self.ops
+            .push((Operation::Put, key, Some(value), Some(expires_at)));
         self
     }
 
     /// Queue a delete of `key`.
     pub fn delete(&mut self, key: Key) -> &mut Self {
-        self.ops.push((Operation::Delete, key, None));
+        self.ops.push((Operation::Delete, key, None, None));
         self
     }
 
@@ -274,16 +302,30 @@ impl Storage {
         for record in wal.replay()? {
             match record {
                 // A standalone op gets its own sequence number
-                WalRecord::Single(op, key, value) => {
+                WalRecord::Single(entry) => {
                     seq_counter += 1;
-                    apply_op(&mut memtable, seq_counter, op, key, value);
+                    apply_op(
+                        &mut memtable,
+                        seq_counter,
+                        entry.op,
+                        entry.key,
+                        entry.value,
+                        entry.expires_at,
+                    );
                     replay_count += 1;
                 }
                 // A batch's ops all share one sequence number (atomic visibility)
                 WalRecord::Batch(entries) => {
                     seq_counter += 1;
-                    for (op, key, value) in entries {
-                        apply_op(&mut memtable, seq_counter, op, key, value);
+                    for entry in entries {
+                        apply_op(
+                            &mut memtable,
+                            seq_counter,
+                            entry.op,
+                            entry.key,
+                            entry.value,
+                            entry.expires_at,
+                        );
                         replay_count += 1;
                     }
                 }
@@ -464,6 +506,7 @@ impl Storage {
             compactions_total: self.metrics.compactions.load(Relaxed),
             compaction_moves_total: self.metrics.compaction_moves.load(Relaxed),
             checkpoints_total: self.metrics.checkpoints.load(Relaxed),
+            expired_total: self.metrics.expired.load(Relaxed),
             sequence: self.seq_counter,
             live_snapshots: self.snapshots.live_count(),
             memtable_bytes: self.memtable.size() as u64,
@@ -496,12 +539,15 @@ impl Storage {
             println!("GET {:?} @ {}", String::from_utf8_lossy(key), snapshot_seq);
         }
 
-        // First check the memtable; a tombstone visible to the snapshot means
+        // Sampled once so every level of this lookup agrees on the time.
+        let now = crate::version::now_ms();
+
+        // First check the memtable. A tombstone visible to the snapshot means
         // the key was deleted and must shadow any older value in the SSTables
-        match self.memtable.get_at(key, snapshot_seq) {
-            Some(Some(value)) => return Ok(Some(value.clone())),
-            Some(None) => return Ok(None),
-            None => {}
+        // — and so must an expired version, or expiry would uncover the value
+        // it replaced.
+        if let Some(version) = self.memtable.get_at(key, snapshot_seq) {
+            return Ok(version.visible_at(now).cloned());
         }
 
         // Then check SSTables from newest to oldest, level by level
@@ -513,7 +559,7 @@ impl Storage {
                         continue;
                     }
 
-                    match sstable.get_at(key, snapshot_seq)? {
+                    match sstable.get_at(key, snapshot_seq, now)? {
                         SSTableLookup::Found(value) => return Ok(Some(value)),
                         SSTableLookup::Deleted => return Ok(None),
                         SSTableLookup::NotFound => {}
@@ -632,6 +678,78 @@ impl Storage {
     /// Insert or update `key` with `value`. The write is durable (recorded
     /// in the write-ahead log) once this returns.
     pub fn put(&mut self, key: Key, value: Value) -> crate::Result<()> {
+        self.put_inner(key, value, None)
+    }
+
+    /// Insert or update `key` with `value`, hiding it once `ttl` has elapsed.
+    ///
+    /// The TTL is resolved to an absolute deadline immediately and stored that
+    /// way, so it survives restarts without being refreshed and does not
+    /// restart if the store is reopened.
+    pub fn put_with_ttl(&mut self, key: Key, value: Value, ttl: Duration) -> crate::Result<()> {
+        self.put_with_expiry(key, value, crate::version::ttl_to_expiry(ttl))
+    }
+
+    /// Insert or update `key` with `value`, hiding it after `expires_at` —
+    /// an absolute deadline in milliseconds since the Unix epoch.
+    ///
+    /// A deadline already in the past is accepted and written: the key is
+    /// simply invisible from the moment it lands, while still shadowing any
+    /// older version of itself.
+    pub fn put_with_expiry(
+        &mut self,
+        key: Key,
+        value: Value,
+        expires_at: Expiry,
+    ) -> crate::Result<()> {
+        self.put_inner(key, value, Some(expires_at))
+    }
+
+    /// When `key`'s visible version expires.
+    ///
+    /// Distinguishes three cases the way Redis's `TTL` does:
+    /// - `None` — no visible version of the key (absent, deleted or expired)
+    /// - `Some(None)` — the key is present and has no deadline
+    /// - `Some(Some(deadline))` — the key expires at that Unix millisecond
+    pub fn expiry(&self, key: &Key) -> crate::Result<Option<Option<Expiry>>> {
+        self.expiry_at_seq(key, self.seq_counter)
+    }
+
+    fn expiry_at_seq(&self, key: &Key, snapshot_seq: Seq) -> crate::Result<Option<Option<Expiry>>> {
+        let now = crate::version::now_ms();
+        if let Some(version) = self.memtable.get_at(key, snapshot_seq) {
+            return Ok(version
+                .visible_at(now)
+                .is_some()
+                .then_some(version.expires_at));
+        }
+        for level in 0..=self.sstables.keys().max().copied().unwrap_or(0) {
+            if let Some(tables) = self.sstables.get(&level) {
+                for sstable in tables.iter().rev() {
+                    if !sstable.might_contain_key(key) {
+                        continue;
+                    }
+                    match sstable.version_at(key, snapshot_seq)? {
+                        Some(version) => {
+                            return Ok(version
+                                .visible_at(now)
+                                .is_some()
+                                .then_some(version.expires_at))
+                        }
+                        None => continue,
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn put_inner(
+        &mut self,
+        key: Key,
+        value: Value,
+        expires_at: Option<Expiry>,
+    ) -> crate::Result<()> {
         if self.config.verbose {
             let count = PUT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
             let bytes = TOTAL_BYTES.fetch_add(key.len() + value.len(), Ordering::Relaxed)
@@ -652,12 +770,20 @@ impl Storage {
         }
 
         // Write to WAL first
-        self.wal.append(Operation::Put, &key, Some(&value))?;
+        self.wal
+            .append_expiring(Operation::Put, &key, Some(&value), expires_at)?;
 
         // Assign the next sequence number and record this version
         self.seq_counter += 1;
         let seq = self.seq_counter;
-        self.memtable.insert(key.clone(), seq, value);
+        self.memtable.insert_version(
+            key.clone(),
+            seq,
+            Version {
+                value: Some(value),
+                expires_at,
+            },
+        );
         Metrics::incr(&self.metrics.puts);
         self.note_commit(seq, HashSet::from([key]));
 
@@ -698,10 +824,11 @@ impl Storage {
             let entries: Vec<BatchEntry> = batch
                 .ops
                 .iter()
-                .map(|(op, key, value)| BatchEntry {
+                .map(|(op, key, value, expires_at)| BatchEntry {
                     op: *op,
                     key,
                     value: value.as_deref(),
+                    expires_at: *expires_at,
                 })
                 .collect();
             self.wal.append_batch(&entries)?;
@@ -712,9 +839,9 @@ impl Storage {
         self.seq_counter += 1;
         let seq = self.seq_counter;
         let mut written = HashSet::with_capacity(batch.ops.len());
-        for (op, key, value) in batch.ops {
+        for (op, key, value, expires_at) in batch.ops {
             written.insert(key.clone());
-            apply_op(&mut self.memtable, seq, op, key, value);
+            apply_op(&mut self.memtable, seq, op, key, value, expires_at);
         }
         Metrics::incr(&self.metrics.batches);
         self.note_commit(seq, written);
@@ -744,7 +871,7 @@ impl Storage {
     pub(crate) fn commit_transaction(
         &mut self,
         snapshot_seq: Seq,
-        writes: BTreeMap<Key, Option<Value>>,
+        writes: BTreeMap<Key, Version>,
         reads: HashSet<Key>,
         ranges: Vec<(Key, Option<Key>)>,
         isolation: Isolation,
@@ -759,12 +886,15 @@ impl Storage {
         // Apply as one atomic batch: a single sequence number and one WAL
         // record, so the transaction is visible and durable all-or-nothing.
         let mut batch = WriteBatch::new();
-        for (key, value) in writes {
-            match value {
-                Some(value) => {
+        for (key, version) in writes {
+            match (version.value, version.expires_at) {
+                (Some(value), None) => {
                     batch.put(key, value);
                 }
-                None => {
+                (Some(value), Some(expires_at)) => {
+                    batch.put_with_expiry(key, value, expires_at);
+                }
+                (None, _) => {
                     batch.delete(key);
                 }
             }
@@ -1099,7 +1229,9 @@ impl Storage {
         // This is the common shape for append-only and time-ordered keys,
         // where each flush covers a key range strictly above the last.
         let destination_tables = self.sstables.get(&(level + 1)).map_or(0, |t| t.len());
-        let plan = self.compaction_manager.plan(tables, destination_tables);
+        let plan =
+            self.compaction_manager
+                .plan(tables, destination_tables, crate::version::now_ms());
         if plan == CompactionPlan::Promote && self.move_level_down(level)? {
             Metrics::incr(&self.metrics.compaction_moves);
             if self.config.verbose {
@@ -1139,10 +1271,18 @@ impl Storage {
         // the newest version per key.
         let gc_floor = self.snapshots.oldest().unwrap_or(Seq::MAX);
 
-        // Perform compaction (merge in memory, retaining versions as needed)
-        let entries = self
-            .compaction_manager
-            .compact(tables, drop_tombstones, gc_floor)?;
+        // Perform compaction (merge in memory, retaining versions as needed).
+        // Versions past their deadline are collected here: this is where
+        // expired data stops merely being hidden and is actually reclaimed.
+        let (entries, expired) = self.compaction_manager.compact(
+            tables,
+            drop_tombstones,
+            gc_floor,
+            crate::version::now_ms(),
+        )?;
+        self.metrics
+            .expired
+            .fetch_add(expired, std::sync::atomic::Ordering::Relaxed);
 
         // Get paths of tables to delete
         let table_paths: Vec<_> = tables.iter().map(|t| t.get_path().clone()).collect();

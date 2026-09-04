@@ -34,6 +34,9 @@ atomic write batches, and a Prometheus metrics endpoint.
 - **Consistent checkpoints** — `checkpoint()` writes a point-in-time copy you
   can open as a store. SSTables are hard-linked, so it costs almost nothing up
   front; the WAL is copied, so writes made afterwards cannot leak in.
+- **Per-key expiry (TTL)** — `put_with_ttl` hides a key once its deadline
+  passes and compaction reclaims it. Deadlines are absolute, so they survive
+  restarts without being refreshed.
 - **Atomic write batches** — multiple puts and deletes commit all-or-nothing,
   durably and visibly.
 - **Fast reads** — per-table Bloom filters, sparse block indexes, an LRU block
@@ -204,6 +207,46 @@ directory reclaims it. Checkpoints are therefore meant to be short-lived —
 take one, copy it to where backups live, remove it — rather than kept by the
 dozen on the same volume.
 
+### Expiry (TTL)
+
+A key can be given a deadline, after which it stops being visible and is
+reclaimed by the next compaction that reads it:
+
+```rust
+use lsm_rust::Storage;
+use std::time::Duration;
+
+fn main() -> lsm_rust::Result<()> {
+    let mut db = Storage::new("./data", false)?;
+
+    db.put_with_ttl(b"session".to_vec(), b"token".to_vec(), Duration::from_secs(3600))?;
+
+    // Or an absolute deadline, in Unix milliseconds.
+    db.put_with_expiry(b"until".to_vec(), b"v".to_vec(), 1_800_000_000_000)?;
+
+    match db.expiry(&b"session".to_vec())? {
+        None => println!("no such key"),
+        Some(None) => println!("present, no deadline"),
+        Some(Some(at)) => println!("expires at {at}"),
+    }
+    Ok(())
+}
+```
+
+Two properties are worth knowing:
+
+- **Deadlines are absolute, not countdowns.** A TTL is resolved to a Unix
+  timestamp when the write happens, so it survives restarts and does not reset
+  when the store reopens.
+- **A snapshot isolates you from writes, not from time.** A snapshot taken
+  before a key expired will still stop returning it once the deadline passes —
+  sequence numbers order writes against each other and have nothing to say
+  about the clock.
+
+An expired version keeps *shadowing* older versions of the same key rather
+than disappearing, so expiry never uncovers a value it replaced. Compaction
+turns it into a tombstone, and the normal tombstone rules then reclaim it.
+
 ### Errors
 
 Every fallible call returns `lsm_rust::Result<T>`. `Error` says which kind of
@@ -248,8 +291,15 @@ OK
 1) "user:1"
 ```
 
-Supported commands: `PING`, `ECHO`, `SET`, `GET`, `DEL`, `EXISTS`,
-`KEYS <prefix>*` (trailing-star globs), `QUIT`.
+Supported commands: `PING`, `ECHO`, `SET` (with `EX`/`PX`), `GET`, `DEL`,
+`EXISTS`, `TTL`, `KEYS <prefix>*` (trailing-star globs), `QUIT`.
+
+```text
+127.0.0.1:6379> SET session:1 "token" EX 60
+OK
+127.0.0.1:6379> TTL session:1
+(integer) 60
+```
 
 ### Prometheus metrics
 
@@ -261,7 +311,7 @@ cargo run --release -- serve --addr 127.0.0.1:6379 --metrics-addr 127.0.0.1:9898
 
 Metrics include operation counters (`lsm_puts_total`, `lsm_gets_total`,
 `lsm_flushes_total`, `lsm_compactions_total`, `lsm_compaction_moves_total`,
-`lsm_checkpoints_total`, …) and gauges for the MVCC
+`lsm_expired_total`, `lsm_checkpoints_total`, …) and gauges for the MVCC
 sequence, live snapshots, memtable occupancy, and per-level SSTable counts and
 sizes — readable in process via `Storage::stats()` too.
 
