@@ -12,6 +12,17 @@ crates.io yet.
 
 ### Added
 
+- **Per-key expiry (TTL).** `put_with_ttl` / `put_with_expiry` on `Storage`,
+  `SharedStorage`, `WriteBatch` and `Transaction` attach a deadline to a write;
+  `expiry()` reports it, distinguishing "no such key", "no deadline" and "expires
+  at". Deadlines are absolute Unix milliseconds resolved at write time, so they
+  survive restarts without being refreshed. An expired version keeps *shadowing*
+  older versions of the same key rather than vanishing — compaction rewrites it
+  as a tombstone, so expiry can never uncover the value it replaced — and the
+  usual tombstone rules then reclaim it. RESP gains `SET key value EX|PX n` and
+  `TTL key` with Redis's `-2`/`-1`/seconds convention. New `lsm_expired_total`
+  metric. A snapshot isolates a reader from writes but not from the clock: a key
+  stops being visible through an existing snapshot once its deadline passes.
 - **Cost-aware compaction.** A merge earns its cost by collapsing keys that
   appear in more than one table. When a level's tables are mutually disjoint
   there are none, so the level is now *promoted* to the next level without
@@ -94,8 +105,16 @@ crates.io yet.
   functions still return `std::io::Result` compile without edits. Callers that
   named `TransactionError` should use `lsm_rust::Error`; callers that matched
   on `err.kind()` should match on the variant instead.
-- SSTable on-disk format evolved to v4 (checksums). v3, v2, and pre-header
-  legacy files remain readable.
+- SSTable on-disk format evolved to v5 (per-entry expiry, plus an 8-byte
+  header field holding the earliest deadline in the table so compaction can see
+  there is something to reclaim without reading the data). v4, v3, v2, and
+  pre-header legacy files remain readable; entries without a deadline are the
+  same size they were. The write-ahead log gained a matching record type for a
+  put that carries a deadline, and older logs still replay.
+- Compaction now merges rather than promotes a level holding expired versions.
+  Promotion never reads the data, so it can reclaim nothing — without this an
+  append-only workload with TTLs, which is exactly the shape that promotes most
+  eagerly, would keep expired data indefinitely.
 - WAL records are now written in a checksummed frame; older unframed records
   still replay.
 

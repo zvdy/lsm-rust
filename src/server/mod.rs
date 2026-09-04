@@ -25,6 +25,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 /// Maximum accepted bulk-string / array sizes, to bound memory per request.
 const MAX_BULK_LEN: i64 = 64 * 1024 * 1024; // 64MB
@@ -119,12 +120,38 @@ fn handle_connection(stream: TcpStream, storage: SharedStorage) -> io::Result<()
                 2 => write_bulk(&mut writer, Some(&command[1]))?,
                 _ => write_wrong_args(&mut writer, "echo")?,
             },
-            "SET" => match command.len() {
-                3 => match storage.put(command[1].clone(), command[2].clone()) {
-                    Ok(()) => write_simple(&mut writer, "OK")?,
+            // SET key value [EX seconds | PX milliseconds]
+            "SET" => match parse_set(&command) {
+                Ok(None) => write_wrong_args(&mut writer, "set")?,
+                Err(message) => write_error(&mut writer, message)?,
+                Ok(Some(ttl)) => {
+                    let result = match ttl {
+                        Some(ttl) => {
+                            storage.put_with_ttl(command[1].clone(), command[2].clone(), ttl)
+                        }
+                        None => storage.put(command[1].clone(), command[2].clone()),
+                    };
+                    match result {
+                        Ok(()) => write_simple(&mut writer, "OK")?,
+                        Err(e) => write_error(&mut writer, &e.to_string())?,
+                    }
+                }
+            },
+            // TTL key -> remaining whole seconds, -1 no deadline, -2 no key
+            "TTL" => match command.len() {
+                2 => match storage.expiry(&command[1]) {
+                    Ok(None) => write_integer(&mut writer, -2)?,
+                    Ok(Some(None)) => write_integer(&mut writer, -1)?,
+                    Ok(Some(Some(deadline))) => {
+                        let now = lsm_now_ms();
+                        // Round up, so a key with any time left never reports 0
+                        // seconds while still being readable.
+                        let remaining = deadline.saturating_sub(now).div_ceil(1000);
+                        write_integer(&mut writer, remaining as i64)?
+                    }
                     Err(e) => write_error(&mut writer, &e.to_string())?,
                 },
-                _ => write_wrong_args(&mut writer, "set")?,
+                _ => write_wrong_args(&mut writer, "ttl")?,
             },
             "GET" => match command.len() {
                 2 => match storage.get(&command[1]) {
@@ -301,6 +328,37 @@ fn parse_int(bytes: &[u8]) -> io::Result<i64> {
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .ok_or_else(|| protocol_error("invalid integer"))
+}
+
+/// Parse the optional expiry of a `SET`.
+///
+/// `Ok(None)` means the arity is wrong; `Ok(Some(None))` a plain set;
+/// `Ok(Some(Some(ttl)))` a set with a deadline; `Err` a malformed option,
+/// reported to the client rather than silently ignored — a client asking for
+/// an expiry must never be told OK for a key that will live for ever.
+fn parse_set(command: &[Vec<u8>]) -> Result<Option<Option<Duration>>, &'static str> {
+    match command.len() {
+        3 => Ok(Some(None)),
+        5 => {
+            let unit = command[3].to_ascii_uppercase();
+            let amount = std::str::from_utf8(&command[4])
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .filter(|n| *n > 0)
+                .ok_or("ERR invalid expire time in 'set' command")?;
+            match unit.as_slice() {
+                b"EX" => Ok(Some(Some(Duration::from_secs(amount)))),
+                b"PX" => Ok(Some(Some(Duration::from_millis(amount)))),
+                _ => Err("ERR syntax error"),
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Wall-clock now, in Unix milliseconds.
+fn lsm_now_ms() -> u64 {
+    crate::version::now_ms()
 }
 
 fn protocol_error(msg: &str) -> io::Error {

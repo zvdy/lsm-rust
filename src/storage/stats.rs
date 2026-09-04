@@ -24,6 +24,7 @@ pub(super) struct Metrics {
     pub flushes: AtomicU64,
     pub compactions: AtomicU64,
     pub compaction_moves: AtomicU64,
+    pub expired: AtomicU64,
     pub checkpoints: AtomicU64,
 }
 
@@ -77,6 +78,9 @@ pub struct StorageStats {
     pub compaction_moves_total: u64,
     /// Total checkpoints taken.
     pub checkpoints_total: u64,
+    /// Total expired versions collected by compaction — the point at which
+    /// data past its deadline stops being merely hidden and is reclaimed.
+    pub expired_total: u64,
     /// Highest MVCC sequence number assigned so far.
     pub sequence: u64,
     /// Number of live snapshots currently pinning versions.
@@ -166,6 +170,12 @@ impl StorageStats {
             "compaction_moves_total",
             "Compaction runs that promoted disjoint tables instead of rewriting them.",
             self.compaction_moves_total,
+        );
+        counter(
+            &mut out,
+            "expired_total",
+            "Expired versions collected by compaction.",
+            self.expired_total,
         );
         counter(
             &mut out,

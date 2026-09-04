@@ -1,4 +1,4 @@
-use crate::{Key, Seq, Value};
+use crate::{Expiry, Key, Seq, Value, Version};
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::ops::Bound::{Excluded, Included, Unbounded};
@@ -12,11 +12,13 @@ use std::ops::Bound::{Excluded, Included, Unbounded};
 /// from newest to oldest — a range query can then land directly on "the
 /// newest version at or below sequence N", which is what snapshot reads need.
 ///
-/// A value of `None` is a tombstone recording a deletion. Tombstones are kept
-/// (and later flushed to SSTables) so that deletes shadow older values that
-/// may still live on disk or in an earlier version.
+/// Each version is a [`Version`]: a value or a tombstone, plus an optional
+/// wall-clock expiry. Tombstones are kept (and later flushed to SSTables) so
+/// that deletes shadow older values that may still live on disk or in an
+/// earlier version, and an expired version behaves the same way — it stops
+/// being visible without uncovering what it replaced.
 pub struct MemTable {
-    data: BTreeMap<(Key, Reverse<Seq>), Option<Value>>,
+    data: BTreeMap<(Key, Reverse<Seq>), Version>,
     size: usize,
 }
 
@@ -34,35 +36,44 @@ impl MemTable {
         }
     }
 
-    /// Insert a value for `key` at version `seq`.
+    /// Insert a value for `key` at version `seq`, with no expiry.
     pub fn insert(&mut self, key: Key, seq: Seq, value: Value) {
-        self.insert_entry(key, seq, Some(value));
+        self.insert_version(key, seq, Version::live(value));
+    }
+
+    /// Insert a value for `key` at version `seq` that becomes invisible at
+    /// `expires_at` (Unix milliseconds).
+    pub fn insert_expiring(&mut self, key: Key, seq: Seq, value: Value, expires_at: Expiry) {
+        self.insert_version(key, seq, Version::expiring(value, expires_at));
     }
 
     /// Record a deletion for `key` at version `seq` (a tombstone).
     pub fn delete(&mut self, key: Key, seq: Seq) {
-        self.insert_entry(key, seq, None);
+        self.insert_version(key, seq, Version::tombstone());
     }
 
-    fn insert_entry(&mut self, key: Key, seq: Seq, value: Option<Value>) {
-        let value_len = value.as_ref().map_or(0, |v| v.len());
+    /// Insert an already-built version.
+    pub fn insert_version(&mut self, key: Key, seq: Seq, version: Version) {
+        let value_len = version.value.as_ref().map_or(0, |v| v.len());
         let entry_len = key.len() + value_len;
-        if let Some(old) = self.data.insert((key, Reverse(seq)), value) {
+        if let Some(old) = self.data.insert((key, Reverse(seq)), version) {
             // Replacing the same (key, seq) is unusual but keep size honest
             self.size = self
                 .size
-                .saturating_sub(old.as_ref().map_or(0, |v| v.len()));
+                .saturating_sub(old.value.as_ref().map_or(0, |v| v.len()));
         } else {
             self.size += entry_len;
         }
     }
 
     /// Look up the newest version of `key` visible at `snapshot_seq`
-    /// (the version with the largest seq `<= snapshot_seq`). Returns:
-    /// - `Some(Some(value))` if that version has a live value
-    /// - `Some(None)` if that version is a tombstone (deleted)
-    /// - `None` if the memtable has no version of the key visible at `snapshot_seq`
-    pub fn get_at(&self, key: &[u8], snapshot_seq: Seq) -> Option<&Option<Value>> {
+    /// (the version with the largest seq `<= snapshot_seq`). Returns `None`
+    /// when the memtable holds no version of the key at that sequence.
+    ///
+    /// The returned [`Version`] may be a tombstone or may have expired;
+    /// callers decide what to do with it via
+    /// [`Version::visible_at`]. It still *shadows* older versions either way.
+    pub fn get_at(&self, key: &[u8], snapshot_seq: Seq) -> Option<&Version> {
         let lower = (key.to_vec(), Reverse(snapshot_seq));
         self.data
             .range((Included(lower), Unbounded))
@@ -85,7 +96,7 @@ impl MemTable {
 
     /// Iterate every stored version in `(key asc, seq desc)` order. Used to
     /// flush the whole memtable (all versions) to an SSTable.
-    pub fn iter(&self) -> impl Iterator<Item = (&Key, Seq, &Option<Value>)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&Key, Seq, &Version)> {
         self.data.iter().map(|((k, Reverse(seq)), v)| (k, *seq, v))
     }
 
@@ -95,7 +106,7 @@ impl MemTable {
         &'a self,
         start: &[u8],
         end: Option<&[u8]>,
-    ) -> impl Iterator<Item = (&'a Key, Seq, &'a Option<Value>)> {
+    ) -> impl Iterator<Item = (&'a Key, Seq, &'a Version)> {
         // (key, Reverse(u64::MAX)) is the smallest tuple with a given key,
         // so it includes every version of that key and beyond.
         let lower = Included((start.to_vec(), Reverse(Seq::MAX)));
@@ -130,7 +141,7 @@ mod tests {
         table.insert(key.clone(), 1, value.clone());
         assert_eq!(table.len(), 1);
         assert_eq!(table.size(), key.len() + value.len());
-        assert_eq!(table.get_at(&key, Seq::MAX), Some(&Some(value)));
+        assert_eq!(table.get_at(&key, Seq::MAX), Some(&Version::live(value)));
     }
 
     #[test]
@@ -143,12 +154,15 @@ mod tests {
 
         // Snapshot reads see the newest version at or below their seq
         assert_eq!(table.get_at(&key, 0), None); // before any version
-        assert_eq!(table.get_at(&key, 1), Some(&Some(b"v1".to_vec())));
-        assert_eq!(table.get_at(&key, 4), Some(&Some(b"v1".to_vec())));
-        assert_eq!(table.get_at(&key, 5), Some(&Some(b"v5".to_vec())));
-        assert_eq!(table.get_at(&key, 8), Some(&Some(b"v5".to_vec())));
-        assert_eq!(table.get_at(&key, 9), Some(&Some(b"v9".to_vec())));
-        assert_eq!(table.get_at(&key, Seq::MAX), Some(&Some(b"v9".to_vec())));
+        assert_eq!(table.get_at(&key, 1), Some(&Version::live(b"v1".to_vec())));
+        assert_eq!(table.get_at(&key, 4), Some(&Version::live(b"v1".to_vec())));
+        assert_eq!(table.get_at(&key, 5), Some(&Version::live(b"v5".to_vec())));
+        assert_eq!(table.get_at(&key, 8), Some(&Version::live(b"v5".to_vec())));
+        assert_eq!(table.get_at(&key, 9), Some(&Version::live(b"v9".to_vec())));
+        assert_eq!(
+            table.get_at(&key, Seq::MAX),
+            Some(&Version::live(b"v9".to_vec()))
+        );
         // All three versions are retained
         assert_eq!(table.len(), 3);
     }
@@ -161,8 +175,8 @@ mod tests {
         table.delete(key.clone(), 2);
 
         // The latest version is a tombstone, older is still visible by seq
-        assert_eq!(table.get_at(&key, 2), Some(&None));
-        assert_eq!(table.get_at(&key, 1), Some(&Some(b"v".to_vec())));
+        assert_eq!(table.get_at(&key, 2), Some(&Version::tombstone()));
+        assert_eq!(table.get_at(&key, 1), Some(&Version::live(b"v".to_vec())));
         assert_eq!(table.len(), 2);
     }
 
@@ -180,9 +194,9 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                (b"a".to_vec(), 3, Some(b"a3".to_vec())), // key asc, seq desc
-                (b"a".to_vec(), 1, Some(b"a1".to_vec())),
-                (b"b".to_vec(), 2, Some(b"b2".to_vec())),
+                (b"a".to_vec(), 3, Version::live(b"a3".to_vec())), // key asc, seq desc
+                (b"a".to_vec(), 1, Version::live(b"a1".to_vec())),
+                (b"b".to_vec(), 2, Version::live(b"b2".to_vec())),
             ]
         );
     }

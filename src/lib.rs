@@ -15,6 +15,11 @@
 //! carries a CRC-32 that is verified on read, so on-disk corruption surfaces
 //! as an error rather than as silently wrong data.
 //!
+//! Keys may carry an expiry ([`Storage::put_with_ttl`]): an absolute deadline
+//! after which the key stops being visible, and past which compaction reclaims
+//! it. An expired version still shadows older versions of the same key, so
+//! expiry never uncovers the value it replaced.
+//!
 //! Every fallible call returns [`Result<T>`], whose [`Error`] distinguishes
 //! corruption, transaction conflicts, invalid arguments and underlying I/O.
 //! It converts to and from [`std::io::Error`], so callers that still work in
@@ -44,6 +49,7 @@ pub mod memtable;
 pub mod server;
 pub mod sstable;
 pub mod storage;
+pub mod version;
 pub mod wal;
 
 /// Keys are arbitrary byte strings.
@@ -56,6 +62,11 @@ pub type Value = Vec<u8>;
 /// [`Snapshot`] captures one and reads only versions at or below it, which is
 /// what gives the store snapshot isolation.
 pub type Seq = u64;
+/// An absolute expiry deadline, in milliseconds since the Unix epoch.
+///
+/// Expiry is wall-clock and independent of [`Seq`]: sequence numbers order
+/// writes against one another, while a deadline is a point in real time.
+pub type Expiry = u64;
 
 pub use error::{Error, Result};
 pub use server::{MetricsServer, RespServer};
@@ -64,4 +75,5 @@ pub use storage::{
     CheckpointInfo, CompactorHandle, Isolation, LevelStats, ScanIter, SharedStorage, Snapshot,
     SnapshotScan, Storage, StorageConfig, StorageStats, Transaction, WriteBatch,
 };
+pub use version::Version;
 pub use wal::WalSync;

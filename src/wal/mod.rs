@@ -15,17 +15,35 @@ pub struct BatchEntry<'a> {
     pub op: Operation,
     pub key: &'a [u8],
     pub value: Option<&'a [u8]>,
+    /// Absolute expiry in Unix milliseconds, or `None` for no deadline.
+    pub expires_at: Option<crate::Expiry>,
 }
 
 /// A record recovered from the log during replay: either a standalone
 /// operation or a batch that must be applied atomically (all or nothing).
 pub enum WalRecord {
-    Single(Operation, Key, Option<Value>),
-    Batch(Vec<(Operation, Key, Option<Value>)>),
+    Single(WalEntry),
+    Batch(Vec<WalEntry>),
+}
+
+/// One operation recovered from the log.
+#[derive(Debug, PartialEq, Eq)]
+pub struct WalEntry {
+    pub op: Operation,
+    pub key: Key,
+    pub value: Option<Value>,
+    /// Absolute expiry in Unix milliseconds, or `None` for no deadline.
+    pub expires_at: Option<crate::Expiry>,
 }
 
 /// Marker byte introducing a batch record: `[2][count u32][entry...]`.
 const BATCH_MARKER: u8 = 2;
+
+/// Op byte for a put that carries an expiry:
+/// `[4][key_len u32][key][expires_at u64][value_len u32][value]`. A separate
+/// op keeps entries without a deadline exactly the size they were, and lets an
+/// older build reject a log it cannot read instead of misparsing it.
+const PUT_EXPIRING_OP: u8 = 4;
 
 /// Marker byte introducing a checksummed record:
 /// `[3][crc u32][body_len u32][body]`, where `body` is an unframed record
@@ -76,8 +94,19 @@ impl WAL {
     }
 
     pub fn append(&mut self, op: Operation, key: &[u8], value: Option<&[u8]>) -> crate::Result<()> {
+        self.append_expiring(op, key, value, None)
+    }
+
+    /// Append a single operation carrying an absolute expiry.
+    pub fn append_expiring(
+        &mut self,
+        op: Operation,
+        key: &[u8],
+        value: Option<&[u8]>,
+        expires_at: Option<crate::Expiry>,
+    ) -> crate::Result<()> {
         let mut body = Vec::new();
-        Self::write_entry(&mut body, op, key, value)?;
+        Self::write_entry(&mut body, op, key, value, expires_at)?;
         self.write_framed(&body)?;
         self.file.flush()?;
         self.after_commit()
@@ -90,7 +119,13 @@ impl WAL {
         body.push(BATCH_MARKER);
         body.extend_from_slice(&(entries.len() as u32).to_le_bytes());
         for entry in entries {
-            Self::write_entry(&mut body, entry.op, entry.key, entry.value)?;
+            Self::write_entry(
+                &mut body,
+                entry.op,
+                entry.key,
+                entry.value,
+                entry.expires_at,
+            )?;
         }
         self.write_framed(&body)?;
         self.file.flush()?;
@@ -112,14 +147,19 @@ impl WAL {
         op: Operation,
         key: &[u8],
         value: Option<&[u8]>,
+        expires_at: Option<crate::Expiry>,
     ) -> crate::Result<()> {
-        let op_byte = match op {
-            Operation::Put => 0u8,
-            Operation::Delete => 1u8,
+        let op_byte = match (op, expires_at) {
+            (Operation::Put, None) => 0u8,
+            (Operation::Delete, _) => 1u8,
+            (Operation::Put, Some(_)) => PUT_EXPIRING_OP,
         };
         file.write_all(&[op_byte])?;
         file.write_all(&(key.len() as u32).to_le_bytes())?;
         file.write_all(key)?;
+        if op_byte == PUT_EXPIRING_OP {
+            file.write_all(&expires_at.expect("checked above").to_le_bytes())?;
+        }
         if let Some(value) = value {
             file.write_all(&(value.len() as u32).to_le_bytes())?;
             file.write_all(value)?;
@@ -168,13 +208,13 @@ impl WAL {
         let mut pos = 0;
         while pos < buffer.len() {
             match buffer[pos] {
-                0 | 1 => {
+                0 | 1 | PUT_EXPIRING_OP => {
                     let mut p = pos;
                     let Some(entry) = Self::parse_entry(&buffer, &mut p) else {
                         break; // truncated tail
                     };
                     pos = p;
-                    records.push(WalRecord::Single(entry.0, entry.1, entry.2));
+                    records.push(WalRecord::Single(entry));
                 }
                 BATCH_MARKER => {
                     let mut p = pos + 1;
@@ -249,10 +289,7 @@ impl WAL {
     fn parse_body(body: &[u8]) -> Option<WalRecord> {
         let mut p = 0;
         match *body.first()? {
-            0 | 1 => {
-                let (op, key, value) = Self::parse_entry(body, &mut p)?;
-                Some(WalRecord::Single(op, key, value))
-            }
+            0 | 1 | PUT_EXPIRING_OP => Some(WalRecord::Single(Self::parse_entry(body, &mut p)?)),
             BATCH_MARKER => {
                 p = 1;
                 let count = Self::read_u32(body, &mut p)?;
@@ -268,20 +305,33 @@ impl WAL {
 
     /// Parse one `[op][key][value?]` entry, returning None if the buffer ends
     /// before the entry is complete.
-    fn parse_entry(buffer: &[u8], pos: &mut usize) -> Option<(Operation, Key, Option<Value>)> {
-        let op = match buffer.get(*pos)? {
-            0 => Operation::Put,
-            1 => Operation::Delete,
+    fn parse_entry(buffer: &[u8], pos: &mut usize) -> Option<WalEntry> {
+        let (op, expiring) = match buffer.get(*pos)? {
+            0 => (Operation::Put, false),
+            1 => (Operation::Delete, false),
+            &PUT_EXPIRING_OP => (Operation::Put, true),
             _ => return None,
         };
         *pos += 1;
         let key = Self::read_chunk(buffer, pos)?;
+        let expires_at = if expiring {
+            let bytes = buffer.get(*pos..*pos + 8)?;
+            *pos += 8;
+            Some(crate::Expiry::from_le_bytes(bytes.try_into().ok()?))
+        } else {
+            None
+        };
         let value = if matches!(op, Operation::Put) {
             Some(Self::read_chunk(buffer, pos)?)
         } else {
             None
         };
-        Some((op, key, value))
+        Some(WalEntry {
+            op,
+            key,
+            value,
+            expires_at,
+        })
     }
 
     /// Read a length-prefixed chunk, returning None if the buffer ends
@@ -330,8 +380,10 @@ mod tests {
         let mut out = Vec::new();
         for record in records {
             match record {
-                WalRecord::Single(op, k, v) => out.push((op, k, v)),
-                WalRecord::Batch(entries) => out.extend(entries),
+                WalRecord::Single(e) => out.push((e.op, e.key, e.value)),
+                WalRecord::Batch(entries) => {
+                    out.extend(entries.into_iter().map(|e| (e.op, e.key, e.value)))
+                }
             }
         }
         out
@@ -404,11 +456,13 @@ mod tests {
                 op: Operation::Put,
                 key: b"a",
                 value: Some(b"1"),
+                expires_at: None,
             },
             BatchEntry {
                 op: Operation::Delete,
                 key: b"b",
                 value: None,
+                expires_at: None,
             },
         ])
         .unwrap();
@@ -417,16 +471,32 @@ mod tests {
         assert_eq!(records.len(), 2); // one single + one batch
         assert!(matches!(
             records[0],
-            WalRecord::Single(Operation::Put, _, _)
+            WalRecord::Single(WalEntry {
+                op: Operation::Put,
+                ..
+            })
         ));
         match &records[1] {
             WalRecord::Batch(entries) => {
                 assert_eq!(entries.len(), 2);
                 assert_eq!(
                     entries[0],
-                    (Operation::Put, b"a".to_vec(), Some(b"1".to_vec()))
+                    WalEntry {
+                        op: Operation::Put,
+                        key: b"a".to_vec(),
+                        value: Some(b"1".to_vec()),
+                        expires_at: None,
+                    }
                 );
-                assert_eq!(entries[1], (Operation::Delete, b"b".to_vec(), None));
+                assert_eq!(
+                    entries[1],
+                    WalEntry {
+                        op: Operation::Delete,
+                        key: b"b".to_vec(),
+                        value: None,
+                        expires_at: None,
+                    }
+                );
             }
             _ => panic!("expected a batch record"),
         }
@@ -444,11 +514,13 @@ mod tests {
                 op: Operation::Put,
                 key: b"a",
                 value: Some(b"1"),
+                expires_at: None,
             },
             BatchEntry {
                 op: Operation::Put,
                 key: b"b",
                 value: Some(b"2"),
+                expires_at: None,
             },
         ])
         .unwrap();

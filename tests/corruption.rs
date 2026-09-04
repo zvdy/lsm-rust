@@ -41,12 +41,14 @@ struct Layout {
 
 fn parse_layout(bytes: &[u8]) -> Layout {
     assert_eq!(&bytes[..4], b"LSMT", "not a versioned SSTable");
-    assert_eq!(bytes[4], 4, "expected format version 4");
+    assert_eq!(bytes[4], 5, "expected format version 5");
     let read_u32 = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
 
-    // [len][crc][body] for the bloom filter, then the same for the index.
-    let bloom_len = read_u32(6);
-    let bloom_start = 6 + 8;
+    // [magic 4][version 1][flags 1][min_expiry 8], then [len][crc][body] for
+    // the bloom filter and the same again for the index.
+    let header = 4 + 1 + 1 + 8;
+    let bloom_len = read_u32(header);
+    let bloom_start = header + 8;
     let index_len_at = bloom_start + bloom_len;
     let index_len = read_u32(index_len_at);
     let index_start = index_len_at + 8;
