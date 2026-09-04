@@ -12,6 +12,17 @@ crates.io yet.
 
 ### Added
 
+- **Cost-aware compaction.** A merge earns its cost by collapsing keys that
+  appear in more than one table. When a level's tables are mutually disjoint
+  there are none, so the level is now *promoted* to the next level without
+  reading or rewriting a byte, instead of being merged into an identical copy.
+  Append-only and time-ordered workloads benefit most: in the test suite's
+  ascending-key workload, 12 of 14 compaction runs become promotions. Levels
+  with real overlap still merge exactly as before, and a lone table still
+  merges with itself so version collapsing and tombstone dropping are
+  unaffected. New `lsm_compaction_moves_total` metric, and
+  `SSTable::key_range()` / `CompactionManager::max_overlap_depth()` expose the
+  signal behind the decision.
 - **Consistent checkpoints.** `Storage::checkpoint(dir)` /
   `SharedStorage::checkpoint(dir)` write a point-in-time copy of the store
   under the exclusive lock, so the captured tables, write-ahead log and

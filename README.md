@@ -38,8 +38,10 @@ atomic write batches, and a Prometheus metrics endpoint.
   durably and visibly.
 - **Fast reads** — per-table Bloom filters, sparse block indexes, an LRU block
   cache, and optional LZ4 block compression.
-- **Leveled compaction** — newest-value-wins merging with tombstone GC, inline
-  or on a background thread.
+- **Cost-aware leveled compaction** — newest-value-wins merging with tombstone
+  GC, inline or on a background thread. A level whose tables share no keys is
+  promoted rather than rewritten, so append-only and time-ordered workloads
+  stop paying for merges that cannot reclaim anything.
 - **Streaming range and prefix scans** — ordered, newest-wins merges across
   the memtable and every level. `scan_iter` streams one SSTable block at a
   time, so a wide range costs memory proportional to the number of tables, not
@@ -258,7 +260,8 @@ cargo run --release -- serve --addr 127.0.0.1:6379 --metrics-addr 127.0.0.1:9898
 ```
 
 Metrics include operation counters (`lsm_puts_total`, `lsm_gets_total`,
-`lsm_flushes_total`, `lsm_compactions_total`, `lsm_checkpoints_total`, …) and gauges for the MVCC
+`lsm_flushes_total`, `lsm_compactions_total`, `lsm_compaction_moves_total`,
+`lsm_checkpoints_total`, …) and gauges for the MVCC
 sequence, live snapshots, memtable occupancy, and per-level SSTable counts and
 sizes — readable in process via `Storage::stats()` too.
 

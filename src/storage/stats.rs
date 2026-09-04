@@ -23,6 +23,7 @@ pub(super) struct Metrics {
     pub scans: AtomicU64,
     pub flushes: AtomicU64,
     pub compactions: AtomicU64,
+    pub compaction_moves: AtomicU64,
     pub checkpoints: AtomicU64,
 }
 
@@ -70,6 +71,10 @@ pub struct StorageStats {
     pub flushes_total: u64,
     /// Total compaction runs across all levels.
     pub compactions_total: u64,
+    /// How many of those runs promoted a level of mutually disjoint tables
+    /// to the next level instead of rewriting it. A subset of
+    /// `compactions_total`; the difference is the runs that really merged.
+    pub compaction_moves_total: u64,
     /// Total checkpoints taken.
     pub checkpoints_total: u64,
     /// Highest MVCC sequence number assigned so far.
@@ -155,6 +160,12 @@ impl StorageStats {
             "compactions_total",
             "Total compaction runs across all levels.",
             self.compactions_total,
+        );
+        counter(
+            &mut out,
+            "compaction_moves_total",
+            "Compaction runs that promoted disjoint tables instead of rewriting them.",
+            self.compaction_moves_total,
         );
         counter(
             &mut out,

@@ -3,6 +3,26 @@ use crate::{Key, Seq};
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 
+/// The most tables a level may accumulate through promotion before a real
+/// merge is forced to consolidate them.
+///
+/// Promoted tables are disjoint, so a lookup is filtered by their Bloom
+/// filters rather than reading them — but it still *checks* every filter in
+/// the level. Without a ceiling an append-only workload would promote for
+/// ever and grow that per-lookup cost without bound.
+pub const MAX_TABLES_PER_LEVEL: usize = 16;
+
+/// What compaction should do with a level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionPlan {
+    /// Read the tables, merge them, and write one table at the next level.
+    Merge,
+    /// Reinterpret the tables one level down without reading them: no key
+    /// appears in more than one, so a merge would rewrite every byte to
+    /// produce the same entries.
+    Promote,
+}
+
 /// Decides when a level needs compaction and merges its SSTables.
 pub struct CompactionManager {
     level_multiplier: u32,
@@ -30,6 +50,78 @@ impl CompactionManager {
         let level_threshold =
             self.size_threshold * (self.level_multiplier as usize).pow(level as u32);
         level_size >= level_threshold
+    }
+
+    /// Choose between rewriting a level and promoting it, given how many
+    /// tables the destination level already holds.
+    ///
+    /// [`CompactionPlan::Promote`] needs all three of:
+    ///
+    /// - **No overlap.** With every key in exactly one table there is nothing
+    ///   for a merge to collapse, so rewriting is pure cost.
+    /// - **More than one table.** A lone table is merged with itself, which is
+    ///   not busywork: that is where several versions of a key collapse and
+    ///   where tombstones are finally dropped. Promotion would skip both, so
+    ///   this case keeps its existing behaviour.
+    /// - **Room at the destination.** See [`MAX_TABLES_PER_LEVEL`].
+    ///
+    /// Anything else merges, so the fallback is always today's behaviour.
+    pub fn plan(&self, tables: &[SSTable], destination_tables: usize) -> CompactionPlan {
+        if tables.len() < 2 {
+            return CompactionPlan::Merge;
+        }
+        if destination_tables + tables.len() > MAX_TABLES_PER_LEVEL {
+            return CompactionPlan::Merge;
+        }
+        if Self::max_overlap_depth(tables) > 1 {
+            return CompactionPlan::Merge;
+        }
+        CompactionPlan::Promote
+    }
+
+    /// The largest number of tables whose key ranges cover any single point.
+    ///
+    /// This is the cost signal compaction lacks otherwise. A level whose
+    /// tables are mutually disjoint has depth 1: merging them would read and
+    /// rewrite every byte to produce the same entries in a different file,
+    /// because no key appears in more than one table and so nothing can be
+    /// deduplicated. Depth 2 or more means keys really are shadowed across
+    /// tables, and a merge collapses them.
+    ///
+    /// Ranges are inclusive, so tables that merely touch at a key count as
+    /// overlapping. A table whose range cannot be determined makes the result
+    /// `tables.len()` — unknown is treated as maximal overlap, so an
+    /// unreadable range can only ever cause more merging, never less.
+    pub fn max_overlap_depth(tables: &[SSTable]) -> usize {
+        if tables.len() < 2 {
+            return tables.len();
+        }
+
+        // (key, 0 = range opens, 1 = range closes). Sorting puts an opening
+        // before a closing at the same key, so touching ranges overlap.
+        let mut events: Vec<(&[u8], u8)> = Vec::with_capacity(tables.len() * 2);
+        for table in tables {
+            match table.key_range() {
+                Some((min, max)) => {
+                    events.push((min.as_slice(), 0));
+                    events.push((max.as_slice(), 1));
+                }
+                None => return tables.len(),
+            }
+        }
+        events.sort_unstable();
+
+        let mut depth = 0usize;
+        let mut max_depth = 0usize;
+        for (_, kind) in events {
+            if kind == 0 {
+                depth += 1;
+                max_depth = max_depth.max(depth);
+            } else {
+                depth -= 1;
+            }
+        }
+        max_depth
     }
 
     /// Merge the given SSTables into a single sorted, version-aware entry list.
@@ -116,6 +208,130 @@ mod tests {
             .write_versioned(data, super::super::Compression::None)
             .unwrap();
         table
+    }
+
+    /// A table spanning `keys`, written in ascending order.
+    fn table_spanning(dir: &TempDir, name: &str, keys: &[&str]) -> SSTable {
+        let data: Vec<VersionedEntry> = keys
+            .iter()
+            .map(|k| (k.as_bytes().to_vec(), 1, Some(b"v".to_vec())))
+            .collect();
+        write_versioned_table(dir, name, &data)
+    }
+
+    #[test]
+    fn key_range_spans_the_first_and_last_key() {
+        let dir = TempDir::new().unwrap();
+        // Enough keys to span more than one block, so the maximum genuinely
+        // comes from reading the final block rather than the index.
+        let keys: Vec<String> = (0..500).map(|i| format!("key{:04}", i)).collect();
+        let refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+        let table = table_spanning(&dir, "t.sst", &refs);
+
+        let (min, max) = table.key_range().expect("range").clone();
+        assert_eq!(min, b"key0000".to_vec());
+        assert_eq!(max, b"key0499".to_vec());
+    }
+
+    #[test]
+    fn key_range_of_an_empty_table_is_unknown() {
+        let dir = TempDir::new().unwrap();
+        let table = SSTable::new(dir.path().join("empty.sst")).unwrap();
+        assert!(table.key_range().is_none());
+    }
+
+    #[test]
+    fn overlap_depth_of_disjoint_tables_is_one() {
+        let dir = TempDir::new().unwrap();
+        let tables = vec![
+            table_spanning(&dir, "a.sst", &["a1", "a2"]),
+            table_spanning(&dir, "b.sst", &["b1", "b2"]),
+            table_spanning(&dir, "c.sst", &["c1", "c2"]),
+        ];
+        assert_eq!(CompactionManager::max_overlap_depth(&tables), 1);
+    }
+
+    #[test]
+    fn overlap_depth_counts_tables_covering_a_common_point() {
+        let dir = TempDir::new().unwrap();
+        // All three span the whole alphabet: any key is covered three times.
+        let tables = vec![
+            table_spanning(&dir, "a.sst", &["a", "z"]),
+            table_spanning(&dir, "b.sst", &["a", "z"]),
+            table_spanning(&dir, "c.sst", &["a", "z"]),
+        ];
+        assert_eq!(CompactionManager::max_overlap_depth(&tables), 3);
+    }
+
+    #[test]
+    fn overlap_depth_reports_the_deepest_point_not_the_average() {
+        let dir = TempDir::new().unwrap();
+        // a..m and h..z overlap on h..m; q..z overlaps the second only.
+        let tables = vec![
+            table_spanning(&dir, "a.sst", &["a", "m"]),
+            table_spanning(&dir, "b.sst", &["h", "z"]),
+            table_spanning(&dir, "c.sst", &["q", "z"]),
+        ];
+        assert_eq!(CompactionManager::max_overlap_depth(&tables), 2);
+    }
+
+    #[test]
+    fn tables_that_only_touch_count_as_overlapping() {
+        let dir = TempDir::new().unwrap();
+        // Ranges are inclusive, so sharing the endpoint "m" is an overlap:
+        // that key really is in both tables and a merge would collapse it.
+        let tables = vec![
+            table_spanning(&dir, "a.sst", &["a", "m"]),
+            table_spanning(&dir, "b.sst", &["m", "z"]),
+        ];
+        assert_eq!(CompactionManager::max_overlap_depth(&tables), 2);
+    }
+
+    #[test]
+    fn an_unreadable_range_is_treated_as_maximal_overlap() {
+        let dir = TempDir::new().unwrap();
+        // An empty table has no range; the level must then be merged rather
+        // than promoted, so unknown has to read as "fully overlapping".
+        let tables = vec![
+            table_spanning(&dir, "a.sst", &["a", "b"]),
+            SSTable::new(dir.path().join("empty.sst")).unwrap(),
+        ];
+        assert_eq!(CompactionManager::max_overlap_depth(&tables), 2);
+    }
+
+    #[test]
+    fn plan_promotes_only_disjoint_multi_table_levels_with_room() {
+        let dir = TempDir::new().unwrap();
+        let manager = CompactionManager::new(4, 1024, 4);
+
+        let disjoint = vec![
+            table_spanning(&dir, "a.sst", &["a1", "a2"]),
+            table_spanning(&dir, "b.sst", &["b1", "b2"]),
+        ];
+        assert_eq!(manager.plan(&disjoint, 0), CompactionPlan::Promote);
+
+        // Overlapping: a merge actually collapses keys, so it is worth doing.
+        let overlapping = vec![
+            table_spanning(&dir, "c.sst", &["a", "z"]),
+            table_spanning(&dir, "d.sst", &["a", "z"]),
+        ];
+        assert_eq!(manager.plan(&overlapping, 0), CompactionPlan::Merge);
+
+        // A lone table is merged with itself: that is where versions collapse
+        // and tombstones are dropped, which promotion would skip.
+        let single = vec![table_spanning(&dir, "e.sst", &["a", "b"])];
+        assert_eq!(manager.plan(&single, 0), CompactionPlan::Merge);
+
+        // Disjoint, but the destination is already full enough that promoting
+        // would grow per-lookup Bloom checks: consolidate instead.
+        assert_eq!(
+            manager.plan(&disjoint, MAX_TABLES_PER_LEVEL - 1),
+            CompactionPlan::Merge
+        );
+        assert_eq!(
+            manager.plan(&disjoint, MAX_TABLES_PER_LEVEL - 2),
+            CompactionPlan::Promote
+        );
     }
 
     #[test]
