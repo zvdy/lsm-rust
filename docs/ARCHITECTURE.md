@@ -112,6 +112,34 @@ Because blocks are read lazily, each item is a `Result` — a checksum failure
 part-way through a scan surfaces as an error item rather than as a panic or as
 silently truncated output.
 
+**Tables that cannot match are skipped before a cursor is opened.** Each
+table's first and last key bound everything it holds, so a table lying wholly
+outside the requested range contributes nothing to the merge. The comparison is
+exact, not an estimate, and reuses the memoised `key_range()` that compaction
+already relies on.
+
+The saving is not symmetric, which is worth knowing:
+
+- A table lying **above** the range was already cheap. Its cursor starts at
+  block 0, and the first thing the cursor does is notice that block's first key
+  is at or past `end` and stop, without reading it. Skipping such a table saves
+  a cursor and a heap slot.
+- A table lying **below** the range was not. The index seek lands on its last
+  block, and the cursor reads and parses that block only to discard every entry
+  as smaller than `start`. Skipping saves that read outright — and the range
+  needed to skip it is derived from that very block, so once memoised the check
+  costs nothing at all.
+
+The second case is the common one for append-only and time-ordered keys, where
+a scan of recent data sits above a long tail of older tables.
+
+A table whose range cannot be determined is never skipped: uncertainty costs
+work, never correctness. That is also why the range of a legacy (pre-versioned)
+file is computed as a true minimum and maximum rather than its first and last
+entry — nothing guarantees such a file is ordered, which is why point lookups
+read them with `sorted: false` as well. `lsm_scan_tables_pruned_total` counts
+the tables skipped this way.
+
 ### Snapshots and time-travel
 
 Every version is tagged with its sequence number, and a read carries a

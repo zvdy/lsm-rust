@@ -12,6 +12,13 @@ crates.io yet.
 
 ### Added
 
+- **Scans skip tables they cannot match.** A scan opened a cursor over every
+  SSTable in the store; it now compares each table's first and last key against
+  the requested range and skips those that cannot intersect it, saving a cursor,
+  a heap slot and — for a table lying entirely below the scan — a block read
+  that returned only keys the merge discarded. The check is exact rather than
+  estimated, and a table whose range is unknown is never skipped. New
+  `lsm_scan_tables_pruned_total` metric.
 - **Per-key expiry (TTL).** `put_with_ttl` / `put_with_expiry` on `Storage`,
   `SharedStorage`, `WriteBatch` and `Transaction` attach a deadline to a write;
   `expiry()` reports it, distinguishing "no such key", "no deadline" and "expires
@@ -117,6 +124,14 @@ crates.io yet.
   eagerly, would keep expired data indefinitely.
 - WAL records are now written in a checksummed frame; older unframed records
   still replay.
+
+### Fixed
+
+- `SSTable::key_range` no longer assumes a legacy (pre-versioned) file is
+  sorted, taking the true minimum and maximum instead of the first and last
+  entry. Point lookups already read legacy files with `sorted: false`; the
+  range had been trusting an ordering nothing guarantees, and an understated
+  range could have let compaction or a scan skip a table holding matching keys.
 
 ### Security
 

@@ -502,6 +502,7 @@ impl Storage {
             batches_total: self.metrics.batches.load(Relaxed),
             gets_total: self.metrics.gets.load(Relaxed),
             scans_total: self.metrics.scans.load(Relaxed),
+            scan_tables_pruned_total: self.metrics.scan_tables_pruned.load(Relaxed),
             flushes_total: self.metrics.flushes.load(Relaxed),
             compactions_total: self.metrics.compactions.load(Relaxed),
             compaction_moves_total: self.metrics.compaction_moves.load(Relaxed),
@@ -672,6 +673,7 @@ impl Storage {
             start,
             end,
             snapshot_seq,
+            &self.metrics,
         )
     }
 

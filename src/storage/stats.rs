@@ -21,6 +21,7 @@ pub(super) struct Metrics {
     pub batches: AtomicU64,
     pub gets: AtomicU64,
     pub scans: AtomicU64,
+    pub scan_tables_pruned: AtomicU64,
     pub flushes: AtomicU64,
     pub compactions: AtomicU64,
     pub compaction_moves: AtomicU64,
@@ -68,6 +69,9 @@ pub struct StorageStats {
     pub gets_total: u64,
     /// Total range/prefix scans served.
     pub scans_total: u64,
+    /// Total SSTables a scan skipped because their key range could not
+    /// intersect the requested one.
+    pub scan_tables_pruned_total: u64,
     /// Total memtable flushes to level-0 SSTables.
     pub flushes_total: u64,
     /// Total compaction runs across all levels.
@@ -152,6 +156,12 @@ impl StorageStats {
             "scans_total",
             "Total range or prefix scans served.",
             self.scans_total,
+        );
+        counter(
+            &mut out,
+            "scan_tables_pruned_total",
+            "SSTables skipped by scans whose key range could not match.",
+            self.scan_tables_pruned_total,
         );
         counter(
             &mut out,

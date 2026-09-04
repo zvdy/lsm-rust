@@ -48,7 +48,8 @@ atomic write batches, and a Prometheus metrics endpoint.
 - **Streaming range and prefix scans** — ordered, newest-wins merges across
   the memtable and every level. `scan_iter` streams one SSTable block at a
   time, so a wide range costs memory proportional to the number of tables, not
-  to the size of the range.
+  to the size of the range, and tables whose key range cannot match are skipped
+  outright.
 - **Concurrency** — a cloneable `SharedStorage` handle: concurrent reads,
   serialized writes.
 - **Redis-protocol server** — `lsm-rust serve` speaks RESP, so `redis-cli` and
@@ -311,7 +312,7 @@ cargo run --release -- serve --addr 127.0.0.1:6379 --metrics-addr 127.0.0.1:9898
 
 Metrics include operation counters (`lsm_puts_total`, `lsm_gets_total`,
 `lsm_flushes_total`, `lsm_compactions_total`, `lsm_compaction_moves_total`,
-`lsm_expired_total`, `lsm_checkpoints_total`, …) and gauges for the MVCC
+`lsm_expired_total`, `lsm_scan_tables_pruned_total`, `lsm_checkpoints_total`, …) and gauges for the MVCC
 sequence, live snapshots, memtable occupancy, and per-level SSTable counts and
 sizes — readable in process via `Storage::stats()` too.
 

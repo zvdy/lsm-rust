@@ -5,6 +5,7 @@
 //! them. A scan over a wide range therefore costs memory proportional to the
 //! number of sources — not to the size of the range.
 
+use super::stats::Metrics;
 use super::Snapshot;
 use crate::memtable::MemTable;
 use crate::sstable::{RangeCursor, SSTable, VersionedEntry};
@@ -83,6 +84,7 @@ impl<'a> ScanIter<'a> {
         start: &[u8],
         end: Option<&[u8]>,
         snapshot_seq: Seq,
+        metrics: &Metrics,
     ) -> crate::Result<Self> {
         let mut sources: Vec<Source<'a>> = Vec::new();
         sources.push(Source::Mem(Box::new(
@@ -91,6 +93,14 @@ impl<'a> ScanIter<'a> {
                 .map(|(k, seq, v)| (k.clone(), seq, v.clone())),
         )));
         for table in sstables {
+            // A table whose whole key range falls outside the scan cannot
+            // contribute to it. Skipping it here avoids a cursor, a heap slot
+            // and — for a table lying entirely below `start` — a block read
+            // that would return nothing but keys the scan then discards.
+            if !table.may_contain_range(start, end) {
+                Metrics::incr(&metrics.scan_tables_pruned);
+                continue;
+            }
             sources.push(Source::Table(table.range_cursor(start, end)?));
         }
 
