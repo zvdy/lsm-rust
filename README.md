@@ -362,7 +362,12 @@ verified by CI on every pull request.
 
 The test suite covers the engine, a crash-recovery suite (restarts, torn WAL
 tails, delete persistence, and a model-based random workload), and the
-snapshot, write-batch, time-travel, and metrics integration suites.
+snapshot, write-batch, time-travel, and metrics integration suites. On top of
+those, `differential.rs` replays randomized workloads against a plain
+in-memory model under every combination of LZ4 compression and the block
+cache, `concurrency.rs` stresses transactions, a background compactor,
+live scanners and checkpoints against one store at once, and `key_edges.rs`
+pins the behaviour of empty and all-`0xFF` keys.
 
 ## Project structure
 
