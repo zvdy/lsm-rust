@@ -358,6 +358,18 @@ fn transactions_can_set_deadlines_and_read_their_own() {
     assert_eq!(db.get(&b"live".to_vec()).unwrap(), Some(b"v".to_vec()));
 }
 
+/// A deadline far enough out that no write, however slow the machine, can
+/// outrun it — used wherever a test needs a key to still be *present*.
+const GENEROUS_TTL: Duration = Duration::from_secs(3600);
+
+/// A deadline in the immediate past, used wherever a test needs a key to be
+/// *gone*. Waiting longer can only make that more true, so this direction
+/// cannot race however slow the machine is.
+const ALREADY_DUE: Duration = Duration::from_millis(1);
+
+/// Long enough that `ALREADY_DUE` has certainly passed.
+const PAST_DUE: Duration = Duration::from_millis(250);
+
 #[test]
 fn a_snapshot_isolates_from_writes_but_not_from_time() {
     // Documented semantics: a snapshot pins which versions exist, not the
@@ -366,16 +378,20 @@ fn a_snapshot_isolates_from_writes_but_not_from_time() {
     let dir = TempDir::new().unwrap();
     let mut db = Storage::with_config(dir.path(), config()).unwrap();
 
-    db.put_with_ttl(b"k".to_vec(), b"v".to_vec(), Duration::from_millis(80))
+    // A companion key with no deadline, so the check after the sleep proves
+    // the snapshot is still working rather than merely returning nothing.
+    db.put(b"permanent".to_vec(), b"v".to_vec()).unwrap();
+    db.put_with_ttl(b"k".to_vec(), b"v".to_vec(), ALREADY_DUE)
         .unwrap();
     let snap = db.snapshot();
+
+    sleep(PAST_DUE);
+
     assert_eq!(
-        db.get_at(&snap, &b"k".to_vec()).unwrap(),
-        Some(b"v".to_vec())
+        db.get_at(&snap, &b"permanent".to_vec()).unwrap(),
+        Some(b"v".to_vec()),
+        "the snapshot itself must still be readable"
     );
-
-    sleep(Duration::from_millis(160));
-
     assert_eq!(
         db.get_at(&snap, &b"k".to_vec()).unwrap(),
         None,
@@ -384,16 +400,41 @@ fn a_snapshot_isolates_from_writes_but_not_from_time() {
 }
 
 #[test]
-fn a_ttl_expires_on_the_real_clock() {
+fn a_ttl_still_in_the_future_is_readable() {
     let dir = TempDir::new().unwrap();
     let mut db = Storage::with_config(dir.path(), config()).unwrap();
 
-    db.put_with_ttl(b"k".to_vec(), b"v".to_vec(), Duration::from_millis(80))
+    db.put_with_ttl(b"k".to_vec(), b"v".to_vec(), GENEROUS_TTL)
         .unwrap();
-    assert_eq!(db.get(&b"k".to_vec()).unwrap(), Some(b"v".to_vec()));
 
-    sleep(Duration::from_millis(160));
+    assert_eq!(db.get(&b"k".to_vec()).unwrap(), Some(b"v".to_vec()));
+    let deadline = db
+        .expiry(&b"k".to_vec())
+        .unwrap()
+        .flatten()
+        .expect("a deadline");
+    assert!(
+        deadline >= now_ms(),
+        "a duration must resolve to a deadline in the future"
+    );
+}
+
+#[test]
+fn a_ttl_expires_on_the_real_clock() {
+    // Only the "gone" direction is asserted against the wall clock. Checking
+    // that a key is still present within a short TTL would race the write
+    // itself: every put fsyncs, and on a slow machine that can outlast a
+    // deadline measured in tens of milliseconds. `a_ttl_still_in_the_future_is_readable`
+    // covers presence with a deadline nothing can outrun.
+    let dir = TempDir::new().unwrap();
+    let mut db = Storage::with_config(dir.path(), config()).unwrap();
+
+    db.put_with_ttl(b"k".to_vec(), b"v".to_vec(), ALREADY_DUE)
+        .unwrap();
+    sleep(PAST_DUE);
+
     assert_eq!(db.get(&b"k".to_vec()).unwrap(), None);
+    assert_eq!(db.expiry(&b"k".to_vec()).unwrap(), None);
 }
 
 #[test]
