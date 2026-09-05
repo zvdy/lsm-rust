@@ -55,14 +55,19 @@ impl MemTable {
     /// Insert an already-built version.
     pub fn insert_version(&mut self, key: Key, seq: Seq, version: Version) {
         let value_len = version.value.as_ref().map_or(0, |v| v.len());
-        let entry_len = key.len() + value_len;
-        if let Some(old) = self.data.insert((key, Reverse(seq)), version) {
-            // Replacing the same (key, seq) is unusual but keep size honest
-            self.size = self
-                .size
-                .saturating_sub(old.value.as_ref().map_or(0, |v| v.len()));
-        } else {
-            self.size += entry_len;
+        let key_len = key.len();
+        match self.data.insert((key, Reverse(seq)), version) {
+            // Replacing the same (key, seq) — which a write batch does when it
+            // writes one key twice, since every op in a batch shares a
+            // sequence number. The key is already counted, so only the value's
+            // contribution changes. Subtracting the old length without adding
+            // the new one drives the tracked size towards zero while the
+            // memtable keeps growing, and the flush threshold stops firing.
+            Some(old) => {
+                let old_len = old.value.as_ref().map_or(0, |v| v.len());
+                self.size = self.size.saturating_sub(old_len).saturating_add(value_len);
+            }
+            None => self.size += key_len + value_len,
         }
     }
 
@@ -123,6 +128,38 @@ impl MemTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacing_the_same_key_and_seq_keeps_the_tracked_size_honest() {
+        // A write batch commits every op at one sequence number, so a batch
+        // that writes the same key twice inserts the same (key, seq) twice.
+        // Subtracting the replaced value without adding the new one drives the
+        // tracked size towards zero while the table keeps growing, and the
+        // flush threshold then never fires.
+        let mut table = MemTable::new();
+        let key = b"k".to_vec();
+
+        table.insert(key.clone(), 1, vec![b'a'; 100]);
+        assert_eq!(table.size(), key.len() + 100);
+
+        // Same (key, seq), larger value.
+        table.insert(key.clone(), 1, vec![b'b'; 400]);
+        assert_eq!(table.len(), 1, "still one version");
+        assert_eq!(table.size(), key.len() + 400);
+
+        // Same (key, seq), smaller value.
+        table.insert(key.clone(), 1, vec![b'c'; 50]);
+        assert_eq!(table.size(), key.len() + 50);
+
+        // A different seq is a new version and adds its own key and value.
+        table.insert(key.clone(), 2, vec![b'd'; 70]);
+        assert_eq!(table.len(), 2);
+        assert_eq!(table.size(), (key.len() + 50) + (key.len() + 70));
+
+        // Replacing with a tombstone drops the value's contribution only.
+        table.delete(key.clone(), 2);
+        assert_eq!(table.size(), (key.len() + 50) + key.len());
+    }
 
     #[test]
     fn test_new_memtable() {

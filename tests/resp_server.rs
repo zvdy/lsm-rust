@@ -180,23 +180,44 @@ fn concurrent_clients_and_persistence() {
 }
 
 #[test]
-fn set_with_ex_expires_the_key() {
+fn set_with_px_expires_the_key() {
     let (_temp_dir, server) = start_server();
     let mut client = Client::connect(server.local_addr());
 
-    // PX keeps the test fast while still exercising the real clock.
-    client.send(&[b"SET", b"quick", b"v", b"PX", b"80"]);
+    // Only the "gone" direction is timed. Asserting the key is still there
+    // inside a short window would race the write itself — every put fsyncs,
+    // and that can outlast a deadline measured in milliseconds on a slow
+    // machine. `set_with_ex_is_readable_before_its_deadline` covers presence
+    // with a deadline nothing can outrun.
+    client.send(&[b"SET", b"quick", b"v", b"PX", b"1"]);
     assert_eq!(client.read_reply(), vec!["+OK"]);
-    client.send(&[b"GET", b"quick"]);
-    assert_eq!(client.read_reply(), vec!["v"]);
 
-    std::thread::sleep(std::time::Duration::from_millis(160));
+    std::thread::sleep(std::time::Duration::from_millis(250));
 
     client.send(&[b"GET", b"quick"]);
     assert_eq!(client.read_reply(), vec!["nil"]);
     // EXISTS must agree with GET rather than reporting the hidden version.
     client.send(&[b"EXISTS", b"quick"]);
     assert_eq!(client.read_reply(), vec![":0"]);
+    client.send(&[b"TTL", b"quick"]);
+    assert_eq!(
+        client.read_reply(),
+        vec![":-2"],
+        "expired reads as no such key"
+    );
+}
+
+#[test]
+fn set_with_ex_is_readable_before_its_deadline() {
+    let (_temp_dir, server) = start_server();
+    let mut client = Client::connect(server.local_addr());
+
+    client.send(&[b"SET", b"slow", b"v", b"EX", b"3600"]);
+    assert_eq!(client.read_reply(), vec!["+OK"]);
+    client.send(&[b"GET", b"slow"]);
+    assert_eq!(client.read_reply(), vec!["v"]);
+    client.send(&[b"EXISTS", b"slow"]);
+    assert_eq!(client.read_reply(), vec![":1"]);
 }
 
 #[test]

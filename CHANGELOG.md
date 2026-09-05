@@ -127,6 +127,21 @@ crates.io yet.
 
 ### Fixed
 
+- **The memtable's tracked size no longer drifts towards zero.** Replacing the
+  same `(key, seq)` subtracted the old value's bytes without adding the new
+  value's. Every op in a write batch commits at one sequence number, so a batch
+  that writes one key twice — a documented, supported usage — hit this path: in
+  a reproduction, 200 KiB of live data reported **50 bytes** and triggered
+  **zero flushes** against an 8 KiB threshold. Since that threshold is the
+  memtable's memory bound, it could grow without limit, and
+  `lsm_memtable_bytes` reported a gauge far below reality. Values were always
+  read back correctly.
+- The wall-clock TTL tests no longer race the write they are timing. They
+  asserted a key was still present within 80 ms of a `put_with_ttl`, but every
+  put fsyncs, and on a slow CI runner that can outlast the deadline — the key
+  was correctly hidden and the test failed. Presence is now checked against a
+  deadline nothing can outrun, and expiry against one already past, so neither
+  direction depends on how fast the machine is.
 - `SSTable::key_range` no longer assumes a legacy (pre-versioned) file is
   sorted, taking the true minimum and maximum instead of the first and last
   entry. Point lookups already read legacy files with `sorted: false`; the
