@@ -136,6 +136,18 @@ crates.io yet.
   memtable's memory bound, it could grow without limit, and
   `lsm_memtable_bytes` reported a gauge far below reality. Values were always
   read back correctly.
+- **The RESP server no longer buffers an unbounded protocol line.** The
+  declared-size limits bound what a client may ask for, but they are read from
+  a line that has to be buffered first, and that had no bound of its own — a
+  client that never sent a newline grew the buffer without limit, and no
+  command was ever dispatched for anything else to reject. An unrecognised
+  command then echoed its whole name back in the error, so oversized input
+  produced an equally oversized reply: 4 MiB in, a 4,194,329-byte error out.
+  Framing lines are now capped at 64 KiB (matching Redis's inline limit) and
+  echoed names at 64 bytes. Bulk payloads are read by declared length rather
+  than by line, so large values are unaffected. Malformed framing is now
+  reported to the client before the connection is closed, rather than the
+  connection simply resetting.
 - The wall-clock TTL tests no longer race the write they are timing. They
   asserted a key was still present within 80 ms of a `put_with_ttl`, but every
   put fsyncs, and on a slow CI runner that can outlast the deadline — the key

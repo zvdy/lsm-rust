@@ -31,6 +31,21 @@ use std::time::Duration;
 const MAX_BULK_LEN: i64 = 64 * 1024 * 1024; // 64MB
 const MAX_ARRAY_LEN: i64 = 1024 * 1024;
 
+/// Longest protocol *line* accepted before the connection is failed.
+///
+/// The limits above bound what a client may declare, but they are read from a
+/// line that has to be buffered first. Without a bound of its own, a client
+/// that never sends a newline grows that buffer without limit — no command is
+/// ever dispatched, so nothing else gets the chance to reject it. Bulk payloads
+/// are read by length rather than by line, so a 64 MB value is unaffected by
+/// this; it bounds only the framing. Redis caps its inline buffer at the same
+/// 64 KiB.
+const MAX_LINE_LEN: usize = 64 * 1024;
+
+/// How much of an unrecognised command name is quoted back in the error.
+/// Echoing it whole turns any oversized input into an equally oversized reply.
+const MAX_ECHOED_NAME: usize = 64;
+
 /// A running RESP server. Dropping the handle stops the accept loop and
 /// waits for it to exit; connections already being served finish their
 /// current command.
@@ -101,8 +116,18 @@ fn handle_connection(stream: TcpStream, storage: SharedStorage) -> io::Result<()
     let mut writer = BufWriter::new(stream);
 
     loop {
-        let Some(command) = read_command(&mut reader)? else {
-            return Ok(()); // clean disconnect
+        let command = match read_command(&mut reader) {
+            Ok(Some(command)) => command,
+            Ok(None) => return Ok(()), // clean disconnect
+            // Malformed framing. Say so before hanging up: the stream is now
+            // at an unknown offset, so carrying on would misparse whatever
+            // follows, but closing silently leaves the client guessing.
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                write_error(&mut writer, &format!("ERR Protocol error: {e}"))?;
+                writer.flush()?;
+                return Ok(());
+            }
+            Err(e) => return Err(e),
         };
         if command.is_empty() {
             write_error(&mut writer, "empty command")?;
@@ -110,6 +135,9 @@ fn handle_connection(stream: TcpStream, storage: SharedStorage) -> io::Result<()
         }
 
         let name = String::from_utf8_lossy(&command[0]).to_ascii_uppercase();
+        // Bounded copy for error messages, so a bad command cannot be
+        // reflected back at its own size.
+        let quoted: String = name.chars().take(MAX_ECHOED_NAME).collect();
         match name.as_str() {
             "PING" => match command.len() {
                 1 => write_simple(&mut writer, "PONG")?,
@@ -239,7 +267,7 @@ fn handle_connection(stream: TcpStream, storage: SharedStorage) -> io::Result<()
                 writer.flush()?;
                 return Ok(());
             }
-            _ => write_error(&mut writer, &format!("unknown command '{}'", name))?,
+            _ => write_error(&mut writer, &format!("unknown command '{}'", quoted))?,
         }
         writer.flush()?;
     }
@@ -311,11 +339,17 @@ fn read_command(reader: &mut impl BufRead) -> io::Result<Option<Vec<Vec<u8>>>> {
 
 /// Read a CRLF-terminated line (without the terminator). `None` on EOF
 /// before any bytes were read.
-fn read_line(reader: &mut impl BufRead) -> io::Result<Option<Vec<u8>>> {
+fn read_line<R: BufRead>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
     let mut line = Vec::new();
-    let n = reader.read_until(b'\n', &mut line)?;
+    // Read one byte past the limit so that hitting it is distinguishable from
+    // a line that merely ends exactly at it.
+    let mut limited = std::io::Read::take(&mut *reader, MAX_LINE_LEN as u64 + 1);
+    let n = limited.read_until(b'\n', &mut line)?;
     if n == 0 {
         return Ok(None);
+    }
+    if n > MAX_LINE_LEN {
+        return Err(protocol_error("line too long"));
     }
     while matches!(line.last(), Some(b'\n') | Some(b'\r')) {
         line.pop();

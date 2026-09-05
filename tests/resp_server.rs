@@ -267,3 +267,79 @@ fn a_malformed_expiry_is_rejected_rather_than_silently_ignored() {
     client.send(&[b"SET", b"k", b"v", b"EX"]);
     assert!(client.read_reply()[0].starts_with('-'));
 }
+
+#[test]
+fn an_over_long_line_is_rejected_rather_than_buffered() {
+    // Framing lines have to be buffered before anything can inspect them, so
+    // without a bound of their own a client that never sends a newline grows
+    // that buffer without limit — the declared-size limits never get a chance
+    // to reject it, because no command is ever dispatched.
+    let (_temp_dir, server) = start_server();
+    let mut client = Client::connect(server.local_addr());
+
+    // Without the bound the server simply waits for a newline that never
+    // arrives, so guard with a read timeout: a regression must fail this test
+    // rather than hang CI.
+    client
+        .writer
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+
+    client.writer.write_all(&vec![b'A'; 70 * 1024]).unwrap();
+    client.writer.flush().unwrap();
+
+    let reply = client.read_reply();
+    assert!(
+        reply[0].starts_with('-'),
+        "expected a protocol error, got {reply:?}"
+    );
+    assert!(
+        reply[0].to_lowercase().contains("too long"),
+        "error should say what was wrong: {reply:?}"
+    );
+    assert!(
+        reply[0].len() < 256,
+        "the error must not echo the oversized input back: {} bytes",
+        reply[0].len()
+    );
+}
+
+#[test]
+fn an_unknown_command_is_not_reflected_back_at_its_own_size() {
+    let (_temp_dir, server) = start_server();
+    let mut client = Client::connect(server.local_addr());
+
+    let name = vec![b'Z'; 4096];
+    client.send(&[&name]);
+
+    let reply = client.read_reply();
+    assert!(reply[0].starts_with('-'), "{reply:?}");
+    assert!(
+        reply[0].len() < 256,
+        "unknown-command errors must be bounded, got {} bytes",
+        reply[0].len()
+    );
+
+    // The connection is still usable: this was a command error, not a framing
+    // error, so nothing was closed.
+    client.send(&[b"PING"]);
+    assert_eq!(client.read_reply(), vec!["+PONG"]);
+}
+
+#[test]
+fn a_large_bulk_value_still_round_trips() {
+    // The line bound must not cap payloads: bulk strings are read by declared
+    // length, not by line, so a value far larger than a line still works.
+    let (_temp_dir, server) = start_server();
+    let mut client = Client::connect(server.local_addr());
+
+    let value = vec![b'v'; 1024 * 1024];
+    client.send(&[b"SET", b"big", &value]);
+    assert_eq!(client.read_reply(), vec!["+OK"]);
+
+    client.send(&[b"GET", b"big"]);
+    let reply = client.read_reply();
+    assert_eq!(reply.len(), 1);
+    assert_eq!(reply[0].len(), value.len());
+    assert!(reply[0].bytes().all(|b| b == b'v'));
+}
