@@ -31,6 +31,24 @@ use std::time::Duration;
 const MAX_BULK_LEN: i64 = 64 * 1024 * 1024; // 64MB
 const MAX_ARRAY_LEN: i64 = 1024 * 1024;
 
+/// Cap on the summed payload of one command.
+///
+/// The limits above bound each element on its own, which leaves the total
+/// unbounded: an array may declare a million elements of 64 MB each, and the
+/// server accumulates every one of them before the command is dispatched.
+/// Twice [`MAX_BULK_LEN`] leaves room for a maximal value plus its key and
+/// framing — every legitimate command fits, and nothing accumulates without
+/// limit.
+const MAX_COMMAND_BYTES: usize = 2 * MAX_BULK_LEN as usize;
+
+/// How much to reserve up front for an array's elements.
+///
+/// The declared element count is a claim, not evidence; reserving for a
+/// million elements costs tens of megabytes before a single one has arrived.
+/// Ordinary commands are a handful of elements, so reserving for those and
+/// letting the vector grow past them costs nothing measurable.
+const ARRAY_RESERVE: usize = 16;
+
 /// Longest protocol *line* accepted before the connection is failed.
 ///
 /// The limits above bound what a client may declare, but they are read from a
@@ -295,6 +313,15 @@ fn parse_keys_pattern(pattern: &[u8]) -> KeysPattern {
 /// all Redis clients, plus space-separated inline commands for telnet use.
 /// Returns `None` on a clean EOF between commands.
 fn read_command(reader: &mut impl BufRead) -> io::Result<Option<Vec<Vec<u8>>>> {
+    read_command_within(reader, MAX_COMMAND_BYTES)
+}
+
+/// The body of [`read_command`], with the per-command byte budget named so it
+/// can be exercised at a size a test can afford to send.
+fn read_command_within(
+    reader: &mut impl BufRead,
+    budget: usize,
+) -> io::Result<Option<Vec<Vec<u8>>>> {
     let Some(line) = read_bounded_line(reader)? else {
         return Ok(None);
     };
@@ -317,7 +344,8 @@ fn read_command(reader: &mut impl BufRead) -> io::Result<Option<Vec<Vec<u8>>>> {
         return Err(protocol_error("array length out of range"));
     }
 
-    let mut parts = Vec::with_capacity(count as usize);
+    let mut parts = Vec::with_capacity((count as usize).min(ARRAY_RESERVE));
+    let mut total = 0usize;
     for _ in 0..count {
         let Some(header) = read_bounded_line(reader)? else {
             return Err(protocol_error("unexpected EOF inside command"));
@@ -329,12 +357,39 @@ fn read_command(reader: &mut impl BufRead) -> io::Result<Option<Vec<Vec<u8>>>> {
         if !(0..=MAX_BULK_LEN).contains(&len) {
             return Err(protocol_error("bulk length out of range"));
         }
-        let mut buf = vec![0u8; len as usize + 2]; // payload + CRLF
-        reader.read_exact(&mut buf)?;
-        buf.truncate(len as usize);
-        parts.push(buf);
+        total = total.saturating_add(len as usize);
+        if total > budget {
+            return Err(protocol_error("command too large"));
+        }
+        parts.push(read_bulk(reader, len as usize)?);
     }
     Ok(Some(parts))
+}
+
+/// Read a bulk string of `len` bytes plus its trailing CRLF.
+///
+/// The buffer grows as the payload arrives rather than being sized from the
+/// declared length: that length is a claim by the client, and sizing the
+/// allocation from it lets fifteen bytes of input reserve sixty-four
+/// megabytes for as long as the sender cares to stall.
+fn read_bulk<R: BufRead>(reader: &mut R, len: usize) -> io::Result<Vec<u8>> {
+    let want = len + 2; // payload + CRLF
+    let mut buf = Vec::new();
+    let read = {
+        use std::io::Read;
+        (&mut *reader).take(want as u64).read_to_end(&mut buf)?
+    };
+    if read != want {
+        return Err(protocol_error("unexpected EOF inside bulk string"));
+    }
+    // The declared length and the terminator have to agree. Consuming those
+    // two bytes without looking at them lets a client whose length is wrong be
+    // silently misparsed rather than told.
+    if !buf.ends_with(b"\r\n") {
+        return Err(protocol_error("bulk string is not CRLF-terminated"));
+    }
+    buf.truncate(len);
+    Ok(buf)
 }
 
 /// Read a CRLF-terminated line (without the terminator). `None` on EOF
@@ -476,5 +531,68 @@ mod tests {
             parse_keys_pattern(b"a?c"),
             KeysPattern::Unsupported
         ));
+    }
+
+    fn read(raw: &[u8]) -> io::Result<Option<Vec<Vec<u8>>>> {
+        read_command(&mut BufReader::new(raw))
+    }
+
+    #[test]
+    fn a_well_formed_command_parses() {
+        let parts = read(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(parts, vec![b"SET".to_vec(), b"k".to_vec(), b"v".to_vec()]);
+    }
+
+    #[test]
+    fn an_empty_bulk_string_is_allowed() {
+        // Zero length is a real value, not a malformed one: `SET k ""`.
+        let parts = read(b"*2\r\n$1\r\nk\r\n$0\r\n\r\n").unwrap().unwrap();
+        assert_eq!(parts, vec![b"k".to_vec(), Vec::new()]);
+    }
+
+    #[test]
+    fn a_bulk_string_must_be_followed_by_its_terminator() {
+        // A three-byte payload that is not followed by CRLF — here the next
+        // command begins immediately. Reading `len + 2` bytes and discarding
+        // the last two unexamined swallowed the "*1" that starts the second
+        // command, leaving the parser aligned on nothing in particular and
+        // every command after it misread. Rejecting is the only safe answer:
+        // once the stream is off by two bytes there is nothing to resynchronise
+        // against.
+        let err = read(b"*1\r\n$3\r\nabc*1\r\n$4\r\nPING\r\n").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("CRLF"),
+            "the client should be told which rule it broke: {err}"
+        );
+    }
+
+    #[test]
+    fn a_truncated_bulk_string_is_an_error_not_a_short_value() {
+        let err = read(b"*1\r\n$64\r\nshort").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn a_commands_elements_are_bounded_in_total() {
+        // Each element is individually within every limit; their sum is not.
+        // The budget is a parameter here only so the test can afford to send
+        // the bytes — in production it is `MAX_COMMAND_BYTES`.
+        let mut raw = b"*4\r\n".to_vec();
+        for _ in 0..4 {
+            raw.extend_from_slice(b"$8\r\naaaaaaaa\r\n");
+        }
+        // 4 x 8 bytes against a 24-byte budget: the fourth element trips it.
+        let err = read_command_within(&mut BufReader::new(&raw[..]), 24).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("too large"), "{err}");
+
+        // ... and the same command fits when the budget allows it.
+        let parts = read_command_within(&mut BufReader::new(&raw[..]), 32)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parts.len(), 4);
     }
 }
