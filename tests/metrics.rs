@@ -84,13 +84,24 @@ fn shared_storage_stats() {
     assert!(stats.to_prometheus().contains("lsm_puts_total 1"));
 }
 
-/// Connect, send `request` verbatim, and return the status line.
-///
-/// A read timeout is deliberate: an unbounded server does not *fail* these
-/// tests, it waits for a newline that never comes, and a hung CI job is worse
-/// to diagnose than a failed one.
-fn status_line_for(request: &[u8]) -> String {
-    use std::io::{BufRead, BufReader, Write};
+/// What came back from a request.
+#[derive(Debug)]
+enum Outcome {
+    /// The server answered; this is its status line.
+    Status(String),
+    /// The server hung up without answering — a clean EOF, or a reset because
+    /// it stopped reading while the client was still writing.
+    Closed,
+    /// Nothing arrived before the timeout: the server is still waiting for
+    /// input it will never get, which is the failure these tests exist to
+    /// catch. An unbounded reader ends up here, so this must never be treated
+    /// as a rejection.
+    NoReply,
+}
+
+/// Send `request` and report what the server did with it.
+fn outcome_for(request: &[u8]) -> Outcome {
+    use std::io::{BufRead, BufReader, ErrorKind, Write};
     use std::net::{TcpListener, TcpStream};
 
     let temp = TempDir::new().unwrap();
@@ -104,58 +115,94 @@ fn status_line_for(request: &[u8]) -> String {
         .unwrap();
     let mut reader = BufReader::new(writer.try_clone().unwrap());
 
-    writer.write_all(request).unwrap();
-    writer.flush().unwrap();
+    // A short write is expected when the server rejects mid-request.
+    let _ = writer.write_all(request);
+    let _ = writer.flush();
 
     let mut status = String::new();
-    reader.read_line(&mut status).unwrap();
-    status.trim_end().to_string()
+    match reader.read_line(&mut status) {
+        Ok(0) => Outcome::Closed,
+        Ok(_) => Outcome::Status(status.trim_end().to_string()),
+        // A reset means it rejected and hung up while we were still writing;
+        // a timeout means it never answered at all. Only the first is a
+        // rejection.
+        Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+            Outcome::NoReply
+        }
+        Err(_) => Outcome::Closed,
+    }
+}
+
+/// Assert the server refused: a 431, or it hung up.
+///
+/// Closing counts because the limits exist precisely so the server stops
+/// reading early, and closing with unread bytes in flight sends a reset that
+/// can discard the reply the client had buffered — macOS does this at far
+/// smaller sizes than Linux. Never answering does *not* count: that is what an
+/// unbounded reader does.
+fn assert_rejected(request: &[u8], what: &str) {
+    match outcome_for(request) {
+        Outcome::Closed => {}
+        Outcome::Status(status) => assert_eq!(
+            status, "HTTP/1.1 431 Request Header Fields Too Large",
+            "{what} should have been refused"
+        ),
+        Outcome::NoReply => {
+            panic!("{what}: the server never answered — it is still buffering the request")
+        }
+    }
 }
 
 #[test]
 fn an_over_long_request_line_is_rejected() {
-    // No newline anywhere: the request line has to be buffered before anything
-    // can inspect it, so without a per-line bound this grows without limit and
-    // the byte-total limit is never consulted.
-    let mut request = vec![b'A'; 70 * 1024];
-    request.extend_from_slice(b"\r\n\r\n");
-    assert_eq!(
-        status_line_for(&request),
-        "HTTP/1.1 431 Request Header Fields Too Large"
-    );
+    // Deliberately *well-formed*: method, path and version all present, so an
+    // unbounded server parses it happily and answers 404. A line of filler
+    // with no second token would be refused as malformed instead, which would
+    // make this pass without the limit doing any work.
+    let mut request = b"GET /".to_vec();
+    request.extend_from_slice(&vec![b'A'; 70 * 1024]);
+    request.extend_from_slice(b" HTTP/1.1\r\n\r\n");
+    assert_rejected(&request, "an over-long request line");
+}
+
+#[test]
+fn a_request_line_that_never_ends_is_rejected() {
+    // No newline at all. The line has to be buffered before anything can look
+    // at it, so an unbounded reader waits for a newline that never comes and
+    // grows the buffer meanwhile — it never answers, which `Outcome::NoReply`
+    // is there to distinguish from a rejection.
+    assert_rejected(&vec![b'A'; 70 * 1024], "a request line with no newline");
 }
 
 #[test]
 fn oversized_headers_are_rejected() {
-    // A single header far past the 8 KiB request budget. Checking the total
-    // only *after* reading each line lets one line blow the budget by any
-    // margin it likes before the check runs.
+    // A single header past the 8 KiB request budget. Checking the total only
+    // *after* reading each line lets one line blow the budget by any margin it
+    // likes before the check runs.
     let mut request = b"GET /metrics HTTP/1.1\r\nX-Pad: ".to_vec();
     request.extend_from_slice(&vec![b'A'; 16 * 1024]);
     request.extend_from_slice(b"\r\n\r\n");
-    assert_eq!(
-        status_line_for(&request),
-        "HTTP/1.1 431 Request Header Fields Too Large"
-    );
+    assert_rejected(&request, "an oversized header");
 }
 
 #[test]
 fn a_normal_scrape_is_unaffected_by_the_limits() {
     let request = b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nUser-Agent: Prometheus/2.0\r\nAccept: */*\r\n\r\n";
-    assert_eq!(status_line_for(request), "HTTP/1.1 200 OK");
+    match outcome_for(request) {
+        Outcome::Status(status) => assert_eq!(status, "HTTP/1.1 200 OK"),
+        other => panic!("an ordinary scrape must be served: {other:?}"),
+    }
 }
 
 #[test]
 fn many_small_headers_are_bounded_in_total() {
     // Each line is individually fine; their sum is not. Bounding only the
-    // per-line size would let a client stream headers for ever.
+    // per-line size would let a client stream headers for ever. Sized to just
+    // clear the 8 KiB budget, so little is left unread when the server stops.
     let mut request = b"GET /metrics HTTP/1.1\r\n".to_vec();
-    for i in 0..400 {
-        request.extend_from_slice(format!("X-Pad-{i:04}: {}\r\n", "p".repeat(64)).as_bytes());
+    for i in 0..150 {
+        request.extend_from_slice(format!("X-Pad-{i:04}: {}\r\n", "p".repeat(48)).as_bytes());
     }
     request.extend_from_slice(b"\r\n");
-    assert_eq!(
-        status_line_for(&request),
-        "HTTP/1.1 431 Request Header Fields Too Large"
-    );
+    assert_rejected(&request, "headers exceeding the byte budget");
 }
