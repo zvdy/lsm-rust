@@ -42,6 +42,13 @@
 //! }
 //! ```
 
+// Every public item is part of the crate's contract, so leaving one
+// undocumented is a defect rather than a style question. Denied rather than
+// warned: a warning here went unnoticed long enough for a doc comment to end
+// up attached to the wrong function, which left one method undocumented and
+// gave another an opening sentence describing something else entirely.
+#![deny(missing_docs)]
+
 pub mod bloom;
 pub mod checksum;
 pub mod error;
