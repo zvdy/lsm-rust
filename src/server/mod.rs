@@ -40,7 +40,7 @@ const MAX_ARRAY_LEN: i64 = 1024 * 1024;
 /// are read by length rather than by line, so a 64 MB value is unaffected by
 /// this; it bounds only the framing. Redis caps its inline buffer at the same
 /// 64 KiB.
-const MAX_LINE_LEN: usize = 64 * 1024;
+pub(super) const MAX_LINE_LEN: usize = 64 * 1024;
 
 /// How much of an unrecognised command name is quoted back in the error.
 /// Echoing it whole turns any oversized input into an equally oversized reply.
@@ -295,7 +295,7 @@ fn parse_keys_pattern(pattern: &[u8]) -> KeysPattern {
 /// all Redis clients, plus space-separated inline commands for telnet use.
 /// Returns `None` on a clean EOF between commands.
 fn read_command(reader: &mut impl BufRead) -> io::Result<Option<Vec<Vec<u8>>>> {
-    let Some(line) = read_line(reader)? else {
+    let Some(line) = read_bounded_line(reader)? else {
         return Ok(None);
     };
     if line.is_empty() {
@@ -319,7 +319,7 @@ fn read_command(reader: &mut impl BufRead) -> io::Result<Option<Vec<Vec<u8>>>> {
 
     let mut parts = Vec::with_capacity(count as usize);
     for _ in 0..count {
-        let Some(header) = read_line(reader)? else {
+        let Some(header) = read_bounded_line(reader)? else {
             return Err(protocol_error("unexpected EOF inside command"));
         };
         if header.first() != Some(&b'$') {
@@ -339,7 +339,15 @@ fn read_command(reader: &mut impl BufRead) -> io::Result<Option<Vec<Vec<u8>>>> {
 
 /// Read a CRLF-terminated line (without the terminator). `None` on EOF
 /// before any bytes were read.
-fn read_line<R: BufRead>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
+/// Read one line, refusing to buffer more than [`MAX_LINE_LEN`] bytes.
+///
+/// Shared by both front ends. A line has to be buffered before anything can
+/// inspect it, so any limit expressed in terms of the line's *contents* is
+/// downstream of the memory it takes to get there — which is why this is one
+/// function rather than one per protocol.
+///
+/// Trailing `\r` and `\n` are stripped, so an empty result is a blank line.
+pub(super) fn read_bounded_line<R: BufRead>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
     let mut line = Vec::new();
     // Read one byte past the limit so that hitting it is distinguishable from
     // a line that merely ends exactly at it.

@@ -1,19 +1,39 @@
+//! The write-ahead log: durability ahead of the memtable.
+//!
+//! Every write is appended here and fsynced (subject to [`WalSync`]) before
+//! it is recorded in the memtable, so an acknowledged write survives a crash
+//! even though the memtable itself lives only in memory. On startup the log
+//! is replayed to rebuild whatever had not yet been flushed to an SSTable,
+//! and it is truncated once that flush commits.
+//!
+//! Records are framed as `[3][crc u32][len u32][body]`, so a torn write at
+//! the tail — a crash part way through an append — is detected by its
+//! checksum and dropped, while every complete record before it recovers. A
+//! batch is one record, which is what makes a [`crate::WriteBatch`] atomic
+//! across a crash: it is replayed whole or not at all.
+
 use crate::checksum::crc32;
 use crate::{Key, Value};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::path::PathBuf;
 
+/// What an entry does to a key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operation {
+    /// Store a value, replacing any older one.
     Put,
+    /// Record a tombstone, shadowing older values still held in SSTables.
     Delete,
 }
 
 /// A single operation inside an atomically-committed batch.
 pub struct BatchEntry<'a> {
+    /// What this entry does to its key.
     pub op: Operation,
+    /// The key written.
     pub key: &'a [u8],
+    /// The value written, or `None` for a delete.
     pub value: Option<&'a [u8]>,
     /// Absolute expiry in Unix milliseconds, or `None` for no deadline.
     pub expires_at: Option<crate::Expiry>,
@@ -22,15 +42,21 @@ pub struct BatchEntry<'a> {
 /// A record recovered from the log during replay: either a standalone
 /// operation or a batch that must be applied atomically (all or nothing).
 pub enum WalRecord {
+    /// One operation, committed on its own at its own sequence number.
     Single(WalEntry),
+    /// Operations that were committed together and share one sequence
+    /// number, so they become visible all at once.
     Batch(Vec<WalEntry>),
 }
 
 /// One operation recovered from the log.
 #[derive(Debug, PartialEq, Eq)]
 pub struct WalEntry {
+    /// What this entry does to its key.
     pub op: Operation,
+    /// The key written.
     pub key: Key,
+    /// The value written, or `None` for a delete.
     pub value: Option<Value>,
     /// Absolute expiry in Unix milliseconds, or `None` for no deadline.
     pub expires_at: Option<crate::Expiry>,
@@ -62,9 +88,13 @@ pub enum WalSync {
     /// Group commit: fsync once every `every_n_writes` appends (and on
     /// memtable flush and shutdown). Much higher write throughput; on a
     /// crash, up to `every_n_writes - 1` acknowledged writes may be lost.
-    Batched { every_n_writes: usize },
+    Batched {
+        /// How many appends may share one fsync.
+        every_n_writes: usize,
+    },
 }
 
+/// An append-only log file guarding the memtable's contents.
 #[allow(clippy::upper_case_acronyms)]
 pub struct WAL {
     path: PathBuf,
@@ -74,10 +104,16 @@ pub struct WAL {
 }
 
 impl WAL {
+    /// Open (or create) the log at `path`, fsyncing every append.
     pub fn new(path: PathBuf) -> crate::Result<Self> {
         Self::with_sync(path, WalSync::Always)
     }
 
+    /// Open (or create) the log at `path` with the given sync policy.
+    ///
+    /// The file is opened for append, so an existing log is added to rather
+    /// than replaced: reopening a store must not discard records that have
+    /// not yet been flushed.
     pub fn with_sync(path: PathBuf, sync: WalSync) -> crate::Result<Self> {
         let file = OpenOptions::new()
             .create(true)
@@ -93,6 +129,7 @@ impl WAL {
         })
     }
 
+    /// Append a single operation with no expiry.
     pub fn append(&mut self, op: Operation, key: &[u8], value: Option<&[u8]>) -> crate::Result<()> {
         self.append_expiring(op, key, value, None)
     }
@@ -357,6 +394,11 @@ impl WAL {
         Some(u32::from_le_bytes(bytes.try_into().unwrap()))
     }
 
+    /// Discard every record, leaving an empty log.
+    ///
+    /// Called once a flush has committed the memtable's contents to an
+    /// SSTable *and* recorded that table in the manifest — never before, or a
+    /// crash in between would lose the writes the log was holding.
     pub fn clear(&mut self) -> crate::Result<()> {
         self.file = OpenOptions::new()
             .create(true)

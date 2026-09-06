@@ -127,6 +127,16 @@ crates.io yet.
 
 ### Fixed
 
+- **The metrics endpoint had the same unbounded-read bug as the RESP server.**
+  Its `MAX_REQUEST_BYTES` was checked *after* each line was read, so any single
+  header could exceed it by any margin before the check ran, and the request
+  line itself was never checked at all — a 4 MiB header was buffered in full
+  and still answered `200 OK`, and a request line with no newline buffered
+  indefinitely, which is exactly the case its comment claimed to defend
+  against. Both front ends now share one bounded line reader, so the two
+  cannot drift apart again, and the byte total is enforced before each
+  subsequent read. Oversized requests get `431` rather than a silent reset.
+
 - **The memtable's tracked size no longer drifts towards zero.** Replacing the
   same `(key, seq)` subtracted the old value's bytes without adding the new
   value's. Every op in a write batch commits at one sequence number, so a batch
