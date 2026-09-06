@@ -23,8 +23,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-/// Cap on the request line + headers we will read, to bound per-connection
-/// memory against a client that never sends a blank line.
+/// Cap on the request line plus headers, checked as they are read.
+///
+/// Each individual line is separately bounded by
+/// [`read_bounded_line`](super::read_bounded_line); this bounds their sum, so
+/// a client cannot stream short headers for ever either. Both limits are
+/// needed: without the per-line one a single header can be arbitrarily large
+/// before this total is ever consulted.
 const MAX_REQUEST_BYTES: usize = 8 * 1024;
 
 /// A running Prometheus metrics server. Dropping the handle stops the accept
@@ -89,11 +94,25 @@ fn handle_connection(stream: TcpStream, storage: &SharedStorage) -> io::Result<(
 
     // Parse just the request line ("METHOD PATH VERSION"); the rest of the
     // headers are read and discarded up to the terminating blank line.
-    let Some((method, path)) = read_request(&mut reader)? else {
+    let request = read_request(&mut reader);
+    let mut writer = stream.try_clone()?;
+    let Some((method, path)) = (match request {
+        Ok(request) => request,
+        // Say why before hanging up, rather than resetting the connection and
+        // leaving a scraper with nothing to go on.
+        Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+            write_response(
+                &mut writer,
+                "431 Request Header Fields Too Large",
+                "text/plain; charset=utf-8",
+                b"request line and headers too large\n",
+            )?;
+            return writer.flush();
+        }
+        Err(e) => return Err(e),
+    }) else {
         return Ok(()); // malformed or empty request
     };
-
-    let mut writer = stream;
     match (method.as_str(), path.as_str()) {
         ("GET", "/metrics") => match storage.stats() {
             Ok(stats) => write_response(
@@ -130,36 +149,48 @@ fn handle_connection(stream: TcpStream, storage: &SharedStorage) -> io::Result<(
 
 /// Read and parse an HTTP request line, consuming headers up to the blank
 /// line. Returns `(method, path)`, or `None` on EOF / a malformed start line.
-fn read_request(reader: &mut impl BufRead) -> io::Result<Option<(String, String)>> {
-    let mut line = String::new();
-    let mut total = 0;
-
-    let n = reader.read_line(&mut line)?;
-    if n == 0 {
-        return Ok(None);
+fn read_request<R: BufRead>(reader: &mut R) -> io::Result<Option<(String, String)>> {
+    let Some(line) = super::read_bounded_line(reader)? else {
+        return Ok(None); // client closed without sending anything
+    };
+    let mut total = line.len();
+    if total > MAX_REQUEST_BYTES {
+        return Err(too_large());
     }
-    total += n;
 
+    let line = String::from_utf8_lossy(&line);
     let mut parts = line.split_whitespace();
     let (Some(method), Some(path)) = (parts.next(), parts.next()) else {
         return Ok(None);
     };
     let (method, path) = (method.to_string(), path.to_string());
 
-    // Drain remaining headers until a blank line, bounding total bytes read.
+    // Drain the remaining headers up to the blank line. Each is bounded on its
+    // own; this bounds their total, and both checks happen *before* the next
+    // read rather than after, so nothing oversized is buffered on the way to
+    // discovering it is oversized.
     loop {
-        let mut header = String::new();
-        let n = reader.read_line(&mut header)?;
-        total += n;
-        if n == 0 || header == "\r\n" || header == "\n" {
-            break;
+        let Some(header) = super::read_bounded_line(reader)? else {
+            break; // EOF before the blank line; serve what we parsed
+        };
+        if header.is_empty() {
+            break; // end of headers
         }
+        total += header.len();
         if total > MAX_REQUEST_BYTES {
-            break;
+            return Err(too_large());
         }
     }
 
     Ok(Some((method, path)))
+}
+
+/// The request line and headers exceeded [`MAX_REQUEST_BYTES`].
+fn too_large() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "request line and headers too large",
+    )
 }
 
 fn write_response(

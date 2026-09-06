@@ -83,3 +83,79 @@ fn shared_storage_stats() {
     assert_eq!(stats.puts_total, 1);
     assert!(stats.to_prometheus().contains("lsm_puts_total 1"));
 }
+
+/// Connect, send `request` verbatim, and return the status line.
+///
+/// A read timeout is deliberate: an unbounded server does not *fail* these
+/// tests, it waits for a newline that never comes, and a hung CI job is worse
+/// to diagnose than a failed one.
+fn status_line_for(request: &[u8]) -> String {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    let temp = TempDir::new().unwrap();
+    let db = SharedStorage::new(temp.path(), false).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let server = lsm_rust::MetricsServer::spawn(db, listener).unwrap();
+
+    let mut writer = TcpStream::connect(server.local_addr()).unwrap();
+    writer
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    let mut reader = BufReader::new(writer.try_clone().unwrap());
+
+    writer.write_all(request).unwrap();
+    writer.flush().unwrap();
+
+    let mut status = String::new();
+    reader.read_line(&mut status).unwrap();
+    status.trim_end().to_string()
+}
+
+#[test]
+fn an_over_long_request_line_is_rejected() {
+    // No newline anywhere: the request line has to be buffered before anything
+    // can inspect it, so without a per-line bound this grows without limit and
+    // the byte-total limit is never consulted.
+    let mut request = vec![b'A'; 70 * 1024];
+    request.extend_from_slice(b"\r\n\r\n");
+    assert_eq!(
+        status_line_for(&request),
+        "HTTP/1.1 431 Request Header Fields Too Large"
+    );
+}
+
+#[test]
+fn oversized_headers_are_rejected() {
+    // A single header far past the 8 KiB request budget. Checking the total
+    // only *after* reading each line lets one line blow the budget by any
+    // margin it likes before the check runs.
+    let mut request = b"GET /metrics HTTP/1.1\r\nX-Pad: ".to_vec();
+    request.extend_from_slice(&vec![b'A'; 16 * 1024]);
+    request.extend_from_slice(b"\r\n\r\n");
+    assert_eq!(
+        status_line_for(&request),
+        "HTTP/1.1 431 Request Header Fields Too Large"
+    );
+}
+
+#[test]
+fn a_normal_scrape_is_unaffected_by_the_limits() {
+    let request = b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nUser-Agent: Prometheus/2.0\r\nAccept: */*\r\n\r\n";
+    assert_eq!(status_line_for(request), "HTTP/1.1 200 OK");
+}
+
+#[test]
+fn many_small_headers_are_bounded_in_total() {
+    // Each line is individually fine; their sum is not. Bounding only the
+    // per-line size would let a client stream headers for ever.
+    let mut request = b"GET /metrics HTTP/1.1\r\n".to_vec();
+    for i in 0..400 {
+        request.extend_from_slice(format!("X-Pad-{i:04}: {}\r\n", "p".repeat(64)).as_bytes());
+    }
+    request.extend_from_slice(b"\r\n");
+    assert_eq!(
+        status_line_for(&request),
+        "HTTP/1.1 431 Request Header Fields Too Large"
+    );
+}
