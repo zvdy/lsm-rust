@@ -1,3 +1,10 @@
+//! The in-memory write buffer at the top of the tree.
+//!
+//! Writes land here after the write-ahead log has made them durable, and stay
+//! until the table outgrows its threshold and is flushed to an SSTable. Reads
+//! consult it first, since it holds the newest version of every key it has
+//! seen.
+
 use crate::{Expiry, Key, Seq, Value, Version};
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
@@ -29,6 +36,7 @@ impl Default for MemTable {
 }
 
 impl MemTable {
+    /// An empty memtable.
     pub fn new() -> Self {
         MemTable {
             data: BTreeMap::new(),
@@ -87,14 +95,19 @@ impl MemTable {
             .map(|(_, v)| v)
     }
 
+    /// Approximate bytes of keys and values held, used to decide when to
+    /// flush.
     pub fn size(&self) -> usize {
         self.size
     }
 
+    /// Whether no versions are stored at all.
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
 
+    /// Number of stored *versions*, which may exceed the number of distinct
+    /// keys.
     pub fn len(&self) -> usize {
         self.data.len()
     }
