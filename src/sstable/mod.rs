@@ -111,6 +111,32 @@ fn corrupt(msg: &str) -> crate::Error {
     crate::Error::corruption(msg)
 }
 
+/// Reject a length read off disk that the file is too short to satisfy.
+///
+/// Lengths are the one field a checksum cannot protect: the CRC covers the
+/// body the length describes, so it can only be verified *after* the length
+/// has already been used to size a buffer. A single flipped bit in a length
+/// prefix therefore turns a few-kilobyte file into a request for gigabytes —
+/// which either aborts the process outright when the allocator refuses, or
+/// reserves the memory and then fails with a bare `UnexpectedEof` that says
+/// nothing about the file being damaged. Checking the length against the
+/// bytes actually remaining costs one `stat` and makes both outcomes a
+/// [`Error::Corruption`] naming the section at fault.
+fn check_length(file: &File, len: usize, what: &str) -> crate::Result<()> {
+    let end = file.metadata()?.len();
+    // `Seek` is implemented for `&File`, so the current offset is readable
+    // without taking the handle mutably.
+    let mut handle: &File = file;
+    let remaining = end.saturating_sub(handle.stream_position()?);
+    if len as u64 > remaining {
+        return Err(corrupt(&format!(
+            "{} claims {} bytes but only {} remain in the file",
+            what, len, remaining
+        )));
+    }
+    Ok(())
+}
+
 fn read_u32(buffer: &[u8], pos: usize) -> crate::Result<u32> {
     buffer
         .get(pos..pos + 4)
@@ -313,6 +339,7 @@ impl SSTable {
         } else {
             // Legacy format: the first 4 bytes are the bloom filter length
             let bloom_len = u32::from_le_bytes(magic) as usize;
+            check_length(&file, bloom_len, "legacy bloom filter")?;
             let mut bloom_bytes = vec![0u8; bloom_len];
             file.read_exact(&mut bloom_bytes)?;
             let bloom = BloomFilter::from_bytes(&bloom_bytes).ok();
@@ -337,6 +364,11 @@ impl SSTable {
             None
         };
 
+        // The CRC protects the body, not the length that precedes it, so the
+        // length has to stand on its own before it is used to size anything.
+        // A file cannot hold more than it is long, which makes that check
+        // exact rather than an arbitrary cap.
+        check_length(file, len, what)?;
         let mut body = vec![0u8; len];
         file.read_exact(&mut body)?;
 
@@ -360,8 +392,24 @@ impl SSTable {
         Ok(())
     }
 
+    /// Bytes every index entry occupies even with an empty key:
+    /// `[key_len 4][offset 8][len 4]`.
+    const MIN_INDEX_ENTRY: usize = 16;
+
     fn parse_index(bytes: &[u8]) -> crate::Result<Vec<IndexEntry>> {
         let count = read_u32(bytes, 0)? as usize;
+        // Reserving for `count` entries before reading them would let a
+        // corrupt count size the allocation. The loop below rejects a short
+        // buffer anyway; this rejects it *before* reserving 40 bytes apiece
+        // for entries the buffer is far too small to contain.
+        let capacity = bytes.len().saturating_sub(4) / Self::MIN_INDEX_ENTRY;
+        if count > capacity {
+            return Err(corrupt(&format!(
+                "sparse index claims {} entries but only {} bytes follow",
+                count,
+                bytes.len().saturating_sub(4)
+            )));
+        }
         let mut index = Vec::with_capacity(count);
         let mut pos = 4;
         for _ in 0..count {
@@ -567,6 +615,7 @@ impl SSTable {
     fn read_range(&self, offset: u64, len: usize) -> crate::Result<Vec<u8>> {
         let mut file = File::open(&self.path)?;
         file.seek(SeekFrom::Start(offset))?;
+        check_length(&file, len, "data block")?;
         let mut buffer = vec![0u8; len];
         file.read_exact(&mut buffer)?;
         Ok(buffer)

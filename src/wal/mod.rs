@@ -221,7 +221,14 @@ impl WAL {
                     let Some(count) = Self::read_u32(&buffer, &mut p) else {
                         break;
                     };
-                    let mut batch = Vec::with_capacity(count as usize);
+                    // Grow as entries are parsed rather than reserving for
+                    // `count` up front: this frame carries no checksum, so a
+                    // corrupt count is indistinguishable from a real one until
+                    // the entries are read, and reserving first turns a
+                    // damaged byte into an allocation the process cannot
+                    // survive. Parsing stops at the first incomplete entry, so
+                    // the vector never outgrows the bytes actually present.
+                    let mut batch = Vec::new();
                     let mut complete = true;
                     for _ in 0..count {
                         match Self::parse_entry(&buffer, &mut p) {
@@ -293,7 +300,12 @@ impl WAL {
             BATCH_MARKER => {
                 p = 1;
                 let count = Self::read_u32(body, &mut p)?;
-                let mut batch = Vec::with_capacity(count as usize);
+                // Bounded the same way as the unframed path above. The body is
+                // checksummed here, so the count is trustworthy — but a
+                // trustworthy count is not a reason to reserve ahead of the
+                // entries, and keeping both paths identical means neither can
+                // regress on its own.
+                let mut batch = Vec::new();
                 for _ in 0..count {
                     batch.push(Self::parse_entry(body, &mut p)?);
                 }
