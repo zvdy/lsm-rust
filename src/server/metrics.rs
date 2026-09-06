@@ -169,10 +169,9 @@ fn read_request<R: BufRead>(reader: &mut R) -> io::Result<Option<(String, String
     // own; this bounds their total, and both checks happen *before* the next
     // read rather than after, so nothing oversized is buffered on the way to
     // discovering it is oversized.
-    loop {
-        let Some(header) = super::read_bounded_line(reader)? else {
-            break; // EOF before the blank line; serve what we parsed
-        };
+    // Ends on EOF (the client closed before the blank line, so serve what was
+    // parsed) or on the blank line itself.
+    while let Some(header) = super::read_bounded_line(reader)? {
         if header.is_empty() {
             break; // end of headers
         }
