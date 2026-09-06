@@ -1,3 +1,20 @@
+//! Sorted string tables: the immutable, on-disk half of the tree.
+//!
+//! A memtable flush writes one SSTable; compaction merges several into one.
+//! Once written a table is never modified, which is what lets reads run
+//! without locks, snapshots keep older versions alive, and a checkpoint
+//! capture a table by hard link rather than by copy.
+//!
+//! Each file carries a bloom filter and a sparse index ahead of its data
+//! blocks, so a lookup usually costs one block read: the filter rules the
+//! table out entirely, or the index names the single block that could hold
+//! the key. Blocks are optionally LZ4-compressed and each is covered by a
+//! CRC-32, as are the header sections.
+//!
+//! Every entry stores its own sequence number, so one table can hold several
+//! versions of a key and a read at a snapshot takes the newest version at or
+//! below it.
+
 use crate::bloom::BloomFilter;
 use crate::checksum::crc32;
 use crate::{Expiry, Key, Seq, Value, Version};
@@ -93,6 +110,8 @@ enum Layout {
     },
 }
 
+/// One immutable table file, with its header loaded and its data read on
+/// demand.
 pub struct SSTable {
     path: PathBuf,
     size: usize,
@@ -233,6 +252,10 @@ fn encode_entries(data: &[VersionedEntry], out: &mut Vec<u8>) {
 }
 
 impl SSTable {
+    /// Open the table at `path`, reading no blocks through a cache.
+    ///
+    /// A path that does not exist (or is empty) opens as an empty table
+    /// rather than failing, so a newly created table can be written into.
     pub fn new(path: PathBuf) -> crate::Result<Self> {
         Self::with_cache(path, None)
     }
@@ -749,6 +772,11 @@ impl SSTable {
         Ok(out)
     }
 
+    /// Whether this table could hold `key`, according to its bloom filter.
+    ///
+    /// False positives are possible and harmless — the lookup then reads a
+    /// block and finds nothing. False negatives are not, so a table written
+    /// without a filter answers `true` for everything.
     pub fn might_contain_key(&self, key: &[u8]) -> bool {
         if let Some(filter) = &self.bloom_filter {
             filter.might_contain(key)
@@ -1006,6 +1034,7 @@ impl SSTable {
         }
     }
 
+    /// Size of the file on disk, in bytes.
     pub fn size(&self) -> usize {
         if self.size == 0 && self.path.exists() {
             // Lazy load size if not set
@@ -1016,10 +1045,12 @@ impl SSTable {
         self.size
     }
 
+    /// Path of the file backing this table.
     pub fn get_path(&self) -> &PathBuf {
         &self.path
     }
 
+    /// Remove the file, consuming the table.
     #[allow(dead_code)]
     pub fn delete(self) -> crate::Result<()> {
         fs::remove_file(self.path)?;

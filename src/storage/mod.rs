@@ -1,3 +1,14 @@
+//! The storage engine: memtable, write-ahead log, levelled SSTables and the
+//! manifest that ties them together.
+//!
+//! [`Storage`] is the single-threaded engine; [`SharedStorage`] wraps it for
+//! concurrent use and is what the server front ends and transactions are
+//! built on. Writes go to the log, then the memtable, and are flushed to
+//! level 0 once the memtable fills; compaction merges levels downwards. The
+//! manifest records which tables are live and how far the sequence counter
+//! has advanced, and replacing it is the commit point for every flush,
+//! compaction and promotion.
+
 pub mod checkpoint;
 mod manifest;
 mod scan;
@@ -988,9 +999,6 @@ impl Storage {
         Ok(())
     }
 
-    /// Run any pending compactions across all levels, regardless of the
-    /// `inline_compaction` setting. Returns once every level is within its
-    /// threshold.
     /// Write a consistent, point-in-time copy of the store to `target`.
     ///
     /// The store is held exclusively for the duration, so the SSTables, the
@@ -1103,6 +1111,9 @@ impl Storage {
         })
     }
 
+    /// Run any pending compactions across all levels, regardless of the
+    /// `inline_compaction` setting. Returns once every level is within its
+    /// threshold.
     pub fn compact_now(&mut self) -> crate::Result<()> {
         let mut level = 0;
         loop {

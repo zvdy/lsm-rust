@@ -1,3 +1,10 @@
+//! A small Bloom filter, used to skip SSTables that cannot hold a key.
+//!
+//! Each table stores one filter over its keys. A lookup asks every table on
+//! every level, so ruling one out before touching the disk is what keeps a
+//! miss cheap. The filter may say "maybe" for a key it does not hold — the
+//! read then costs one wasted block — but never "no" for one it does.
+
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
