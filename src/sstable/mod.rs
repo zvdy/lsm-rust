@@ -39,6 +39,45 @@ const TOMBSTONE_MARKER: u32 = u32::MAX;
 /// common case — a value with no deadline — still costs no extra bytes.
 const EXPIRING_MARKER: u32 = u32::MAX - 1;
 
+/// Longest key the entry format can represent.
+///
+/// Every entry stores its key length in four bytes, so a longer key would be
+/// written with the length wrapped and read back as a different, shorter key.
+pub const MAX_KEY_LEN: usize = u32::MAX as usize;
+
+/// Longest value the entry format can represent.
+///
+/// Values share their four-byte length field with two reserved markers, so
+/// the two largest encodable lengths are not available: a value of exactly
+/// `u32::MAX` bytes would be written as the tombstone marker and read back
+/// as a *deletion*, and one of `u32::MAX - 1` bytes as the expiry marker,
+/// which would consume the first eight bytes of the value as a deadline.
+/// Anything longer wraps and truncates. All three are silent, so the write
+/// is refused instead.
+pub const MAX_VALUE_LEN: usize = u32::MAX as usize - 2;
+
+/// Reject a key or value the entry format cannot represent.
+///
+/// Takes lengths rather than the data so the boundary can be tested without
+/// allocating four gigabytes to do it.
+pub fn check_sizes(key_len: usize, value_len: Option<usize>) -> crate::Result<()> {
+    if key_len > MAX_KEY_LEN {
+        return Err(crate::Error::invalid_argument(format!(
+            "key of {} bytes exceeds the {} byte maximum",
+            key_len, MAX_KEY_LEN
+        )));
+    }
+    if let Some(value_len) = value_len {
+        if value_len > MAX_VALUE_LEN {
+            return Err(crate::Error::invalid_argument(format!(
+                "value of {} bytes exceeds the {} byte maximum",
+                value_len, MAX_VALUE_LEN
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Magic bytes identifying the versioned SSTable format.
 const MAGIC: &[u8; 4] = b"LSMT";
 /// Header flag bit: data blocks are LZ4-compressed.
@@ -1148,6 +1187,76 @@ impl Iterator for RangeCursor<'_> {
 
 #[cfg(test)]
 mod tests {
+    use super::{check_sizes, parse_entries, MAX_KEY_LEN, MAX_VALUE_LEN};
+
+    /// Hand-encode one entry the way `encode_entries` would, given a value
+    /// length. The payload is omitted: what matters is the length field.
+    fn entry_with_declared_value_len(key: &[u8], seq: u64, value_len: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        out.extend_from_slice(key);
+        out.extend_from_slice(&seq.to_le_bytes());
+        out.extend_from_slice(&value_len.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn a_value_of_u32_max_bytes_would_be_read_back_as_a_deletion() {
+        // This is the encoding a 4 GiB value produces: its length field is
+        // bit-for-bit the tombstone marker. Nothing downstream can tell the
+        // two apart, so the value comes back as a delete and the data is
+        // silently gone — which is why the write is refused up front.
+        let bytes = entry_with_declared_value_len(b"k", 7, u32::MAX);
+        let entries = parse_entries(&bytes, true).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0].2.value.is_none(),
+            "a value of u32::MAX bytes decodes as a tombstone"
+        );
+        assert!(check_sizes(1, Some(u32::MAX as usize)).is_err());
+    }
+
+    #[test]
+    fn a_value_of_u32_max_minus_one_bytes_would_be_read_back_as_an_expiry() {
+        // One below is the expiring marker: the first eight bytes of the
+        // value would be consumed as a deadline and the next four as a
+        // length. Here there are no such bytes, so it fails as a truncated
+        // entry rather than as a value.
+        let bytes = entry_with_declared_value_len(b"k", 7, u32::MAX - 1);
+        assert!(
+            parse_entries(&bytes, true).is_err(),
+            "a value of u32::MAX - 1 bytes is read as an expiry header"
+        );
+        assert!(check_sizes(1, Some(u32::MAX as usize - 1)).is_err());
+    }
+
+    #[test]
+    fn the_largest_representable_value_is_still_allowed() {
+        // The limit must sit exactly below the reserved markers and no lower:
+        // shaving off more would refuse values the format can hold perfectly
+        // well.
+        assert_eq!(MAX_VALUE_LEN, u32::MAX as usize - 2);
+        assert!(check_sizes(1, Some(MAX_VALUE_LEN)).is_ok());
+        assert!(check_sizes(MAX_KEY_LEN, Some(0)).is_ok());
+        assert!(check_sizes(MAX_KEY_LEN + 1, None).is_err());
+    }
+
+    #[test]
+    fn ordinary_sizes_are_unaffected() {
+        assert!(check_sizes(0, Some(0)).is_ok());
+        assert!(check_sizes(64, Some(1024 * 1024)).is_ok());
+        assert!(check_sizes(1024, None).is_ok());
+    }
+
+    #[test]
+    fn the_rejection_names_the_offending_size() {
+        let err = check_sizes(1, Some(u32::MAX as usize)).unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidArgument(_)), "{err:?}");
+        let text = err.to_string();
+        assert!(text.contains("4294967295"), "{text}");
+        assert!(text.contains("value"), "{text}");
+    }
+
     use super::*;
     use tempfile::TempDir;
 

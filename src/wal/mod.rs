@@ -186,6 +186,14 @@ impl WAL {
         value: Option<&[u8]>,
         expires_at: Option<crate::Expiry>,
     ) -> crate::Result<()> {
+        // Guarded here rather than at the callers: this is both the single
+        // point every write path reaches — plain, expiring and batched alike —
+        // and the place the lengths are narrowed to `u32`, so the check cannot
+        // drift away from the truncation it exists to prevent. For a batch
+        // this runs while the record is still being assembled in memory, so a
+        // rejected entry leaves nothing written.
+        crate::sstable::check_sizes(key.len(), value.map(|v| v.len()))?;
+
         let op_byte = match (op, expires_at) {
             (Operation::Put, None) => 0u8,
             (Operation::Delete, _) => 1u8,
