@@ -31,6 +31,8 @@ pub struct CompactionManager {
 }
 
 impl CompactionManager {
+    /// Build a manager from the thresholds that decide when a level is due
+    /// for compaction.
     pub fn new(level_multiplier: u32, size_threshold: usize, level0_file_limit: usize) -> Self {
         CompactionManager {
             level_multiplier,
@@ -39,6 +41,11 @@ impl CompactionManager {
         }
     }
 
+    /// Whether `level` is over its threshold and should be compacted.
+    ///
+    /// Level 0 is judged by file count, because its tables come straight from
+    /// memtable flushes and freely overlap each other, so every one of them
+    /// has to be consulted on a read. Deeper levels are judged by total size.
     pub fn should_compact(&self, level: usize, tables: &[SSTable]) -> bool {
         // Level 0 is special - compact based on file count
         if level == 0 {
