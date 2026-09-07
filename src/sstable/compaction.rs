@@ -1,7 +1,7 @@
 use super::{SSTable, VersionedEntry};
 use crate::{Expiry, Key, Seq, Version};
-use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 
 /// The most tables a level may accumulate through promotion before a real
 /// merge is forced to consolidate them.
@@ -145,7 +145,52 @@ impl CompactionManager {
         }
         max_depth
     }
+}
 
+/// One table's current entry, waiting its turn in the k-way merge.
+///
+/// `BinaryHeap` pops the *greatest* element, so `Ord` here is written so that
+/// "greatest" means "next in merge order": smallest key first, then the
+/// highest sequence within a key, then the newest table. That last tie-break
+/// only matters for legacy data written before sequence numbers were unique
+/// per write — it reproduces what inserting the tables oldest-first into a map
+/// used to do, where the newest table's value overwrote the others.
+struct Candidate {
+    key: Key,
+    seq: Seq,
+    /// Index into the input tables, which are ordered oldest to newest.
+    source: usize,
+    version: Version,
+}
+
+impl Ord for Candidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .key
+            .cmp(&self.key)
+            .then_with(|| self.seq.cmp(&other.seq))
+            .then_with(|| self.source.cmp(&other.source))
+    }
+}
+
+impl PartialOrd for Candidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+// Only the ordering fields take part: `version` is the payload being merged,
+// never a tie-break. `source` is unique across the heap (one entry per table),
+// so this is a total order and never reports two live candidates as equal.
+impl PartialEq for Candidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Candidate {}
+
+impl CompactionManager {
     /// Merge the given SSTables into a single sorted, version-aware entry list.
     ///
     /// `tables` must be ordered from oldest to newest (creation order); when
@@ -179,28 +224,69 @@ impl CompactionManager {
         gc_floor: Seq,
         now: Expiry,
     ) -> crate::Result<(Vec<VersionedEntry>, u64)> {
-        // Sorted by (key asc, seq desc). Inserting oldest table first means a
-        // newer table's value wins for a colliding (key, seq) legacy entry.
-        let mut merged: BTreeMap<(Key, Reverse<Seq>), Version> = BTreeMap::new();
-        let mut expired = 0u64;
-        for table in tables {
-            for (key, seq, version) in table.read_versioned()? {
-                let collected = if version.is_expired_at(now) {
-                    expired += 1;
-                    version.collect_if_expired(now)
-                } else {
-                    version
-                };
-                merged.insert((key, Reverse(seq)), collected);
+        // Every input table is already sorted by (key asc, seq desc), so the
+        // merged order comes from a k-way merge rather than from re-sorting
+        // the level in a map. Only one block per table is resident at a time,
+        // which matters because a level being compacted is, by definition,
+        // the largest thing around.
+        let mut cursors: Vec<_> = tables.iter().map(|table| table.versions()).collect();
+        let mut frontier: BinaryHeap<Candidate> = BinaryHeap::with_capacity(cursors.len());
+        for (source, cursor) in cursors.iter_mut().enumerate() {
+            if let Some(entry) = cursor.next() {
+                let (key, seq, version) = entry?;
+                frontier.push(Candidate {
+                    key,
+                    seq,
+                    source,
+                    version,
+                });
             }
         }
 
         let can_drop_tombstones = drop_tombstones && gc_floor == Seq::MAX;
 
+        let mut expired = 0u64;
         let mut out: Vec<VersionedEntry> = Vec::new();
         let mut current_key: Option<Key> = None;
         let mut kept_floor_version = false;
-        for ((key, Reverse(seq)), version) in merged {
+        let mut last_emitted: Option<(Key, Seq)> = None;
+
+        while let Some(candidate) = frontier.pop() {
+            // Refill from the cursor this came from before doing anything
+            // else, so the frontier always holds one entry per live table.
+            if let Some(entry) = cursors[candidate.source].next() {
+                let (key, seq, version) = entry?;
+                frontier.push(Candidate {
+                    key,
+                    seq,
+                    source: candidate.source,
+                    version,
+                });
+            }
+
+            let Candidate {
+                key, seq, version, ..
+            } = candidate;
+
+            let version = if version.is_expired_at(now) {
+                expired += 1;
+                version.collect_if_expired(now)
+            } else {
+                version
+            };
+
+            // The same (key, seq) can appear in more than one table for legacy
+            // data written before sequence numbers were unique. The heap
+            // orders the newest table first, so the first one seen wins and
+            // the rest are the stale copies.
+            if last_emitted
+                .as_ref()
+                .is_some_and(|(k, s)| *k == key && *s == seq)
+            {
+                continue;
+            }
+            last_emitted = Some((key.clone(), seq));
+
             // Reset per-key bookkeeping when the key changes
             if current_key.as_ref() != Some(&key) {
                 current_key = Some(key.clone());

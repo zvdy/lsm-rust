@@ -692,6 +692,23 @@ impl SSTable {
         Ok(buffer)
     }
 
+    /// Iterate every stored version in `(key asc, seq desc)` order, reading
+    /// one block at a time.
+    ///
+    /// [`read_versioned`](Self::read_versioned) materialises the whole table;
+    /// this holds one block. Compaction reads every entry of every input table
+    /// exactly once and in order, so it has no use for the rest being in
+    /// memory — and the whole point of compacting a level is that the level is
+    /// large.
+    pub fn versions(&self) -> VersionCursor<'_> {
+        VersionCursor {
+            table: self,
+            next_block: 0,
+            current: Vec::new().into_iter(),
+            legacy_read: false,
+        }
+    }
+
     /// Read every stored version (including tombstones) from this SSTable.
     pub fn read_versioned(&self) -> crate::Result<Vec<VersionedEntry>> {
         match &self.layout {
@@ -1180,6 +1197,72 @@ impl Iterator for RangeCursor<'_> {
             match parse_entries(&block, *has_seq) {
                 Ok(entries) => *current = entries.into_iter(),
                 Err(e) => return Some(Err(e)),
+            }
+        }
+    }
+}
+
+/// A block-at-a-time reader over one SSTable's versions, in `(key asc,
+/// seq desc)` order. Created by [`SSTable::versions`].
+///
+/// Yields `Err` once and then nothing further: a table that cannot be read is
+/// not a table whose remaining blocks are worth guessing at.
+pub struct VersionCursor<'a> {
+    table: &'a SSTable,
+    /// Index of the next data block to read (versioned layouts).
+    next_block: usize,
+    /// Entries decoded from the block just read, not yet yielded.
+    current: std::vec::IntoIter<VersionedEntry>,
+    /// Legacy tables predate blocks, so they are read in one go — once.
+    legacy_read: bool,
+}
+
+impl Iterator for VersionCursor<'_> {
+    type Item = crate::Result<VersionedEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(entry) = self.current.next() {
+                return Some(Ok(entry));
+            }
+            // The block is spent; refill from the next one. A block that
+            // decodes to nothing simply moves us on to the block after it.
+            let decoded = match &self.table.layout {
+                Layout::Empty => return None,
+                Layout::Legacy { data_start } => {
+                    if self.legacy_read {
+                        return None;
+                    }
+                    self.legacy_read = true;
+                    self.table
+                        .read_to_end_from(*data_start)
+                        .and_then(|buffer| parse_entries(&buffer, false))
+                }
+                Layout::Versioned {
+                    data_start,
+                    index,
+                    compression,
+                    has_seq,
+                    has_block_crc,
+                    ..
+                } => {
+                    let block = index.get(self.next_block)?;
+                    self.next_block += 1;
+                    self.table
+                        .read_block(*data_start, block, *compression, *has_block_crc)
+                        .and_then(|bytes| parse_entries(&bytes, *has_seq))
+                }
+            };
+            match decoded {
+                Ok(entries) => self.current = entries.into_iter(),
+                Err(e) => {
+                    // Stop rather than skipping past damage: the next block's
+                    // bytes are no more trustworthy than this one's.
+                    self.current = Vec::new().into_iter();
+                    self.next_block = usize::MAX;
+                    self.legacy_read = true;
+                    return Some(Err(e));
+                }
             }
         }
     }
