@@ -27,8 +27,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # Pinned to an exact commit: this action publishes no moving major tag
+      # (`v2` does not exist as a ref, which is why every run of this workflow
+      # since it was added failed to resolve it), and a digest is what the
+      # Pinned-Dependencies check this workflow reports on wants to see.
+      # Dependabot updates the digest and the comment together.
       - name: Run analysis
-        uses: ossf/scorecard-action@v2
+        uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4
         with:
           results_file: results.sarif
           results_format: sarif
