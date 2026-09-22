@@ -2,7 +2,7 @@
 
 [![Rust CI](https://github.com/zvdy/lsm-rust/actions/workflows/rust.yml/badge.svg)](https://github.com/zvdy/lsm-rust/actions/workflows/rust.yml)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/zvdy/lsm-rust/badge)](https://scorecard.dev/viewer/?uri=github.com/zvdy/lsm-rust)
-[![MSRV](https://img.shields.io/badge/MSRV-1.87-blue.svg)](https://github.com/zvdy/lsm-rust/blob/main/Cargo.toml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.98-blue.svg)](https://github.com/zvdy/lsm-rust/blob/main/Cargo.toml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A Log-Structured Merge (LSM) tree storage engine in Rust, usable as an
@@ -358,8 +358,10 @@ make deny       # license, advisory, source and ban policy (cargo-deny)
 make bench      # criterion benchmarks
 ```
 
-The minimum supported Rust version is **1.87**, declared in `Cargo.toml` and
-verified by CI on every pull request.
+The minimum supported Rust version is **1.98**, the current stable release,
+declared in `Cargo.toml` and verified by CI on every pull request. The code
+itself only needs 1.87; the floor is set higher by choice, so lower it if you
+need to build on an older toolchain.
 
 The test suite covers the engine, a crash-recovery suite (restarts, torn WAL
 tails, delete persistence, and a model-based random workload), and the
