@@ -2,59 +2,59 @@
 
 [![Rust CI](https://github.com/zvdy/lsm-rust/actions/workflows/rust.yml/badge.svg)](https://github.com/zvdy/lsm-rust/actions/workflows/rust.yml)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/zvdy/lsm-rust/badge)](https://scorecard.dev/viewer/?uri=github.com/zvdy/lsm-rust)
-[![MSRV](https://img.shields.io/badge/MSRV-1.87-blue.svg)](https://github.com/zvdy/lsm-rust/blob/main/Cargo.toml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.98-blue.svg)](https://github.com/zvdy/lsm-rust/blob/main/Cargo.toml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-A Log-Structured Merge (LSM) tree storage engine in Rust — usable as an
+A Log-Structured Merge (LSM) tree storage engine in Rust, usable as an
 embedded library or served over the Redis protocol. It pairs a durable
 write-ahead log and leveled, compacted SSTables with MVCC snapshot isolation,
 atomic write batches, and a Prometheus metrics endpoint.
 
 ## Features
 
-- **One error type** — every call returns `Result<T, Error>`, and `Error`
+- **One error type**: every call returns `Result<T, Error>`, and `Error`
   separates corruption, transaction conflicts, invalid arguments and I/O, so
   failures are classified rather than stringly-typed. It converts both ways
   with `std::io::Error`.
-- **Durable, crash-safe writes** — a write-ahead log fsynced before ack;
+- **Durable, crash-safe writes**: a write-ahead log fsynced before ack;
   torn-tail entries and orphaned tables are cleaned up on recovery, tracked by
   a crash-atomic manifest.
-- **End-to-end checksums** — a CRC-32 on every SSTable section, every data
+- **End-to-end checksums**: a CRC-32 on every SSTable section, every data
   block, and every WAL record turns silent corruption into a clean error
   instead of plausible-looking garbage.
-- **Concurrent transactions** — optimistic (`begin`/`commit`/`rollback`) with
+- **Concurrent transactions**: optimistic (`begin`/`commit`/`rollback`) with
   read-your-own-writes, conflict detection at commit, and retriable aborts.
   Serializable by default (catching write skew and phantoms), or snapshot
   isolation when you want fewer aborts.
-- **MVCC snapshot isolation** — every write is sequence-numbered; a `Snapshot`
+- **MVCC snapshot isolation**: every write is sequence-numbered; a `Snapshot`
   reads a consistent view unaffected by later writes, flushes, or compactions.
-- **Time-travel reads** — revisit the store as of any recorded sequence
+- **Time-travel reads**: revisit the store as of any recorded sequence
   checkpoint with `snapshot_at`; the sequence is persisted, so it survives
   restarts.
-- **Consistent checkpoints** — `checkpoint()` writes a point-in-time copy you
+- **Consistent checkpoints**: `checkpoint()` writes a point-in-time copy you
   can open as a store. SSTables are hard-linked, so it costs almost nothing up
   front; the WAL is copied, so writes made afterwards cannot leak in.
-- **Per-key expiry (TTL)** — `put_with_ttl` hides a key once its deadline
+- **Per-key expiry (TTL)**: `put_with_ttl` hides a key once its deadline
   passes and compaction reclaims it. Deadlines are absolute, so they survive
   restarts without being refreshed.
-- **Atomic write batches** — multiple puts and deletes commit all-or-nothing,
+- **Atomic write batches**: multiple puts and deletes commit all-or-nothing,
   durably and visibly.
-- **Fast reads** — per-table Bloom filters, sparse block indexes, an LRU block
+- **Fast reads**: per-table Bloom filters, sparse block indexes, an LRU block
   cache, and optional LZ4 block compression.
-- **Cost-aware leveled compaction** — newest-value-wins merging with tombstone
+- **Cost-aware leveled compaction**: newest-value-wins merging with tombstone
   GC, inline or on a background thread. A level whose tables share no keys is
   promoted rather than rewritten, so append-only and time-ordered workloads
   stop paying for merges that cannot reclaim anything.
-- **Streaming range and prefix scans** — ordered, newest-wins merges across
+- **Streaming range and prefix scans**: ordered, newest-wins merges across
   the memtable and every level. `scan_iter` streams one SSTable block at a
   time, so a wide range costs memory proportional to the number of tables, not
   to the size of the range, and tables whose key range cannot match are skipped
   outright.
-- **Concurrency** — a cloneable `SharedStorage` handle: concurrent reads,
+- **Concurrency**: a cloneable `SharedStorage` handle: concurrent reads,
   serialized writes.
-- **Redis-protocol server** — `lsm-rust serve` speaks RESP, so `redis-cli` and
+- **Redis-protocol server**: `lsm-rust serve` speaks RESP, so `redis-cli` and
   Redis client libraries work out of the box.
-- **Prometheus metrics** — operation counters and live gauges via
+- **Prometheus metrics**: operation counters and live gauges via
   `Storage::stats()` or a `/metrics` endpoint.
 
 ## Architecture
@@ -163,7 +163,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(tx.get(&b"a".to_vec())?, Some(b"1".to_vec())); // reads its own writes
     match tx.commit() {
         Ok(seq) => println!("committed at {seq}"),
-        Err(e) if e.is_retriable() => println!("conflict — retry"),
+        Err(e) if e.is_retriable() => println!("conflict, retry"),
         Err(e) => return Err(e.into()),
     }
     Ok(())
@@ -173,13 +173,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### Checkpoints and backup
 
 Crash recovery and backup are different problems. A process dying is already
-handled — the WAL is fsynced before ack and the manifest rename is the commit
+handled: the WAL is fsynced before ack and the manifest rename is the commit
 point. What that cannot survive is the data itself being destroyed: a deleted
 directory, a failed disk, a bad deploy. Checksums do not help either; a CRC-32
 turns a rotted block into a clean `Error::Corruption` instead of plausible
 garbage, but it cannot rebuild the bytes.
 
-Copying a live data directory by hand does not work — it races compaction, and
+Copying a live data directory by hand does not work: it races compaction, and
 every way it loses produces a copy that *opens cleanly* while being silently
 wrong. `checkpoint()` holds the store exclusively so the tables, WAL and
 manifest it captures are from one instant:
@@ -195,18 +195,18 @@ fn main() -> lsm_rust::Result<()> {
 }
 ```
 
-A checkpoint directory *is* a data directory — restore by opening it with
+A checkpoint directory *is* a data directory. Restore by opening it with
 `Storage::new`. There is no separate restore call.
 
 **What it costs.** Almost nothing at first. SSTables are immutable, so they are
-captured as hard links rather than copied — a checkpoint of a 10 GB store is
+captured as hard links rather than copied, so a checkpoint of a 10 GB store is
 initially some directory entries plus a manifest. The cost accrues later:
 when compaction unlinks a table, a checkpoint holding a link keeps the extents
 alive, so the real cost is *the bytes compaction has rewritten since the
 checkpoint was taken*, not the size of the store. Deleting the checkpoint
-directory reclaims it. Checkpoints are therefore meant to be short-lived —
-take one, copy it to where backups live, remove it — rather than kept by the
-dozen on the same volume.
+directory reclaims it. Checkpoints are therefore meant to be short-lived:
+take one, copy it to where backups live, then remove it. They are not meant to
+be kept by the dozen on the same volume.
 
 ### Expiry (TTL)
 
@@ -240,8 +240,8 @@ Two properties are worth knowing:
   timestamp when the write happens, so it survives restarts and does not reset
   when the store reopens.
 - **A snapshot isolates you from writes, not from time.** A snapshot taken
-  before a key expired will still stop returning it once the deadline passes —
-  sequence numbers order writes against each other and have nothing to say
+  before a key expired will still stop returning it once the deadline passes.
+  Sequence numbers order writes against each other and have nothing to say
   about the clock.
 
 An expired version keeps *shadowing* older versions of the same key rather
@@ -261,18 +261,18 @@ failure it was, so callers can act on it instead of parsing a message:
 | `Error::Io` | the underlying filesystem or socket failed | no |
 
 `Error::is_retriable()` and `Error::is_corruption()` cover the common checks.
-`Error` converts to and from `std::io::Error` in both directions — an `Io`
-error passes through untouched — so code whose own signatures are still
+`Error` converts to and from `std::io::Error` in both directions, and an `Io`
+error passes through untouched, so code whose own signatures are still
 `std::io::Result` keeps compiling unchanged.
 
 | Isolation | Detects | Allows |
 | --- | --- | --- |
 | `Isolation::Snapshot` | write-write conflicts | write skew, phantoms |
-| `Isolation::Serializable` (default) | write-write, read-write, phantoms in scanned ranges | — |
+| `Isolation::Serializable` (default) | write-write, read-write, phantoms in scanned ranges | nothing |
 
 Uncommitted writes are invisible to everyone else and are discarded if the
 transaction is dropped or rolled back. A commit applies the whole write set at
-one sequence number, as a single WAL record — all-or-nothing.
+one sequence number, as a single WAL record, all-or-nothing.
 
 ### Command line
 
@@ -312,9 +312,10 @@ cargo run --release -- serve --addr 127.0.0.1:6379 --metrics-addr 127.0.0.1:9898
 
 Metrics include operation counters (`lsm_puts_total`, `lsm_gets_total`,
 `lsm_flushes_total`, `lsm_compactions_total`, `lsm_compaction_moves_total`,
-`lsm_expired_total`, `lsm_scan_tables_pruned_total`, `lsm_checkpoints_total`, …) and gauges for the MVCC
-sequence, live snapshots, memtable occupancy, and per-level SSTable counts and
-sizes — readable in process via `Storage::stats()` too.
+`lsm_expired_total`, `lsm_scan_tables_pruned_total`, `lsm_checkpoints_total`
+and more) and gauges for the MVCC sequence, live snapshots, memtable occupancy,
+and per-level SSTable counts and sizes, readable in process via
+`Storage::stats()` too.
 
 ![lsm-rust Prometheus metrics endpoint](docs/images/prometheus-metrics-endpoint.png)
 
@@ -350,15 +351,17 @@ A `Makefile` mirrors CI so you can reproduce a green build locally:
 
 ```bash
 make            # list all targets
-make check      # format, lint, tests, docs — the CI gates
+make check      # format, lint, tests, docs (the CI gates)
 make test       # full test suite (unit + integration + doc tests)
 make msrv       # build against the declared minimum Rust version
 make deny       # license, advisory, source and ban policy (cargo-deny)
 make bench      # criterion benchmarks
 ```
 
-The minimum supported Rust version is **1.87**, declared in `Cargo.toml` and
-verified by CI on every pull request.
+The minimum supported Rust version is **1.98**, the current stable release,
+declared in `Cargo.toml` and verified by CI on every pull request. The code
+itself only needs 1.87; the floor is set higher by choice, so lower it if you
+need to build on an older toolchain.
 
 The test suite covers the engine, a crash-recovery suite (restarts, torn WAL
 tails, delete persistence, and a model-based random workload), and the
@@ -383,7 +386,7 @@ src/
 ├── wal/                # Write-ahead log
 └── server/             # RESP server + Prometheus metrics endpoint
 benches/storage.rs      # Criterion benchmarks
-tests/                  # Recovery, checkpoint, snapshot, write-batch, errors, …
+tests/                  # Recovery, checkpoint, snapshot, write-batch, errors, and more
 docs/ARCHITECTURE.md    # Design deep-dive and on-disk formats
 ```
 
@@ -391,11 +394,11 @@ docs/ARCHITECTURE.md    # Design deep-dive and on-disk formats
 
 Contributions of all kinds are welcome. Please read:
 
-- [CONTRIBUTING.md](CONTRIBUTING.md) — development setup, PR process, releases
-- [CHANGELOG.md](CHANGELOG.md) — what changed in each version
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the engine works
-- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) · [SECURITY.md](SECURITY.md) ·
-  [GOVERNANCE.md](GOVERNANCE.md) · [MAINTAINERS.md](MAINTAINERS.md)
+- [CONTRIBUTING.md](CONTRIBUTING.md): development setup, PR process, releases
+- [CHANGELOG.md](CHANGELOG.md): what changed in each version
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): how the engine works
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md), [SECURITY.md](SECURITY.md),
+  [GOVERNANCE.md](GOVERNANCE.md) and [MAINTAINERS.md](MAINTAINERS.md)
 
 ## License
 

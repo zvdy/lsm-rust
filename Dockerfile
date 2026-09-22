@@ -1,5 +1,5 @@
 # Build stage
-FROM rust:1.98-slim-bullseye AS builder
+FROM rust:1.98-slim-trixie AS builder
 
 WORKDIR /usr/src/lsm-rust
 
@@ -20,7 +20,7 @@ COPY ./src/wal/mod.rs ./src/wal/
 RUN cargo build --release
 
 # Runtime stage
-FROM debian:bullseye-slim
+FROM debian:trixie-slim
 
 # Install necessary runtime dependencies
 RUN apt-get update && apt-get install -y \
