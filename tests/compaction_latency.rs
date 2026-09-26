@@ -16,7 +16,7 @@
 //! write pays more than a small fraction of it while the same compaction runs
 //! in the background.
 
-use lsm_rust::{Compression, SharedStorage, Storage, StorageConfig};
+use lsm_rust::{Compression, SharedStorage, Storage, StorageConfig, WalSync};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -24,7 +24,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
-fn config() -> StorageConfig {
+/// Builds the fixture: a small memtable so the fill produces several level-0
+/// tables for the compactor to merge.
+fn fill_config() -> StorageConfig {
     StorageConfig {
         memtable_size_threshold: 256 * 1024,
         compaction_size_threshold: 64 * 1024 * 1024,
@@ -37,11 +39,41 @@ fn config() -> StorageConfig {
     }
 }
 
+/// Opens the same fixture for measurement, with everything that is not lock
+/// contention taken out of the write path.
+///
+/// The thresholds are per-handle rather than stored in the data directory, so
+/// the tables the fill produced are still there to compact.
+///
+/// Two things had to go, and leaving either in measures the wrong thing:
+///
+///   - `WalSync::Always` fsyncs every write. On a contended runner one fsync
+///     can take hundreds of milliseconds, which has nothing to do with who
+///     holds the lock. An earlier version of this test failed CI at a 255 ms
+///     "stall" for exactly that reason.
+///   - A small memtable makes the writer thread trigger its own flush, which
+///     writes an SSTable under the write lock. That is a stall the writer
+///     inflicts on itself, not one compaction inflicts on it.
+///
+/// Neither is affected by the change under test, so both are noise here. What
+/// remains is the question the test is asking: while a merge runs, can a
+/// writer take the lock?
+fn measure_config() -> StorageConfig {
+    StorageConfig {
+        // Large enough that the writer never flushes during the measurement.
+        memtable_size_threshold: 256 * 1024 * 1024,
+        wal_sync: WalSync::Batched {
+            every_n_writes: usize::MAX,
+        },
+        ..fill_config()
+    }
+}
+
 /// Fill a store with overlapping key ranges across several flushes, so the
 /// planner merges rather than promoting. A promotion only relinks files and
 /// would not hold the lock long enough to measure.
 fn fill(dir: &Path) {
-    let mut db = Storage::with_config(dir, config()).unwrap();
+    let mut db = Storage::with_config(dir, fill_config()).unwrap();
     for round in 0..8 {
         for i in 0..2000 {
             db.put(
@@ -59,7 +91,7 @@ fn a_background_compaction_does_not_stall_writes() {
     let baseline = {
         let temp = TempDir::new().unwrap();
         fill(temp.path());
-        let mut db = Storage::with_config(temp.path(), config()).unwrap();
+        let mut db = Storage::with_config(temp.path(), measure_config()).unwrap();
         let started = Instant::now();
         db.compact_now().unwrap();
         started.elapsed()
@@ -73,7 +105,7 @@ fn a_background_compaction_does_not_stall_writes() {
     // the store.
     let temp = TempDir::new().unwrap();
     fill(temp.path());
-    let db = SharedStorage::with_config(temp.path(), config()).unwrap();
+    let db = SharedStorage::with_config(temp.path(), measure_config()).unwrap();
     let before = db.stats().unwrap().compactions_total;
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -117,7 +149,10 @@ fn a_background_compaction_does_not_stall_writes() {
 
     // Holding the lock across the merge would put `worst` at or above the
     // baseline. Released, the longest a write can wait is the manifest commit.
-    let bound = baseline / 4;
+    // Half the synchronous cost. Holding the lock puts the stall at or above
+    // the full cost, so this separates the two decisively while leaving room
+    // for a runner that preempts the writer at an unlucky moment.
+    let bound = baseline / 2;
     eprintln!(
         "compaction {baseline:?} synchronous; worst write stall {worst:?} \
          over {writes} writes (bound {bound:?})"
