@@ -42,11 +42,11 @@ flowchart TB
 - **Storage** is the engine: it owns the WAL, the active MemTable, the leveled
   SSTables, the manifest, the snapshot registry, and the block cache, and it
   coordinates the write, read, flush, and compaction paths.
-- **SharedStorage** wraps `Storage` in an `Arc<RwLock<…>>` for concurrent use:
+- **SharedStorage** wraps `Storage` in an `Arc<RwLock<Storage>>` for concurrent use:
   reads take a shared lock and run in parallel; writes take the exclusive lock
   and serialize.
 - **RespServer** and **MetricsServer** are optional network front ends over a
-  `SharedStorage` — the Redis-protocol endpoint and the Prometheus scrape
+  `SharedStorage`: the Redis-protocol endpoint and the Prometheus scrape
   endpoint respectively.
 
 ## Write path
@@ -98,7 +98,7 @@ them.
 
 ### Streaming scans
 
-A range scan merges every source — the memtable and one cursor per SSTable —
+A range scan merges every source (the memtable and one cursor per SSTable)
 through a binary heap ordered by `(key ascending, seq descending)`. All
 versions of a key therefore arrive contiguously, newest first, so the merge
 takes the first version visible to the scan's snapshot and skips the rest; a
@@ -108,7 +108,7 @@ Each SSTable cursor walks the sparse index and reads **one data block at a
 time** as the scan advances, so memory is proportional to the number of
 sources rather than to the size of the range. `scan_iter` exposes this
 directly; `scan` is a convenience wrapper that collects it into a `Vec`.
-Because blocks are read lazily, each item is a `Result` — a checksum failure
+Because blocks are read lazily, each item is a `Result`, because a checksum failure
 part-way through a scan surfaces as an error item rather than as a panic or as
 silently truncated output.
 
@@ -126,7 +126,7 @@ The saving is not symmetric, which is worth knowing:
   a cursor and a heap slot.
 - A table lying **below** the range was not. The index seek lands on its last
   block, and the cursor reads and parses that block only to discard every entry
-  as smaller than `start`. Skipping saves that read outright — and the range
+  as smaller than `start`. Skipping saves that read outright, and the range
   needed to skip it is derived from that very block, so once memoised the check
   costs nothing at all.
 
@@ -136,7 +136,7 @@ a scan of recent data sits above a long tail of older tables.
 A table whose range cannot be determined is never skipped: uncertainty costs
 work, never correctness. That is also why the range of a legacy (pre-versioned)
 file is computed as a true minimum and maximum rather than its first and last
-entry — nothing guarantees such a file is ordered, which is why point lookups
+entry, since nothing guarantees such a file is ordered, which is why point lookups
 read them with `sorted: false` as well. `lsm_scan_tables_pruned_total` counts
 the tables skipped this way.
 
@@ -146,8 +146,8 @@ Every version is tagged with its sequence number, and a read carries a
 *snapshot sequence*: it returns, for each key, the newest version whose
 sequence is at or below the snapshot. A `Snapshot` captures the current
 sequence; `snapshot_at(seq)` captures an arbitrary historical one. Correctness
-rests on an LSM invariant — for a given key, a higher sequence always lives in
-a newer (shallower) table — so a newest-to-oldest scan can stop at the first
+rests on an LSM invariant (for a given key, a higher sequence always lives in
+a newer, shallower table) so a newest-to-oldest scan can stop at the first
 version the snapshot can see.
 
 Holding a snapshot registers its sequence in the **SnapshotRegistry**, which
@@ -192,12 +192,12 @@ every entry newer than its snapshot:
 
 | Check | `Snapshot` | `Serializable` |
 | --- | --- | --- |
-| Write-write — someone wrote a key we wrote | ✓ | ✓ |
-| Read-write — someone wrote a key we read | | ✓ |
-| Phantom — someone wrote a key inside a range we scanned | | ✓ |
+| Write-write: someone wrote a key we wrote | ✓ | ✓ |
+| Read-write: someone wrote a key we read | | ✓ |
+| Phantom: someone wrote a key inside a range we scanned | | ✓ |
 
 Every write path feeds the commit log, including plain `put`, `delete` and
-`write_batch` — a transaction must conflict with concurrent non-transactional
+`write_batch`, because a transaction must conflict with concurrent non-transactional
 writes exactly as it does with transactional ones.
 
 The log is bounded, not unbounded history: entries at or below the oldest live
@@ -208,7 +208,7 @@ couple of entries are retained.
 ### Guarantees and limits
 
 - A committed transaction applies its whole write set at a single sequence
-  number, in one WAL record — atomic in both visibility and durability.
+  number, in one WAL record: atomic in both visibility and durability.
 - An aborted or dropped transaction has no effect at all.
 - `Serializable` (the default) rules out write skew and phantoms in scanned
   ranges. `Snapshot` is cheaper and aborts less, but permits both.
@@ -248,7 +248,7 @@ and rewriting every byte produces the same entries in a different file. This is
 not a corner case: it is the steady state for append-only and time-ordered keys,
 where each flush covers a range strictly above the last.
 
-The signal is the **maximum overlap depth** — the largest number of tables whose
+The signal is the **maximum overlap depth**, the largest number of tables whose
 key ranges cover any single point. Depth 1 means mutually disjoint. It is
 computed by sweeping the range endpoints, using each table's `key_range()`,
 whose minimum is free from the in-memory sparse index and whose maximum costs
@@ -265,12 +265,12 @@ flowchart TB
 Promotion requires all three of:
 
 - **No overlap**, so nothing can be collapsed.
-- **More than one table.** A lone table merged with itself is not busywork —
+- **More than one table.** A lone table merged with itself is not busywork:
   that is where several versions of a key collapse and where tombstones are
   finally dropped. Promotion would skip both, so this case is left alone.
 - **Room at the destination** (`MAX_TABLES_PER_LEVEL`, 16). Promoted tables are
   disjoint, so a lookup is filtered by their Bloom filters rather than reading
-  them — but it still *checks* every filter in the level. Without a ceiling an
+  them, but it still *checks* every filter in the level. Without a ceiling an
   append-only workload would promote for ever and grow that per-lookup cost
   without bound.
 
@@ -281,7 +281,7 @@ only ever cause more merging, never less.
 **Promotion preserves read order.** Reads walk a level's tables in reverse, so
 the last pushed is consulted first. Promoted tables come from a shallower level
 and are therefore the newer versions, so they are *appended* to the destination
-— exactly where a merge output would go. Getting this backwards returns stale
+which is exactly where a merge output would go. Getting this backwards returns stale
 data for keys the destination already held, which is what
 `promotion_into_a_populated_level_keeps_the_newest_version` exists to catch.
 
@@ -295,7 +295,7 @@ because a store that loses its manifest falls back to reading levels out of
 filenames.
 
 The trade-off is honest: promotion defers the version collapsing and tombstone
-dropping a merge would have done. Deferred, not skipped — the data still meets
+dropping a merge would have done. Deferred, not skipped: the data still meets
 overlapping tables eventually, and the destination ceiling bounds how long that
 can take. `lsm_compaction_moves_total` reports how many compaction runs were
 promotions, as a subset of `lsm_compactions_total`.
@@ -334,7 +334,7 @@ key's versions are never split across blocks, so a snapshot lookup reads a
 single block and returns the newest version at or below its sequence. The
 `flags` byte records per-block compression (e.g. LZ4).
 
-A block's checksum covers the bytes **as stored** — after compression — so
+A block's checksum covers the bytes **as stored**, after compression, so
 corruption is caught before the decompressor is handed the data. Section
 checksums are verified while opening the table, so a damaged index or bloom
 filter fails loudly at open instead of silently mis-routing later lookups.
@@ -344,7 +344,7 @@ filter fails loudly at open instead of silently mis-routing later lookups.
 ```text
 record: [3][crc32 u32][body_len u32][body]
 
-body — one of:
+body, one of:
   entry:  [op u8][key_len u32][key][value_len u32][value]
   batch:  [2][count u32] followed by `count` entries
 ```
@@ -355,7 +355,7 @@ write batch is a body introduced by marker `2`, recovered whole or not at all.
 Every record written is wrapped in the checksummed frame (marker `3`); the
 older unframed markers are still replayed so a log written by an earlier build
 stays readable. Replay tolerates a truncated final record, and a *checksum*
-failure on the final record is treated the same way — a torn write is
+failure on the final record is treated the same way: a torn write is
 indistinguishable from truncation, so it is dropped and recovery continues. A
 checksum failure anywhere earlier in the log is real corruption of durable data
 and is reported as an error.
@@ -371,7 +371,7 @@ sequence checkpoint remain meaningful across restarts for time-travel reads.
 
 ## Expiry (TTL)
 
-A version may carry an absolute deadline — Unix milliseconds, not a countdown —
+A version may carry an absolute deadline (Unix milliseconds, not a countdown)
 resolved when the write happens. It therefore survives a restart without being
 refreshed and does not reset when the store reopens.
 
@@ -392,7 +392,7 @@ flowchart TB
     R["read k"] --> N["newest version ≤ snapshot"]
     N --> Q{"kind?"}
     Q -->|"value, no deadline"| V["return it"]
-    Q -->|"value, deadline passed"| A["absent — and stop:<br/>older versions stay hidden"]
+    Q -->|"value, deadline passed"| A["absent, and stop:<br/>older versions stay hidden"]
     Q -->|tombstone| A
     A -.->|"never"| O["older version of k"]
 ```
@@ -404,21 +404,21 @@ before.
 
 **Compaction is where expired data is actually reclaimed.** Until then it is
 only hidden. A merge rewrites an expired version as a tombstone rather than
-dropping it — dropping would uncover the older version and bring back a value
-the deadline retired — and the ordinary tombstone rules then decide when it is
+dropping it: dropping would uncover the older version and bring back a value
+the deadline retired. The ordinary tombstone rules then decide when it is
 safe to drop outright. `lsm_expired_total` counts versions collected this way.
 
 That interacts with the promotion path above, and the interaction is not
 optional. A promotion never reads the data, so it can collect nothing; and an
-append-only, time-ordered workload — precisely the shape that promotes most
-eagerly — is also the one most likely to use TTLs. A level holding anything
+append-only, time-ordered workload, precisely the shape that promotes most
+eagerly, is also the one most likely to use TTLs. A level holding anything
 past its deadline is therefore merged rather than promoted, which the header's
 `min_expiry` makes free to detect.
 
 The RESP server exposes this as `SET key value EX seconds | PX milliseconds`
 and `TTL key`, the latter following Redis's convention: `-2` for no such key,
 `-1` for a key with no deadline, otherwise the whole seconds remaining. A
-malformed expiry option is an error rather than a silently ignored argument —
+malformed expiry option is an error rather than a silently ignored argument:
 a client that asked for a deadline must never be told `OK` for a key that
 would live for ever.
 
@@ -450,13 +450,13 @@ Two properties matter more than the variants themselves.
 the read path becomes `Corruption`, never a `None` result and never plausible
 bytes. The one deliberate exception is a WAL frame whose checksum fails *at the
 tail of the file*: that is a torn write from a crash mid-append, indistinguishable
-from a truncated tail, so it is dropped during replay rather than reported —
+from a truncated tail, so it is dropped during replay rather than reported:
 the same treatment a short final record gets. A bad checksum anywhere earlier
 is real corruption of durable data and is returned as an error.
 
 **Conflicts are the only retriable failure.** `Error::is_retriable()` is true
 for `Conflict` alone, because a losing transaction is rolled back before
-anything is written — replaying it against a fresh snapshot is safe. Nothing
+anything is written, so replaying it against a fresh snapshot is safe. Nothing
 else fixes itself on a retry, which is what lets `SharedStorage::transaction`
 loop on `is_retriable()` without risking a write being applied twice.
 
@@ -487,7 +487,7 @@ since parsing a socket is pure I/O; their public `spawn` entry points return
 
 Crash recovery and backup are different problems, and the sections above only
 cover the first. A process that dies is handled by the WAL and the manifest
-commit point; neither helps when the data itself is destroyed — a deleted
+commit point; neither helps when the data itself is destroyed: a deleted
 directory, a failed disk, a bad deploy. Checksums do not close that gap
 either: a CRC-32 *detects* a rotted block and turns it into `Corruption`
 instead of plausible data, but it cannot reconstruct the bytes.
@@ -534,14 +534,14 @@ written at each flush, and the WAL carries the writes made since, so recovery
 rebuilds the current sequence as `manifest.last_seq + replayed records`. A
 checkpoint that stamped the live counter into its manifest *and* copied that
 WAL would count those writes twice, restoring a store whose sequence had run
-ahead of its data — reads would return the right values, but every time-travel
+ahead of its data. Reads would return the right values, but every time-travel
 coordinate would be off by the number of unflushed writes. Copying the
 persisted sequence keeps the invariant, which is why a restored checkpoint's
 `current_sequence()` equals the `CheckpointInfo::sequence` it reported.
 
 **Restoring is just opening it.** A checkpoint directory satisfies every
 invariant a data directory has, so `Storage::new` reads it back with no
-special path — and therefore no separate restore path to drift out of sync.
+special path, and therefore no separate restore path to drift out of sync.
 
 **Cost over time.** A checkpoint starts at roughly the size of its manifest
 plus the WAL. It grows only as compaction rewrites the tables it linked: an
@@ -549,7 +549,7 @@ unlink that would have freed extents merely decrements a link count while the
 checkpoint holds one. So the steady-state cost is the volume compaction has
 rewritten since the checkpoint was taken, and deleting the directory reclaims
 all of it. This is the same lazy pinning a long-held `Snapshot` applies to
-logical versions, one level down — physical files rather than MVCC versions.
+logical versions, one level down: physical files rather than MVCC versions.
 
 There is deliberately no "bytes currently pinned" gauge. The bytes that matter
 are in files the engine has already unlinked and forgotten, so it cannot

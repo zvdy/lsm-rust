@@ -15,7 +15,7 @@ crates.io yet.
 - **Scans skip tables they cannot match.** A scan opened a cursor over every
   SSTable in the store; it now compares each table's first and last key against
   the requested range and skips those that cannot intersect it, saving a cursor,
-  a heap slot and — for a table lying entirely below the scan — a block read
+  a heap slot and, for a table lying entirely below the scan, a block read
   that returned only keys the merge discarded. The check is exact rather than
   estimated, and a table whose range is unknown is never skipped. New
   `lsm_scan_tables_pruned_total` metric.
@@ -24,8 +24,8 @@ crates.io yet.
   `expiry()` reports it, distinguishing "no such key", "no deadline" and "expires
   at". Deadlines are absolute Unix milliseconds resolved at write time, so they
   survive restarts without being refreshed. An expired version keeps *shadowing*
-  older versions of the same key rather than vanishing — compaction rewrites it
-  as a tombstone, so expiry can never uncover the value it replaced — and the
+  older versions of the same key rather than vanishing. Compaction rewrites it
+  as a tombstone, so expiry can never uncover the value it replaced, and the
   usual tombstone rules then reclaim it. RESP gains `SET key value EX|PX n` and
   `TTL key` with Redis's `-2`/`-1`/seconds convention. New `lsm_expired_total`
   metric. A snapshot isolates a reader from writes but not from the clock: a key
@@ -46,12 +46,12 @@ crates.io yet.
   under the exclusive lock, so the captured tables, write-ahead log and
   manifest are all from the same instant. SSTables are hard-linked (immutable,
   so sharing the inode is safe and nearly free); the WAL is copied, since it is
-  still being appended to. A checkpoint directory is itself a data directory —
+  still being appended to. A checkpoint directory is itself a data directory:
   restore by opening it. `CheckpointInfo` reports what was captured and how
   much disk was genuinely duplicated. New `lsm_checkpoints_total` metric.
 - **A unified error type.** Every fallible call now returns
   `lsm_rust::Result<T>`, whose `Error` separates `Corruption`, `Conflict`,
-  `InvalidArgument` and `Io` — so a caller can tell a losing transaction from a
+  `InvalidArgument` and `Io`, so a caller can tell a losing transaction from a
   damaged file without matching on error strings. `Error::is_retriable()` and
   `Error::is_corruption()` classify a failure without a `match`.
 - **Concurrent transactions.** Optimistic `begin`/`commit`/`rollback` with
@@ -71,7 +71,7 @@ crates.io yet.
   operation counters and live gauges; `lsm-rust serve --metrics-addr` exposes
   them at `/metrics` in the text exposition format.
 - **Atomic write batches.** `WriteBatch` commits multiple puts and deletes at a
-  single sequence number and as one framed WAL record — visible and durable
+  single sequence number and as one framed WAL record: visible and durable
   all-or-nothing.
 - **MVCC snapshot isolation.** Every write is sequence-numbered; a `Snapshot`
   reads a consistent view unaffected by later writes, flushes, or compactions,
@@ -104,7 +104,7 @@ crates.io yet.
 ### Changed
 
 - **Breaking:** the public API returns `lsm_rust::Result<T>` instead of
-  `std::io::Result<T>`, and `TransactionError` is gone — its `Conflict` variant
+  `std::io::Result<T>`, and `TransactionError` is gone; its `Conflict` variant
   is now `Error::Conflict` and its `Io` variant is now `Error::Io`.
   `Error` converts to and from `std::io::Error` (`Corruption` maps to
   `InvalidData`, `Conflict` to `WouldBlock`, `InvalidArgument` to
@@ -119,7 +119,7 @@ crates.io yet.
   same size they were. The write-ahead log gained a matching record type for a
   put that carries a deadline, and older logs still replay.
 - Compaction now merges rather than promotes a level holding expired versions.
-  Promotion never reads the data, so it can reclaim nothing — without this an
+  Promotion never reads the data, so it can reclaim nothing. Without this an
   append-only workload with TTLs, which is exactly the shape that promotes most
   eagerly, would keep expired data indefinitely.
 - WAL records are now written in a checksummed frame; older unframed records
@@ -130,7 +130,7 @@ crates.io yet.
 - **The metrics endpoint had the same unbounded-read bug as the RESP server.**
   Its `MAX_REQUEST_BYTES` was checked *after* each line was read, so any single
   header could exceed it by any margin before the check ran, and the request
-  line itself was never checked at all — a 4 MiB header was buffered in full
+  line itself was never checked at all: a 4 MiB header was buffered in full
   and still answered `200 OK`, and a request line with no newline buffered
   indefinitely, which is exactly the case its comment claimed to defend
   against. Both front ends now share one bounded line reader, so the two
@@ -140,7 +140,7 @@ crates.io yet.
 - **The memtable's tracked size no longer drifts towards zero.** Replacing the
   same `(key, seq)` subtracted the old value's bytes without adding the new
   value's. Every op in a write batch commits at one sequence number, so a batch
-  that writes one key twice — a documented, supported usage — hit this path: in
+  that writes one key twice (a documented, supported usage) hit this path: in
   a reproduction, 200 KiB of live data reported **50 bytes** and triggered
   **zero flushes** against an 8 KiB threshold. Since that threshold is the
   memtable's memory bound, it could grow without limit, and
@@ -148,7 +148,7 @@ crates.io yet.
   read back correctly.
 - **The RESP server no longer buffers an unbounded protocol line.** The
   declared-size limits bound what a client may ask for, but they are read from
-  a line that has to be buffered first, and that had no bound of its own — a
+  a line that has to be buffered first, and that had no bound of its own. A
   client that never sent a newline grew the buffer without limit, and no
   command was ever dispatched for anything else to reject. An unrecognised
   command then echoed its whole name back in the error, so oversized input
@@ -160,7 +160,7 @@ crates.io yet.
   connection simply resetting.
 - The wall-clock TTL tests no longer race the write they are timing. They
   asserted a key was still present within 80 ms of a `put_with_ttl`, but every
-  put fsyncs, and on a slow CI runner that can outlast the deadline — the key
+  put fsyncs, and on a slow CI runner that can outlast the deadline, so the key
   was correctly hidden and the test failed. Presence is now checked against a
   deadline nothing can outrun, and expiry against one already past, so neither
   direction depends on how fast the machine is.

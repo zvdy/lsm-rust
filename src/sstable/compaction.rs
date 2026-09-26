@@ -24,6 +24,7 @@ pub enum CompactionPlan {
 }
 
 /// Decides when a level needs compaction and merges its SSTables.
+#[derive(Clone)]
 pub struct CompactionManager {
     level_multiplier: u32,
     size_threshold: usize,
