@@ -30,8 +30,8 @@ design discussions) are considered accepted if no maintainer objects within a
 reasonable review period. When consensus cannot be reached, a simple majority
 vote of maintainers decides; the lead maintainer breaks ties.
 
-Significant changes — on-disk format changes, public API breaks, new
-dependencies — should be proposed in an issue before implementation so the
+Significant changes (on-disk format changes, public API breaks, new
+dependencies) should be proposed in an issue before implementation so the
 discussion is recorded.
 
 ## Adding Maintainers

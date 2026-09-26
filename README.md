@@ -318,6 +318,40 @@ sizes — readable in process via `Storage::stats()` too.
 
 ![lsm-rust Prometheus metrics endpoint](docs/images/prometheus-metrics-endpoint.png)
 
+## Limitations
+
+What this engine does not do, so you can tell whether it fits before you
+depend on it.
+
+- **One writer at a time.** `SharedStorage` is an `RwLock`: reads run
+  concurrently, writes serialize across the whole store. There is no sharding
+  or per-key locking.
+- **Compaction buffers its output.** The merge itself streams, reading one
+  block per input table, but the bloom filter and sparse index are written
+  ahead of the data, so the output table is held in memory until it can be
+  written. Peak memory during a compaction is roughly 1.4x the size of the
+  level being merged. Keep a level comfortably smaller than available RAM.
+- **Compaction no longer blocks the store, but the commit does.** The merge
+  runs with the store unlocked; installing the result takes the write lock for
+  the length of one manifest write. Expect a short pause, not a stall
+  proportional to the data.
+- **`WalSync::Batched` trades durability for throughput.** The default,
+  `WalSync::Always`, fsyncs every write. Under `Batched { every_n_writes }` a
+  crash can lose up to `every_n_writes - 1` acknowledged writes. That is the
+  point of the setting, but it is a real loss of the guarantee the default
+  gives you.
+- **Single node.** No replication, no failover, no clustering. `checkpoint()`
+  is the backup primitive; getting a copy off the machine is your job.
+- **The on-disk format is still moving.** It has reached v5 and older versions
+  are still read, but nothing is frozen and `0.1.0` has not been published.
+  Treat the format as unstable until it is.
+- **Key and value size.** Both are length-prefixed with four bytes, so a key
+  may not exceed `MAX_KEY_LEN` and a value `MAX_VALUE_LEN` (both exported).
+  Oversized writes are rejected rather than truncated.
+- **Not yet proven under sustained load.** The test suite covers correctness,
+  crash recovery and corruption thoroughly, but there is no long-running soak
+  test and no published benchmark under concurrent production-shaped traffic.
+
 ## Configuration
 
 | `StorageConfig` field | Default | Meaning |
