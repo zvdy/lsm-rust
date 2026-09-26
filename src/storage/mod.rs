@@ -225,6 +225,59 @@ pub struct Storage {
     block_cache: Option<Arc<BlockCache>>,
     manifest: Manifest,
     config: StorageConfig,
+    /// Set while a compaction is running with the store unlocked.
+    ///
+    /// The background compactor releases the write lock for the expensive
+    /// part of a compaction (see [`Storage::plan_detached_compaction`]), so
+    /// writes can land while it runs. This keeps a second compaction from
+    /// starting underneath it and pulling the input tables away mid-merge.
+    compacting_detached: bool,
+}
+
+/// A merge chosen under the write lock and run without it.
+///
+/// It owns everything the merge needs, deliberately borrowing nothing from
+/// [`Storage`]: that is what lets the store be unlocked while the merge reads
+/// and writes. Its inputs are SSTables, which are immutable once written, so
+/// reading them outside the lock is safe. The paths are reopened rather than
+/// carried as handles, so the job stays independent of the store's own view of
+/// them.
+pub(crate) struct CompactionJob {
+    /// The level being merged; output lands one below.
+    level: usize,
+    /// The exact tables this merge consumes, fixed when it was planned.
+    inputs: Vec<PathBuf>,
+    /// Its name reserves a sequence number under the lock, so no flush can
+    /// claim the same filename while the merge runs.
+    output: PathBuf,
+    drop_tombstones: bool,
+    gc_floor: Seq,
+    now: Expiry,
+    compression: Compression,
+    cache: Option<Arc<BlockCache>>,
+    manager: CompactionManager,
+}
+
+impl CompactionJob {
+    /// Merge the inputs and write the output, with the store unlocked.
+    ///
+    /// Returns the finished table and the number of expired versions
+    /// collected. Nothing here touches the store, so reads and writes run
+    /// normally throughout.
+    pub(crate) fn execute(&self) -> crate::Result<(SSTable, u64)> {
+        let mut inputs = Vec::with_capacity(self.inputs.len());
+        for path in &self.inputs {
+            inputs.push(SSTable::with_cache(path.clone(), self.cache.clone())?);
+        }
+
+        let (entries, expired) =
+            self.manager
+                .compact(&inputs, self.drop_tombstones, self.gc_floor, self.now)?;
+
+        let mut table = SSTable::with_cache(self.output.clone(), self.cache.clone())?;
+        table.write_versioned(&entries, self.compression)?;
+        Ok((table, expired))
+    }
 }
 
 impl Storage {
@@ -401,6 +454,7 @@ impl Storage {
             block_cache,
             manifest,
             config,
+            compacting_detached: false,
         };
 
         // Give legacy directories a manifest so the next startup (and any
@@ -1114,6 +1168,10 @@ impl Storage {
     /// Run any pending compactions across all levels, regardless of the
     /// `inline_compaction` setting. Returns once every level is within its
     /// threshold.
+    ///
+    /// Does nothing while a background compactor is part way through a
+    /// detached merge, since that merge is reading the very tables this would
+    /// replace.
     pub fn compact_now(&mut self) -> crate::Result<()> {
         let mut level = 0;
         loop {
@@ -1215,7 +1273,144 @@ impl Storage {
         Ok(true)
     }
 
+    /// Choose a merge to run with the store unlocked, if one is due.
+    ///
+    /// This is the first of three phases. It runs under the write lock and
+    /// does no I/O beyond what is already in memory: it picks the level, fixes
+    /// the exact set of input tables, and reserves a name for the output. The
+    /// expensive part, [`CompactionJob::execute`], then runs with the lock
+    /// released, and [`Storage::commit_compaction`] takes the lock again only
+    /// to swap the result in.
+    ///
+    /// Only merges are detached. A promotion moves no data (it hard-links the
+    /// files and rewrites the manifest), so it is already as short as the
+    /// locked path can be and stays there.
+    ///
+    /// Returns `None` when nothing is due, or when a detached compaction is
+    /// already in flight.
+    pub(crate) fn plan_detached_compaction(&mut self) -> Option<CompactionJob> {
+        if self.compacting_detached {
+            return None;
+        }
+        let now = crate::version::now_ms();
+        let max_level = self.sstables.keys().max().copied().unwrap_or(0);
+        for level in 0..=max_level {
+            let Some(tables) = self.sstables.get(&level) else {
+                continue;
+            };
+            if tables.is_empty() || !self.compaction_manager.should_compact(level, tables) {
+                continue;
+            }
+            let destination_tables = self.sstables.get(&(level + 1)).map_or(0, |t| t.len());
+            if self
+                .compaction_manager
+                .plan(tables, destination_tables, now)
+                != CompactionPlan::Merge
+            {
+                continue; // a promotion: cheap enough to keep under the lock
+            }
+
+            // Tombstones may only be dropped when nothing at or below the
+            // output level could still hold an older value for the key.
+            let drop_tombstones = self
+                .sstables
+                .iter()
+                .all(|(l, tables)| *l <= level || tables.is_empty());
+            // Read now and used later, which is safe in one direction only:
+            // the floor rises as snapshots are released, so a stale value
+            // keeps versions a fresher one would have collected. Retaining too
+            // much is a wasted pass; retaining too little is data loss.
+            let gc_floor = self.snapshots.oldest().unwrap_or(Seq::MAX);
+
+            let output_seq = self.sstable_counter;
+            self.sstable_counter += 1;
+            self.compacting_detached = true;
+            Metrics::incr(&self.metrics.compactions);
+
+            return Some(CompactionJob {
+                level,
+                inputs: tables.iter().map(|t| t.get_path().clone()).collect(),
+                output: self
+                    .data_dir
+                    .join(format!("L{}_{}.sst", level + 1, output_seq)),
+                drop_tombstones,
+                gc_floor,
+                now,
+                compression: self.config.compression,
+                cache: self.block_cache.clone(),
+                manager: self.compaction_manager.clone(),
+            });
+        }
+        None
+    }
+
+    /// Install a finished detached compaction, or discard it.
+    ///
+    /// Returns `false` when the level moved underneath the merge, in which
+    /// case the output is deleted and nothing changes. Nothing else compacts
+    /// while a detached compaction is in flight, so in practice only a
+    /// memtable flush can add to level 0 meanwhile; the check is the guarantee
+    /// rather than the expectation.
+    pub(crate) fn commit_compaction(
+        &mut self,
+        job: &CompactionJob,
+        table: SSTable,
+        expired: u64,
+    ) -> crate::Result<bool> {
+        self.compacting_detached = false;
+
+        let level_tables = self.sstables.entry(job.level).or_default();
+        let still_present = job
+            .inputs
+            .iter()
+            .all(|path| level_tables.iter().any(|t| t.get_path() == path));
+        if !still_present {
+            drop(table);
+            let _ = fs::remove_file(&job.output);
+            return Ok(false);
+        }
+
+        // Remove exactly the inputs rather than clearing the level: with the
+        // lock released, a flush may have added a table that was never part of
+        // this merge.
+        level_tables.retain(|t| !job.inputs.contains(t.get_path()));
+
+        // The output carries the highest sequence of anything at its level, so
+        // appending keeps the level ordered oldest to newest, which is what
+        // reads and later merges rely on.
+        self.sstables.entry(job.level + 1).or_default().push(table);
+        self.metrics
+            .expired
+            .fetch_add(expired, std::sync::atomic::Ordering::Relaxed);
+
+        // The manifest rename is the commit point, exactly as on the locked
+        // path: crash before it and the output is an orphan, crash after it
+        // and the inputs are.
+        self.persist_manifest()?;
+
+        for path in &job.inputs {
+            fs::remove_file(path)?;
+            if let Some(cache) = &self.block_cache {
+                cache.purge_file(path);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Give up on a planned compaction whose merge failed, leaving the store
+    /// exactly as it was.
+    pub(crate) fn abandon_compaction(&mut self, job: &CompactionJob) {
+        self.compacting_detached = false;
+        let _ = fs::remove_file(&job.output);
+    }
+
     fn maybe_compact(&mut self, level: usize) -> crate::Result<()> {
+        // A detached compaction is reading these tables with the store
+        // unlocked. Starting another one here would delete the files it is
+        // part way through merging.
+        if self.compacting_detached {
+            return Ok(());
+        }
         let Some(tables) = self.sstables.get(&level) else {
             return Ok(());
         };

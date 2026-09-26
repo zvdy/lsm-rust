@@ -313,6 +313,10 @@ impl SharedStorage {
     }
 
     /// Run any pending compactions now, under the write lock.
+    /// While a background compactor is part way through a merge, this does
+    /// nothing: that merge is reading tables with the store unlocked, and
+    /// compacting them again here would delete the files underneath it. Call
+    /// it again once the compactor is idle, or rely on the compactor itself.
     pub fn compact_now(&self) -> crate::Result<()> {
         self.inner.write().map_err(|_| poisoned())?.compact_now()
     }
@@ -376,15 +380,66 @@ fn compactor_loop(
             return;
         }
 
-        // The store has been dropped: nothing left to compact
-        let Some(inner) = storage.upgrade() else {
-            return;
-        };
+        // Keep going while there is work: one call compacts at most one
+        // level, and a merge into level N+1 can leave that level due too.
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            // The store has been dropped: nothing left to compact
+            let Some(inner) = storage.upgrade() else {
+                return;
+            };
+            match compact_detached(&inner) {
+                Ok(true) => continue,
+                Ok(false) => break,
+                Err(_) => {
+                    errors.fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Run one compaction, holding the write lock only to choose it and to
+/// install the result.
+///
+/// The merge itself is the expensive part, and it happens between the two
+/// locked sections rather than inside one: reads and writes proceed against
+/// the store while it runs. This is only sound because SSTables are immutable
+/// once written, so the merge's inputs cannot change underneath it, and
+/// because nothing else starts a compaction while one is detached.
+///
+/// Returns whether anything was compacted.
+fn compact_detached(inner: &Arc<RwLock<Storage>>) -> crate::Result<bool> {
+    // Phase 1, locked: choose the work. No I/O.
+    let job = {
         let Ok(mut storage) = inner.write() else {
-            return; // poisoned by a panicked writer
+            return Err(poisoned());
         };
-        if storage.compact_now().is_err() {
-            errors.fetch_add(1, Ordering::Relaxed);
+        match storage.plan_detached_compaction() {
+            Some(job) => job,
+            // Nothing due as a detached merge. A promotion may still be
+            // waiting, and that path is cheap enough to run under the lock.
+            None => return storage.compact_now().map(|()| false),
+        }
+    };
+
+    // Phase 2, unlocked: the merge and the write.
+    let merged = job.execute();
+
+    // Phase 3, locked: install it, or put the store back as it was.
+    let Ok(mut storage) = inner.write() else {
+        return Err(poisoned());
+    };
+    match merged {
+        Ok((table, expired)) => storage
+            .commit_compaction(&job, table, expired)
+            .map(|_| true),
+        Err(e) => {
+            storage.abandon_compaction(&job);
+            Err(e)
         }
     }
 }
