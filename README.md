@@ -84,7 +84,17 @@ Writes hit the WAL and the in-memory MemTable, which flushes to immutable
 Level 0 SSTables; compaction merges levels downward. Reads consult the
 MemTable, then SSTables newest-to-oldest, skipping tables via Bloom filters.
 For the full write/read/compaction walk-throughs, on-disk formats, and the
-MVCC/GC model, see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
+MVCC/GC model, see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**. For the
+on-disk formats and guarantees stated as a specification, see
+**[docs/RFC-0001-lsm-rust.md](docs/RFC-0001-lsm-rust.md)**.
+
+The design follows the thesis of O'Neil, Cheng, Gawlick and O'Neil,
+[*The Log-Structured Merge-Tree*](https://www.cs.umb.edu/~poneil/lsmtree.pdf)
+(Acta Informatica, 1996): defer and batch index changes, and cascade them from
+a memory-resident component through geometrically larger disk-resident ones.
+The realisation here is the later SSTable one, with Bloom filters, a block
+cache and discrete compaction rather than that paper's rolling merge. Section
+12 of the specification sets out exactly where the two part company.
 
 ## Quick start
 
@@ -431,6 +441,8 @@ Contributions of all kinds are welcome. Please read:
 - [CONTRIBUTING.md](CONTRIBUTING.md): development setup, PR process, releases
 - [CHANGELOG.md](CHANGELOG.md): what changed in each version
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): how the engine works
+- [docs/RFC-0001-lsm-rust.md](docs/RFC-0001-lsm-rust.md): the formats and
+  guarantees as a specification, precise enough to reimplement against
 - [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md), [SECURITY.md](SECURITY.md),
   [GOVERNANCE.md](GOVERNANCE.md) and [MAINTAINERS.md](MAINTAINERS.md)
 
