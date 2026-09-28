@@ -1,7 +1,7 @@
 # RFC 0001: The lsm-rust Storage Engine
 
 ```
-Project: lsm-rust                                                  zvdy
+Project: lsm-rust                                            C. R. Bulzan
 Request for Comments: 0001                                  Category: Informational
                                                             September 2026
 ```
@@ -703,6 +703,8 @@ protocol and registers nothing.
 - **[ONEIL96]** O'Neil, P., Cheng, E., Gawlick, D., and E. O'Neil, "The
   Log-Structured Merge-Tree (LSM-Tree)", Acta Informatica 33, 1996.
   https://www.cs.umb.edu/~poneil/lsmtree.pdf
+  Authors and title were read from that document, whose title page reads
+  "To be published: Acta Informatica"; it is the preprint.
 - **[BIGTABLE]** Chang, F., et al., "Bigtable: A Distributed Storage System
   for Structured Data", OSDI, 2006.
 - **[RFC7322]** Flanagan, H. and S. Ginoza, "RFC Style Guide", RFC 7322,
@@ -715,7 +717,7 @@ protocol and registers nothing.
 ## Author's Address
 
 ```
-zvdy
+Cristian Razvan Bulzan (zvdy)
 https://github.com/zvdy
 Project: https://github.com/zvdy/lsm-rust
 ```
