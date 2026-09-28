@@ -1,7 +1,7 @@
 # RFC 0001: The lsm-rust Storage Engine
 
 ```
-Project: lsm-rust                                              Z. Vidal
+Project: lsm-rust                                                  zvdy
 Request for Comments: 0001                                  Category: Informational
                                                             September 2026
 ```
@@ -715,6 +715,7 @@ protocol and registers nothing.
 ## Author's Address
 
 ```
-Z. Vidal
-https://github.com/zvdy/lsm-rust
+zvdy
+https://github.com/zvdy
+Project: https://github.com/zvdy/lsm-rust
 ```
