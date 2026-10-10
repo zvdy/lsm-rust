@@ -1,0 +1,79 @@
+# lsm-rust is an embedded, single-writer engine: one process owns the data
+# directory. The chart therefore runs exactly one replica (a StatefulSet with a
+# PersistentVolumeClaim); scaling out means sharding at the application layer.
+
+image:
+  repository: ghcr.io/zvdy/lsm-rust
+  # Pin to an immutable tag or digest in production.
+  tag: ""            # defaults to .Chart.AppVersion
+  digest: ""         # sha256:... takes precedence over tag
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+auth:
+  # Name of an existing Secret holding the AUTH password under `password`.
+  # On EKS, sync it from AWS Secrets Manager with External Secrets Operator or
+  # the Secrets Store CSI driver; leaving this empty generates one in-cluster.
+  existingSecret: ""
+  # Set false only if the network layer alone restricts access.
+  enabled: true
+
+server:
+  maxConnections: 1024
+  idleTimeoutSeconds: 300
+
+persistence:
+  size: 20Gi
+  # "gp3" is the recommended EKS class (EBS CSI driver). Empty = cluster default.
+  storageClass: gp3
+  accessModes: [ReadWriteOnce]
+  # Retain the volume when the StatefulSet is deleted or scaled down.
+  retentionPolicy: Retain
+
+service:
+  type: ClusterIP
+  port: 6379
+  annotations: {}
+  # Internal NLB example:
+  #   type: LoadBalancer
+  #   annotations:
+  #     service.beta.kubernetes.io/aws-load-balancer-type: external
+  #     service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+  #     service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+
+metrics:
+  port: 9898
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    labels: {}
+
+resources:
+  requests: { cpu: 250m, memory: 512Mi }
+  limits: { memory: 1Gi }
+
+networkPolicy:
+  enabled: true
+  # Pods matching these selectors may reach the RESP port. Empty = same
+  # namespace only.
+  allowedClientLabels: {}
+  # Namespaces allowed to scrape /metrics (by kubernetes.io/metadata.name).
+  metricsNamespaces: [monitoring]
+
+podDisruptionBudget:
+  enabled: false   # a single replica: a PDB of minAvailable=1 would block node drains
+
+serviceAccount:
+  create: true
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+terminationGracePeriodSeconds: 60

@@ -22,7 +22,7 @@ pub use metrics::MetricsServer;
 use crate::storage::SharedStorage;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -64,6 +64,56 @@ pub(super) const MAX_LINE_LEN: usize = 64 * 1024;
 /// Echoing it whole turns any oversized input into an equally oversized reply.
 const MAX_ECHOED_NAME: usize = 64;
 
+/// Operational limits and credentials for a [`RespServer`].
+///
+/// The defaults match [`RespServer::spawn`]: no password, no idle timeout and
+/// no connection cap, which is right for a loopback listener in tests. A server
+/// that is reachable by anything else should set all three.
+#[derive(Clone, Default)]
+pub struct RespConfig {
+    /// When set, every connection must `AUTH` with this password before any
+    /// other command (other than `QUIT`) is accepted.
+    pub password: Option<Vec<u8>>,
+    /// Maximum simultaneous client connections; `0` means unlimited.
+    pub max_connections: usize,
+    /// Drop a connection that sends nothing for this long. Without it a client
+    /// that connects and stalls holds a thread and a socket for ever.
+    pub idle_timeout: Option<Duration>,
+}
+
+impl std::fmt::Debug for RespConfig {
+    // Hand-written so the password can never reach a log line via `{:?}`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RespConfig")
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("max_connections", &self.max_connections)
+            .field("idle_timeout", &self.idle_timeout)
+            .finish()
+    }
+}
+
+/// Decrements the live-connection count when a connection thread ends,
+/// however it ends.
+struct ConnectionSlot(Arc<AtomicUsize>);
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Equality that takes the same time wherever the inputs first differ, so the
+/// reply latency of `AUTH` does not leak how much of a guess was right.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = a.len() ^ b.len();
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= usize::from(x ^ y);
+    }
+    diff == 0
+}
+
 /// A running RESP server. Dropping the handle stops the accept loop and
 /// waits for it to exit; connections already being served finish their
 /// current command.
@@ -76,8 +126,19 @@ pub struct RespServer {
 impl RespServer {
     /// Start serving `storage` on `listener` in background threads.
     pub fn spawn(storage: SharedStorage, listener: TcpListener) -> crate::Result<Self> {
+        Self::spawn_with(storage, listener, RespConfig::default())
+    }
+
+    /// Like [`spawn`](Self::spawn), with authentication and connection limits.
+    pub fn spawn_with(
+        storage: SharedStorage,
+        listener: TcpListener,
+        config: RespConfig,
+    ) -> crate::Result<Self> {
         let local_addr = listener.local_addr()?;
         let stop = Arc::new(AtomicBool::new(false));
+        let live = Arc::new(AtomicUsize::new(0));
+        let config = Arc::new(config);
 
         let accept_stop = Arc::clone(&stop);
         let accept_thread = thread::spawn(move || {
@@ -86,13 +147,27 @@ impl RespServer {
                     break;
                 }
                 match stream {
-                    Ok(stream) => {
+                    Ok(mut stream) => {
+                        let max = config.max_connections;
+                        let now = live.fetch_add(1, Ordering::AcqRel) + 1;
+                        let slot = ConnectionSlot(Arc::clone(&live));
+                        if max != 0 && now > max {
+                            // Refuse rather than queue: the client learns why
+                            // instead of hanging, and no thread is spent.
+                            let _ = stream.write_all(b"-ERR max number of clients reached\r\n");
+                            continue;
+                        }
                         let storage = storage.clone();
+                        let config = Arc::clone(&config);
                         thread::spawn(move || {
-                            let _ = handle_connection(stream, storage);
+                            let _slot = slot;
+                            let _ = handle_connection(stream, storage, &config);
                         });
                     }
-                    Err(_) => break,
+                    // A failed accept (e.g. a connection reset before it was
+                    // picked up, or fd exhaustion) must not take the whole
+                    // server down.
+                    Err(_) => thread::sleep(Duration::from_millis(10)),
                 }
             }
         });
@@ -129,9 +204,17 @@ impl Drop for RespServer {
     }
 }
 
-fn handle_connection(stream: TcpStream, storage: SharedStorage) -> io::Result<()> {
+fn handle_connection(
+    stream: TcpStream,
+    storage: SharedStorage,
+    config: &RespConfig,
+) -> io::Result<()> {
+    stream.set_read_timeout(config.idle_timeout)?;
+    // Bound how long a client that has stopped reading can pin this thread.
+    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = BufWriter::new(stream);
+    let mut authenticated = config.password.is_none();
 
     loop {
         let command = match read_command(&mut reader) {
@@ -156,6 +239,37 @@ fn handle_connection(stream: TcpStream, storage: SharedStorage) -> io::Result<()
         // Bounded copy for error messages, so a bad command cannot be
         // reflected back at its own size.
         let quoted: String = name.chars().take(MAX_ECHOED_NAME).collect();
+        if name == "AUTH" {
+            // AUTH password | AUTH default password (the Redis 6 ACL form; only
+            // the `default` user exists here).
+            let given = match command.len() {
+                2 => Some(&command[1]),
+                3 if command[1] == b"default" => Some(&command[2]),
+                _ => None,
+            };
+            match (&config.password, given) {
+                (None, _) => write_error(
+                    &mut writer,
+                    "AUTH <password> called without any password configured",
+                )?,
+                (Some(_), None) => write_wrong_args(&mut writer, "auth")?,
+                (Some(want), Some(got)) if constant_time_eq(want, got) => {
+                    authenticated = true;
+                    write_simple(&mut writer, "OK")?;
+                }
+                (Some(_), Some(_)) => {
+                    authenticated = false;
+                    write_coded_error(&mut writer, "WRONGPASS", "invalid password")?;
+                }
+            }
+            writer.flush()?;
+            continue;
+        }
+        if !authenticated && name != "QUIT" {
+            write_coded_error(&mut writer, "NOAUTH", "Authentication required.")?;
+            writer.flush()?;
+            continue;
+        }
         match name.as_str() {
             "PING" => match command.len() {
                 1 => write_simple(&mut writer, "PONG")?,
@@ -472,6 +586,12 @@ fn write_simple(w: &mut impl Write, s: &str) -> io::Result<()> {
 fn write_error(w: &mut impl Write, msg: &str) -> io::Result<()> {
     // RESP errors are single-line
     write!(w, "-ERR {}\r\n", msg.replace(['\r', '\n'], " "))
+}
+
+/// An error with its own RESP error code (`NOAUTH`, `WRONGPASS`), which
+/// clients match on, rather than the generic `ERR`.
+fn write_coded_error(w: &mut impl Write, code: &str, msg: &str) -> io::Result<()> {
+    write!(w, "-{} {}\r\n", code, msg.replace(['\r', '\n'], " "))
 }
 
 fn write_wrong_args(w: &mut impl Write, cmd: &str) -> io::Result<()> {

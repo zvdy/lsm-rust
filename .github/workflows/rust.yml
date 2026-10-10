@@ -179,12 +179,56 @@ jobs:
       - name: Check licenses, advisories, sources and bans
         run: make deny
 
+  container:
+    name: Container image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build the image
+        run: docker build -t lsm-rust:ci .
+
+      - name: Smoke test the image
+        run: |
+          echo -n 'ci-password' > "$RUNNER_TEMP/pw"
+          chmod 0444 "$RUNNER_TEMP/pw"
+          docker run -d --name lsm -p 6379:6379 \
+            -v "$RUNNER_TEMP/pw:/run/pw:ro" -e LSM_REQUIREPASS_FILE=/run/pw lsm-rust:ci
+          for i in $(seq 1 20); do
+            docker exec lsm /usr/local/bin/lsm-rust healthcheck && break
+            sleep 1
+          done
+          docker exec lsm /usr/local/bin/lsm-rust healthcheck
+          docker stop -t 20 lsm
+          test "$(docker inspect lsm --format '{{.State.ExitCode}}')" = "0"
+
+      - name: Scan for HIGH/CRITICAL vulnerabilities
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: lsm-rust:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+  helm:
+    name: Helm chart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v4
+      - run: helm lint deploy/helm/lsm-rust
+      - name: Render with non-default values
+        run: |
+          helm template t deploy/helm/lsm-rust \
+            --set metrics.serviceMonitor.enabled=true \
+            --set podDisruptionBudget.enabled=true > /dev/null
+
   # Single required status check for branch protection: it succeeds only when
   # every gating job above has succeeded (and fails fast if any did not).
   ci:
     name: CI
     if: always()
-    needs: [ lint, test, docs, build, coverage, audit, msrv, deny ]
+    needs: [ lint, test, docs, build, coverage, audit, msrv, deny, container, helm ]
     runs-on: ubuntu-latest
     steps:
       - name: Verify all gating jobs succeeded
@@ -197,6 +241,8 @@ jobs:
           echo "audit=${{ needs.audit.result }}"
           echo "msrv=${{ needs.msrv.result }}"
           echo "deny=${{ needs.deny.result }}"
+          echo "container=${{ needs.container.result }}"
+          echo "helm=${{ needs.helm.result }}"
           test "${{ needs.lint.result }}" = "success" \
             && test "${{ needs.test.result }}" = "success" \
             && test "${{ needs.docs.result }}" = "success" \
@@ -204,4 +250,6 @@ jobs:
             && test "${{ needs.coverage.result }}" = "success" \
             && test "${{ needs.audit.result }}" = "success" \
             && test "${{ needs.msrv.result }}" = "success" \
-            && test "${{ needs.deny.result }}" = "success"
+            && test "${{ needs.deny.result }}" = "success" \
+            && test "${{ needs.container.result }}" = "success" \
+            && test "${{ needs.helm.result }}" = "success"

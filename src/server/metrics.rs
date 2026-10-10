@@ -60,7 +60,7 @@ impl MetricsServer {
                             let _ = handle_connection(stream, &storage);
                         });
                     }
-                    Err(_) => break,
+                    Err(_) => thread::sleep(std::time::Duration::from_millis(10)),
                 }
             }
         });
@@ -90,6 +90,9 @@ impl Drop for MetricsServer {
 }
 
 fn handle_connection(stream: TcpStream, storage: &SharedStorage) -> io::Result<()> {
+    // A scraper that connects and sends nothing must not hold a thread for ever.
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(10)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
 
     // Parse just the request line ("METHOD PATH VERSION"); the rest of the

@@ -1,62 +1,52 @@
-# Build stage
-FROM rust:1.98-slim-trixie AS builder
+# syntax=docker/dockerfile:1.7
 
+# ---- build ----------------------------------------------------------------
+# Keep in step with `rust-version` in Cargo.toml.
+FROM rust:1.98-slim-trixie AS builder
 WORKDIR /usr/src/lsm-rust
 
-# First, create the source layout
-RUN mkdir -p src/memtable src/sstable src/storage src/wal
+# Resolve and compile dependencies against a stub first, so source edits do not
+# invalidate the dependency layer.
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir -p src benches \
+ && echo 'fn main() {}' > src/main.rs \
+ && echo '' > src/lib.rs \
+ && echo 'fn main() {}' > benches/storage.rs \
+ && cargo build --release --locked --bins \
+ && rm -rf src benches
 
-# Copy manifest
-COPY ./Cargo.toml .
+COPY src ./src
+COPY benches ./benches
+# `--locked` fails the build rather than silently re-resolving dependencies.
+RUN touch src/main.rs src/lib.rs \
+ && cargo build --release --locked --bin lsm-rust \
+ && strip target/release/lsm-rust
 
-# Copy all source files
-COPY ./src/main.rs ./src/
-COPY ./src/memtable/mod.rs ./src/memtable/
-COPY ./src/sstable/mod.rs ./src/sstable/
-COPY ./src/storage/mod.rs ./src/storage/
-COPY ./src/wal/mod.rs ./src/wal/
+# ---- runtime --------------------------------------------------------------
+# distroless/cc: glibc and libgcc only. No shell, no package manager, and a
+# nonroot user baked in, so there is little for an attacker to work with.
+FROM gcr.io/distroless/cc-debian13:nonroot
 
-# Build the project
-RUN cargo build --release
+COPY --from=builder /usr/src/lsm-rust/target/release/lsm-rust /usr/local/bin/lsm-rust
 
-# Runtime stage
-FROM debian:trixie-slim
-
-# Install necessary runtime dependencies
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    procps \
-    && rm -rf /var/lib/apt/lists/*
-
-# Create a non-root user and group
-RUN groupadd -r lsmuser && useradd -r -g lsmuser lsmuser
-
-# Create data and config directories with proper permissions
-RUN mkdir -p /data /etc/lsm-rust && \
-    chown -R lsmuser:lsmuser /data /etc/lsm-rust && \
-    chmod 755 /data /etc/lsm-rust
-
-# Copy the built binary
-COPY --from=builder /usr/src/lsm-rust/target/release/lsm-rust /usr/local/bin/
-RUN chmod +x /usr/local/bin/lsm-rust
-
-# Switch to non-root user
-USER lsmuser
-
-# Set data directory as volume
+# /data is the only writable path; mount a persistent volume here.
+WORKDIR /data
 VOLUME ["/data"]
 
-# Set working directory
-WORKDIR /data
+# 6379 RESP, 9898 Prometheus /metrics + /healthz.
+EXPOSE 6379 9898
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s \
-    CMD pgrep lsm-rust || exit 1
+# Inside a container the listener must bind all interfaces to be reachable;
+# network exposure is then governed by the orchestrator (Service, NetworkPolicy,
+# security groups). Set LSM_REQUIREPASS_FILE to require AUTH.
+ENV LSM_ADDR=0.0.0.0:6379 \
+    LSM_DATA_DIR=/data \
+    LSM_METRICS_ADDR=0.0.0.0:9898
 
-# Environment variables
-ENV LSM_DATA_DIR=/data \
-    RUST_LOG=info
+USER nonroot:nonroot
 
-# Run the binary
-ENTRYPOINT ["lsm-rust"]
-CMD ["--data-dir", "/data"] 
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD ["/usr/local/bin/lsm-rust", "healthcheck"]
+
+ENTRYPOINT ["/usr/local/bin/lsm-rust"]
+CMD ["serve"]

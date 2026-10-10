@@ -1,0 +1,11 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "lsm-rust.fullname" . }}
+  labels: {{- include "lsm-rust.labels" . | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: {{- include "lsm-rust.selectorLabels" . | nindent 6 }}
+{{- end }}
