@@ -76,7 +76,7 @@ pub type Seq = u64;
 pub type Expiry = u64;
 
 pub use error::{Error, Result};
-pub use server::{MetricsServer, RespServer};
+pub use server::{MetricsServer, RespConfig, RespServer};
 pub use sstable::{BlockCache, Compression, MAX_KEY_LEN, MAX_VALUE_LEN};
 pub use storage::{
     CheckpointInfo, CompactorHandle, Isolation, LevelStats, ScanIter, SharedStorage, Snapshot,

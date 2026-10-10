@@ -23,6 +23,8 @@ exclude = ["docs/images/*", ".github/*"]
 
 [dependencies]
 lz4_flex = "0.14.0"
+# SIGTERM/SIGINT handling for graceful shutdown under an orchestrator.
+ctrlc = { version = "3", features = ["termination"] }
 
 # Disable the default libtest bench harness so `cargo bench -- <criterion args>`
 # only reaches the criterion benches

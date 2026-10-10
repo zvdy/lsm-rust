@@ -31,9 +31,9 @@ fn grew(size: usize) {
 }
 
 fn shrank(size: usize) {
-    // `fetch_update` rather than `fetch_sub`: an allocation made before the
+    // `try_update` rather than `fetch_sub`: an allocation made before the
     // counter was armed would otherwise underflow it.
-    let _ = LIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
+    let _ = LIVE.try_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
         Some(live.saturating_sub(size))
     });
 }

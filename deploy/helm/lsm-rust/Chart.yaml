@@ -1,0 +1,9 @@
+apiVersion: v2
+name: lsm-rust
+description: lsm-rust LSM-tree key-value store served over RESP, with Prometheus metrics
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/zvdy/lsm-rust
+sources:
+  - https://github.com/zvdy/lsm-rust

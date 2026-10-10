@@ -1,8 +1,10 @@
 use std::env;
 use std::fs;
 use std::net::TcpListener;
+use std::sync::mpsc;
+use std::time::Duration;
 
-use lsm_rust::{Error, MetricsServer, RespServer, SharedStorage, Storage};
+use lsm_rust::{Error, MetricsServer, RespConfig, RespServer, SharedStorage, Storage};
 
 fn main() -> lsm_rust::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -10,6 +12,7 @@ fn main() -> lsm_rust::Result<()> {
 
     match args.first().map(String::as_str) {
         Some("serve") => serve(&args[1..], verbose),
+        Some("healthcheck") => healthcheck(&args[1..]),
         Some("demo") | None => demo(verbose),
         Some("-v") | Some("--verbose") => demo(verbose),
         Some("help") | Some("--help") | Some("-h") => {
@@ -30,43 +33,87 @@ fn print_usage() {
     println!("Commands:");
     println!("  demo               Run the scripted demo (default)");
     println!("  serve              Serve the store over the Redis protocol (RESP)");
+    println!(
+        "  healthcheck        Probe a running server (for container HEALTHCHECK); exit 0 if live"
+    );
     println!();
     println!("Options:");
     println!("  -v, --verbose            Verbose engine logging");
     println!("  --addr HOST:PORT         serve: RESP listen address (default 127.0.0.1:6379)");
     println!("  --data DIR               serve: data directory (default ./data)");
     println!("  --metrics-addr HOST:PORT serve: also expose Prometheus /metrics at this address");
+    println!("  --requirepass-file PATH  serve: require AUTH with the password in this file");
+    println!(
+        "  --max-connections N      serve: client connection cap, 0 = unlimited (default 1024)"
+    );
+    println!("  --idle-timeout-secs N    serve: drop idle clients after N seconds, 0 = never (default 300)");
+    println!();
+    println!("Environment (flags take precedence): LSM_ADDR, LSM_DATA_DIR, LSM_METRICS_ADDR,");
+    println!("  LSM_REQUIREPASS_FILE, LSM_MAX_CONNECTIONS, LSM_IDLE_TIMEOUT_SECS");
 }
 
-/// `lsm-rust serve [--addr HOST:PORT] [--data DIR] [-v]`
-fn serve(args: &[String], verbose: bool) -> lsm_rust::Result<()> {
-    let mut addr = "127.0.0.1:6379".to_string();
-    let mut data_dir = "./data".to_string();
-    let mut metrics_addr: Option<String> = None;
+/// Settings for `serve`. Each comes from `--flag VALUE`, else an environment
+/// variable, else a default; flags win so an operator can always override a
+/// setting baked into a container image.
+struct ServeOptions {
+    addr: String,
+    data_dir: String,
+    metrics_addr: Option<String>,
+    password_file: Option<String>,
+    max_connections: usize,
+    idle_timeout_secs: u64,
+}
 
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--addr" => {
-                addr = iter
-                    .next()
-                    .ok_or_else(|| Error::InvalidArgument("--addr needs a value".to_string()))?
-                    .clone();
+fn env_nonempty(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> lsm_rust::Result<T> {
+    match env_nonempty(name) {
+        None => Ok(default),
+        Some(raw) => raw
+            .parse()
+            .map_err(|_| Error::InvalidArgument(format!("{name} is not a valid number: {raw}"))),
+    }
+}
+
+/// `lsm-rust serve [OPTIONS]` — see `print_usage` for the full list.
+fn serve(args: &[String], verbose: bool) -> lsm_rust::Result<()> {
+    let mut opts = ServeOptions {
+        addr: env_nonempty("LSM_ADDR").unwrap_or_else(|| "127.0.0.1:6379".to_string()),
+        data_dir: env_nonempty("LSM_DATA_DIR").unwrap_or_else(|| "./data".to_string()),
+        metrics_addr: env_nonempty("LSM_METRICS_ADDR"),
+        password_file: env_nonempty("LSM_REQUIREPASS_FILE"),
+        max_connections: env_parse("LSM_MAX_CONNECTIONS", 1024)?,
+        idle_timeout_secs: env_parse("LSM_IDLE_TIMEOUT_SECS", 300)?,
+    };
+
+    let mut i = 0;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        i += 1;
+        let mut take = |flag: &str| -> lsm_rust::Result<String> {
+            let v = args
+                .get(i)
+                .cloned()
+                .ok_or_else(|| Error::InvalidArgument(format!("{flag} needs a value")))?;
+            i += 1;
+            Ok(v)
+        };
+        match flag {
+            "--addr" => opts.addr = take("--addr")?,
+            "--data" => opts.data_dir = take("--data")?,
+            "--metrics-addr" => opts.metrics_addr = Some(take("--metrics-addr")?),
+            "--requirepass-file" => opts.password_file = Some(take("--requirepass-file")?),
+            "--max-connections" => {
+                opts.max_connections = take("--max-connections")?
+                    .parse()
+                    .map_err(|_| Error::InvalidArgument("--max-connections: not a number".into()))?
             }
-            "--data" => {
-                data_dir = iter
-                    .next()
-                    .ok_or_else(|| Error::InvalidArgument("--data needs a value".to_string()))?
-                    .clone();
-            }
-            "--metrics-addr" => {
-                metrics_addr = Some(
-                    iter.next()
-                        .ok_or_else(|| {
-                            Error::InvalidArgument("--metrics-addr needs a value".to_string())
-                        })?
-                        .clone(),
-                );
+            "--idle-timeout-secs" => {
+                opts.idle_timeout_secs = take("--idle-timeout-secs")?.parse().map_err(|_| {
+                    Error::InvalidArgument("--idle-timeout-secs: not a number".into())
+                })?
             }
             "-v" | "--verbose" => {}
             other => {
@@ -78,20 +125,51 @@ fn serve(args: &[String], verbose: bool) -> lsm_rust::Result<()> {
         }
     }
 
-    let storage = SharedStorage::new(&data_dir, verbose)?;
-    let listener = TcpListener::bind(&addr)?;
+    // The password comes from a file (a mounted Secret), never from argv or an
+    // environment variable, both of which leak via `ps`, `/proc` and crash
+    // dumps. One trailing newline is stripped so `echo secret > file` works.
+    let password = match &opts.password_file {
+        None => None,
+        Some(path) => {
+            let mut raw = fs::read(path).map_err(|e| {
+                Error::InvalidArgument(format!("cannot read password file {path}: {e}"))
+            })?;
+            while matches!(raw.last(), Some(b'\n') | Some(b'\r')) {
+                raw.pop();
+            }
+            if raw.is_empty() {
+                return Err(Error::InvalidArgument(format!(
+                    "password file {path} is empty"
+                )));
+            }
+            Some(raw)
+        }
+    };
+
+    let storage = SharedStorage::new(&opts.data_dir, verbose)?;
+    let listener = TcpListener::bind(&opts.addr)?;
     println!(
-        "lsm-rust serving RESP on {} (data: {})",
+        "lsm-rust serving RESP on {} (data: {}, auth: {})",
         listener.local_addr()?,
-        data_dir
+        opts.data_dir,
+        if password.is_some() {
+            "required"
+        } else {
+            "off"
+        }
     );
-    println!("Try: redis-cli -p {}", listener.local_addr()?.port());
+    if password.is_none() && !listener.local_addr()?.ip().is_loopback() {
+        eprintln!(
+            "warning: listening on a non-loopback address without authentication; \
+             set --requirepass-file or restrict access at the network layer"
+        );
+    }
 
     // Optionally expose Prometheus metrics on a separate HTTP port. Keep the
     // handle alive for the lifetime of the server so the thread keeps running.
-    let _metrics = match metrics_addr {
+    let _metrics = match &opts.metrics_addr {
         Some(addr) => {
-            let metrics_listener = TcpListener::bind(&addr)?;
+            let metrics_listener = TcpListener::bind(addr)?;
             let bound = metrics_listener.local_addr()?;
             let server = MetricsServer::spawn(storage.clone(), metrics_listener)?;
             println!("Prometheus metrics on http://{}/metrics", bound);
@@ -100,9 +178,69 @@ fn serve(args: &[String], verbose: bool) -> lsm_rust::Result<()> {
         None => None,
     };
 
-    let server = RespServer::spawn(storage, listener)?;
-    server.join();
+    let config = RespConfig {
+        password,
+        max_connections: opts.max_connections,
+        idle_timeout: (opts.idle_timeout_secs > 0)
+            .then(|| Duration::from_secs(opts.idle_timeout_secs)),
+    };
+    let server = RespServer::spawn_with(storage, listener, config)?;
+
+    // Block until SIGTERM/SIGINT, then drop the servers in order so the accept
+    // loops stop and in-flight commands finish before the process exits.
+    let (tx, rx) = mpsc::channel();
+    ctrlc::set_handler(move || {
+        let _ = tx.send(());
+    })
+    .map_err(|e| Error::InvalidArgument(format!("cannot install signal handler: {e}")))?;
+    let _ = rx.recv();
+    println!("shutting down");
+    drop(server);
     Ok(())
+}
+
+/// `lsm-rust healthcheck [--addr HOST:PORT]`
+///
+/// Sends `PING` and exits 0 on any well-formed reply. A `-NOAUTH` reply counts:
+/// it proves the server is up and parsing, without the probe needing the
+/// password. This exists because the runtime image has no shell or `pgrep`.
+fn healthcheck(args: &[String]) -> lsm_rust::Result<()> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+
+    let mut addr = env_nonempty("LSM_ADDR").unwrap_or_else(|| "127.0.0.1:6379".to_string());
+    if args.first().map(String::as_str) == Some("--addr") {
+        addr = args
+            .get(1)
+            .cloned()
+            .ok_or_else(|| Error::InvalidArgument("--addr needs a value".to_string()))?;
+    }
+    // A wildcard bind address is not connectable; probe loopback on its port.
+    let target: SocketAddr = addr
+        .to_socket_addrs()?
+        .next()
+        .map(|a| {
+            if a.ip().is_unspecified() {
+                SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), a.port())
+            } else {
+                a
+            }
+        })
+        .ok_or_else(|| Error::InvalidArgument(format!("cannot resolve {addr}")))?;
+
+    let timeout = Duration::from_secs(2);
+    let mut stream = TcpStream::connect_timeout(&target, timeout)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    stream.write_all(b"PING\r\n")?;
+    let mut reply = String::new();
+    BufReader::new(stream).read_line(&mut reply)?;
+    if reply.starts_with("+PONG") || reply.starts_with("-NOAUTH") {
+        Ok(())
+    } else {
+        eprintln!("unhealthy: unexpected reply {reply:?}");
+        std::process::exit(1);
+    }
 }
 
 /// `lsm-rust demo [-v]` — the original scripted example.

@@ -2,8 +2,8 @@
 /target/
 **/*.rs.bk
 
-# Remove Cargo.lock for libraries
-Cargo.lock
+# Cargo.lock is committed: this crate ships a binary and a container image,
+# and both must build reproducibly from the audited dependency set.
 
 # IDE specific files
 .vscode/
