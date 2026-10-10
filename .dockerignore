@@ -3,7 +3,6 @@
 target/
 data/
 docs/images/
-benches/
 tests/
 deploy/
 *.sst
