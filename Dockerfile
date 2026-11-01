@@ -2,7 +2,7 @@
 
 # ---- build ----------------------------------------------------------------
 # Keep in step with `rust-version` in Cargo.toml.
-FROM rust:1.98-slim-trixie AS builder
+FROM rust:1.99-slim-trixie AS builder
 WORKDIR /usr/src/lsm-rust
 
 # Resolve and compile dependencies against a stub first, so source edits do not
