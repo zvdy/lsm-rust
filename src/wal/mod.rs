@@ -101,6 +101,8 @@ pub struct WAL {
     file: File,
     sync: WalSync,
     unsynced_writes: usize,
+    /// Length of the log up to the end of the last record known to be whole.
+    len: u64,
 }
 
 impl WAL {
@@ -111,21 +113,23 @@ impl WAL {
 
     /// Open (or create) the log at `path` with the given sync policy.
     ///
-    /// The file is opened for append, so an existing log is added to rather
-    /// than replaced: reopening a store must not discard records that have
-    /// not yet been flushed.
+    /// An existing log is added to rather than replaced: reopening a store
+    /// must not discard records that have not yet been flushed.
     pub fn with_sync(path: PathBuf, sync: WalSync) -> crate::Result<Self> {
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create(true)
-            .append(true)
+            .truncate(false)
             .read(true)
+            .write(true)
             .open(&path)?;
+        let len = file.seek(io::SeekFrom::End(0))?;
 
         Ok(WAL {
             path,
             file,
             sync,
             unsynced_writes: 0,
+            len,
         })
     }
 
@@ -144,9 +148,7 @@ impl WAL {
     ) -> crate::Result<()> {
         let mut body = Vec::new();
         Self::write_entry(&mut body, op, key, value, expires_at)?;
-        self.write_framed(&body)?;
-        self.file.flush()?;
-        self.after_commit()
+        self.append_record(&body)
     }
 
     /// Append several operations as a single atomic record. On replay the
@@ -164,17 +166,41 @@ impl WAL {
                 entry.expires_at,
             )?;
         }
-        self.write_framed(&body)?;
-        self.file.flush()?;
-        self.after_commit()
+        self.append_record(&body)
     }
 
-    /// Wrap a record body in the checksummed frame and append it.
-    fn write_framed(&mut self, body: &[u8]) -> crate::Result<()> {
-        self.file.write_all(&[CRC_MARKER])?;
-        self.file.write_all(&crc32(body).to_le_bytes())?;
-        self.file.write_all(&(body.len() as u32).to_le_bytes())?;
-        self.file.write_all(body)?;
+    /// Frame a record body and append it as a single write.
+    ///
+    /// If the write or the sync fails, the log is cut back to the last whole
+    /// record. Otherwise a partial frame would stay behind and later appends
+    /// would land after it, turning a torn tail into mid-log corruption.
+    fn append_record(&mut self, body: &[u8]) -> crate::Result<()> {
+        let mut frame = Vec::with_capacity(body.len() + 9);
+        frame.push(CRC_MARKER);
+        frame.extend_from_slice(&crc32(body).to_le_bytes());
+        frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        frame.extend_from_slice(body);
+
+        let result = self
+            .file
+            .write_all(&frame)
+            .map_err(Into::into)
+            .and_then(|()| self.after_commit());
+        match result {
+            Ok(()) => {
+                self.len += frame.len() as u64;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.rewind_to_last_whole_record();
+                Err(e)
+            }
+        }
+    }
+
+    fn rewind_to_last_whole_record(&mut self) -> io::Result<()> {
+        self.file.set_len(self.len)?;
+        self.file.seek(io::SeekFrom::Start(self.len))?;
         Ok(())
     }
 
@@ -240,8 +266,8 @@ impl WAL {
     ///
     /// A crash can leave a partially written record at the end of the file;
     /// such a truncated tail — a single entry or an incomplete batch — is
-    /// silently discarded rather than failing recovery of the complete
-    /// records before it.
+    /// discarded, and cut from the file, rather than failing recovery of the
+    /// complete records before it.
     pub fn replay(&mut self) -> crate::Result<Vec<WalRecord>> {
         let mut records = Vec::new();
         let mut buffer = Vec::new();
@@ -333,6 +359,14 @@ impl WAL {
             }
         }
 
+        // Drop an incomplete tail so the next append starts on a record
+        // boundary instead of behind it.
+        if pos < buffer.len() {
+            self.file.set_len(pos as u64)?;
+        }
+        self.len = pos as u64;
+        self.file.seek(io::SeekFrom::Start(self.len))?;
+
         Ok(records)
     }
 
@@ -420,6 +454,7 @@ impl WAL {
             .open(&self.path)?;
         self.file.sync_data()?;
         self.unsynced_writes = 0;
+        self.len = 0;
         Ok(())
     }
 }

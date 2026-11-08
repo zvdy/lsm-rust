@@ -127,6 +127,13 @@ crates.io yet.
 
 ### Fixed
 
+- **A write after a crash could make the store unopenable.** Recovery ignored a
+  torn tail in the WAL but left it in the file, so the next append landed behind
+  it. The following restart then found a bad checksum in the middle of the log
+  and failed with `Corruption`. Recovery now cuts the log back to the last
+  whole record. A failed append (for example, out of disk space) is rolled back
+  the same way, and each record is written with one `write` instead of four.
+
 - **The metrics endpoint had the same unbounded-read bug as the RESP server.**
   Its `MAX_REQUEST_BYTES` was checked *after* each line was read, so any single
   header could exceed it by any margin before the check ran, and the request
