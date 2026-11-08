@@ -127,6 +127,12 @@ crates.io yet.
 
 ### Fixed
 
+- **A data directory can no longer be opened twice.** Two stores on one
+  directory shared a WAL and wrote tables under the same names, and the last
+  writer silently won. Opening now takes an exclusive lock on a `LOCK` file and
+  fails with an `Io` error of kind `ResourceBusy` if the directory is in use,
+  in this process or another. The lock is released when the store is dropped.
+
 - **The metrics endpoint had the same unbounded-read bug as the RESP server.**
   Its `MAX_REQUEST_BYTES` was checked *after* each line was read, so any single
   header could exceed it by any margin before the check ran, and the request
