@@ -18,9 +18,9 @@ fn batch_applies_all_operations() {
     assert_eq!(batch.len(), 3);
     storage.write_batch(batch).unwrap();
 
-    assert_eq!(storage.get(&b"a".to_vec()).unwrap(), Some(b"1".to_vec()));
-    assert_eq!(storage.get(&b"b".to_vec()).unwrap(), Some(b"2".to_vec()));
-    assert_eq!(storage.get(&b"stale".to_vec()).unwrap(), None);
+    assert_eq!(storage.get(b"a").unwrap(), Some(b"1".to_vec()));
+    assert_eq!(storage.get(b"b").unwrap(), Some(b"2".to_vec()));
+    assert_eq!(storage.get(b"stale").unwrap(), None);
 }
 
 #[test]
@@ -28,7 +28,7 @@ fn empty_batch_is_a_noop() {
     let temp_dir = TempDir::new().unwrap();
     let mut storage = Storage::new(temp_dir.path(), false).unwrap();
     storage.write_batch(WriteBatch::new()).unwrap();
-    assert_eq!(storage.get(&b"nothing".to_vec()).unwrap(), None);
+    assert_eq!(storage.get(b"nothing").unwrap(), None);
 }
 
 #[test]
@@ -42,10 +42,7 @@ fn batch_later_op_supersedes_earlier_for_same_key() {
         .put(b"k".to_vec(), b"second".to_vec());
     storage.write_batch(batch).unwrap();
 
-    assert_eq!(
-        storage.get(&b"k".to_vec()).unwrap(),
-        Some(b"second".to_vec())
-    );
+    assert_eq!(storage.get(b"k").unwrap(), Some(b"second".to_vec()));
 }
 
 #[test]
@@ -65,20 +62,11 @@ fn batch_is_atomically_visible_to_snapshots() {
     let after = storage.snapshot();
 
     // The pre-batch snapshot sees none of the batch...
-    assert_eq!(
-        storage.get_at(&before, &b"x".to_vec()).unwrap(),
-        Some(b"x0".to_vec())
-    );
-    assert_eq!(storage.get_at(&before, &b"y".to_vec()).unwrap(), None);
+    assert_eq!(storage.get_at(&before, b"x").unwrap(), Some(b"x0".to_vec()));
+    assert_eq!(storage.get_at(&before, b"y").unwrap(), None);
     // ...the post-batch snapshot sees all of it
-    assert_eq!(
-        storage.get_at(&after, &b"x".to_vec()).unwrap(),
-        Some(b"x1".to_vec())
-    );
-    assert_eq!(
-        storage.get_at(&after, &b"y".to_vec()).unwrap(),
-        Some(b"y1".to_vec())
-    );
+    assert_eq!(storage.get_at(&after, b"x").unwrap(), Some(b"x1".to_vec()));
+    assert_eq!(storage.get_at(&after, b"y").unwrap(), Some(b"y1".to_vec()));
 }
 
 #[test]
@@ -99,15 +87,9 @@ fn batch_survives_restart() {
 
     // Reopen from the WAL: the whole batch must have been recovered
     let recovered = Storage::new(temp_dir.path(), false).unwrap();
-    assert_eq!(
-        recovered.get(&b"k000".to_vec()).unwrap(),
-        Some(b"v0".to_vec())
-    );
-    assert_eq!(
-        recovered.get(&b"k099".to_vec()).unwrap(),
-        Some(b"v99".to_vec())
-    );
-    assert_eq!(recovered.get(&b"k050".to_vec()).unwrap(), None);
+    assert_eq!(recovered.get(b"k000").unwrap(), Some(b"v0".to_vec()));
+    assert_eq!(recovered.get(b"k099").unwrap(), Some(b"v99".to_vec()));
+    assert_eq!(recovered.get(b"k050").unwrap(), None);
 }
 
 #[test]
@@ -128,14 +110,8 @@ fn batch_survives_restart_after_flush() {
     }
 
     let recovered = Storage::with_config(temp_dir.path(), config).unwrap();
-    assert_eq!(
-        recovered.get(&b"k0000".to_vec()).unwrap(),
-        Some(vec![b'v'; 64])
-    );
-    assert_eq!(
-        recovered.get(&b"k0499".to_vec()).unwrap(),
-        Some(vec![b'v'; 64])
-    );
+    assert_eq!(recovered.get(b"k0000").unwrap(), Some(vec![b'v'; 64]));
+    assert_eq!(recovered.get(b"k0499").unwrap(), Some(vec![b'v'; 64]));
 }
 
 #[test]
@@ -149,6 +125,6 @@ fn shared_storage_write_batch() {
         .put(b"b".to_vec(), b"2".to_vec());
     db.write_batch(batch).unwrap();
 
-    assert_eq!(db.get(&b"a".to_vec()).unwrap(), Some(b"1".to_vec()));
-    assert_eq!(db.get(&b"b".to_vec()).unwrap(), Some(b"2".to_vec()));
+    assert_eq!(db.get(b"a").unwrap(), Some(b"1".to_vec()));
+    assert_eq!(db.get(b"b").unwrap(), Some(b"2".to_vec()));
 }

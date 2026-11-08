@@ -47,8 +47,8 @@ fn a_key_past_its_deadline_reads_as_absent() {
     db.put_with_expiry(b"here".to_vec(), b"v".to_vec(), future())
         .unwrap();
 
-    assert_eq!(db.get(&b"gone".to_vec()).unwrap(), None);
-    assert_eq!(db.get(&b"here".to_vec()).unwrap(), Some(b"v".to_vec()));
+    assert_eq!(db.get(b"gone").unwrap(), None);
+    assert_eq!(db.get(b"here").unwrap(), Some(b"v".to_vec()));
 }
 
 #[test]
@@ -63,7 +63,7 @@ fn expiry_shadows_the_value_it_replaced_rather_than_uncovering_it() {
         .unwrap();
 
     assert_eq!(
-        db.get(&b"k".to_vec()).unwrap(),
+        db.get(b"k").unwrap(),
         None,
         "the expired write must shadow the permanent value beneath it"
     );
@@ -84,7 +84,7 @@ fn expiry_shadows_across_a_flush_and_compaction() {
         .unwrap();
     db.compact_now().unwrap();
 
-    assert_eq!(db.get(&b"k".to_vec()).unwrap(), None);
+    assert_eq!(db.get(b"k").unwrap(), None);
 }
 
 /// Small memtable and no automatic compaction, so consecutive writes to the
@@ -130,11 +130,11 @@ fn an_expired_version_on_disk_shadows_an_older_one_in_another_table() {
     );
 
     assert_eq!(
-        db.get(&b"k".to_vec()).unwrap(),
+        db.get(b"k").unwrap(),
         None,
         "the expired version uncovered the value it was meant to retire"
     );
-    assert_eq!(db.expiry(&b"k".to_vec()).unwrap(), None);
+    assert_eq!(db.expiry(b"k").unwrap(), None);
 }
 
 #[test]
@@ -176,7 +176,7 @@ fn compaction_must_not_resurrect_the_value_an_expiry_retired() {
     flush_with_filler(&mut db, "b");
 
     assert_eq!(
-        db.get(&b"k".to_vec()).unwrap(),
+        db.get(b"k").unwrap(),
         None,
         "precondition: the key is already hidden before any merge"
     );
@@ -189,7 +189,7 @@ fn compaction_must_not_resurrect_the_value_an_expiry_retired() {
         "the level had expired data, so it must really merge: {stats:?}"
     );
     assert_eq!(
-        db.get(&b"k".to_vec()).unwrap(),
+        db.get(b"k").unwrap(),
         None,
         "compaction resurrected the value the expiry retired"
     );
@@ -210,9 +210,9 @@ fn a_deadline_survives_a_restart_without_being_refreshed() {
 
     // Replayed from the WAL, so the deadline had to be written there too.
     let db = Storage::with_config(dir.path(), config()).unwrap();
-    assert_eq!(db.get(&b"k".to_vec()).unwrap(), Some(b"v".to_vec()));
-    assert_eq!(db.expiry(&b"k".to_vec()).unwrap(), Some(Some(deadline)));
-    assert_eq!(db.get(&b"gone".to_vec()).unwrap(), None);
+    assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
+    assert_eq!(db.expiry(b"k").unwrap(), Some(Some(deadline)));
+    assert_eq!(db.get(b"gone").unwrap(), None);
 }
 
 #[test]
@@ -229,8 +229,8 @@ fn a_deadline_survives_a_flush_to_disk() {
             .unwrap();
     }
 
-    assert_eq!(db.get(&b"k".to_vec()).unwrap(), Some(b"v".to_vec()));
-    assert_eq!(db.expiry(&b"k".to_vec()).unwrap(), Some(Some(deadline)));
+    assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
+    assert_eq!(db.expiry(b"k").unwrap(), Some(Some(deadline)));
 }
 
 #[test]
@@ -245,13 +245,10 @@ fn expiry_reports_the_three_states() {
     db.put_with_expiry(b"expired".to_vec(), b"v".to_vec(), past())
         .unwrap();
 
-    assert_eq!(db.expiry(&b"missing".to_vec()).unwrap(), None);
-    assert_eq!(db.expiry(&b"expired".to_vec()).unwrap(), None);
-    assert_eq!(db.expiry(&b"permanent".to_vec()).unwrap(), Some(None));
-    assert_eq!(
-        db.expiry(&b"expiring".to_vec()).unwrap(),
-        Some(Some(deadline))
-    );
+    assert_eq!(db.expiry(b"missing").unwrap(), None);
+    assert_eq!(db.expiry(b"expired").unwrap(), None);
+    assert_eq!(db.expiry(b"permanent").unwrap(), Some(None));
+    assert_eq!(db.expiry(b"expiring").unwrap(), Some(Some(deadline)));
 }
 
 #[test]
@@ -310,7 +307,7 @@ fn compaction_collects_expired_versions() {
     assert!(stats.to_prometheus().contains("lsm_expired_total"));
 
     for i in 0..300 {
-        assert_eq!(db.get(&format!("key{:04}", i).into_bytes()).unwrap(), None);
+        assert_eq!(db.get(format!("key{:04}", i).into_bytes()).unwrap(), None);
     }
 }
 
@@ -327,16 +324,16 @@ fn a_write_batch_can_carry_deadlines() {
         .put_with_expiry(b"dead".to_vec(), b"v".to_vec(), past());
     db.write_batch(batch).unwrap();
 
-    assert_eq!(db.get(&b"plain".to_vec()).unwrap(), Some(b"v".to_vec()));
-    assert_eq!(db.get(&b"live".to_vec()).unwrap(), Some(b"v".to_vec()));
-    assert_eq!(db.get(&b"dead".to_vec()).unwrap(), None);
-    assert_eq!(db.expiry(&b"live".to_vec()).unwrap(), Some(Some(deadline)));
+    assert_eq!(db.get(b"plain").unwrap(), Some(b"v".to_vec()));
+    assert_eq!(db.get(b"live").unwrap(), Some(b"v".to_vec()));
+    assert_eq!(db.get(b"dead").unwrap(), None);
+    assert_eq!(db.expiry(b"live").unwrap(), Some(Some(deadline)));
 
     // And the deadline survives the batch's WAL record.
     drop(db);
     let db = Storage::with_config(dir.path(), config()).unwrap();
-    assert_eq!(db.expiry(&b"live".to_vec()).unwrap(), Some(Some(deadline)));
-    assert_eq!(db.get(&b"dead".to_vec()).unwrap(), None);
+    assert_eq!(db.expiry(b"live").unwrap(), Some(Some(deadline)));
+    assert_eq!(db.get(b"dead").unwrap(), None);
 }
 
 #[test]
@@ -348,14 +345,14 @@ fn transactions_can_set_deadlines_and_read_their_own() {
         tx.put_with_expiry(b"dead".to_vec(), b"v".to_vec(), past());
         tx.put_with_expiry(b"live".to_vec(), b"v".to_vec(), future());
         // Read-your-own-writes honours the deadline too.
-        assert_eq!(tx.get(&b"dead".to_vec())?, None);
-        assert_eq!(tx.get(&b"live".to_vec())?, Some(b"v".to_vec()));
+        assert_eq!(tx.get(b"dead")?, None);
+        assert_eq!(tx.get(b"live")?, Some(b"v".to_vec()));
         Ok(())
     })
     .unwrap();
 
-    assert_eq!(db.get(&b"dead".to_vec()).unwrap(), None);
-    assert_eq!(db.get(&b"live".to_vec()).unwrap(), Some(b"v".to_vec()));
+    assert_eq!(db.get(b"dead").unwrap(), None);
+    assert_eq!(db.get(b"live").unwrap(), Some(b"v".to_vec()));
 }
 
 /// A deadline far enough out that no write, however slow the machine, can
@@ -388,12 +385,12 @@ fn a_snapshot_isolates_from_writes_but_not_from_time() {
     sleep(PAST_DUE);
 
     assert_eq!(
-        db.get_at(&snap, &b"permanent".to_vec()).unwrap(),
+        db.get_at(&snap, b"permanent").unwrap(),
         Some(b"v".to_vec()),
         "the snapshot itself must still be readable"
     );
     assert_eq!(
-        db.get_at(&snap, &b"k".to_vec()).unwrap(),
+        db.get_at(&snap, b"k").unwrap(),
         None,
         "a snapshot does not freeze the clock"
     );
@@ -407,12 +404,8 @@ fn a_ttl_still_in_the_future_is_readable() {
     db.put_with_ttl(b"k".to_vec(), b"v".to_vec(), GENEROUS_TTL)
         .unwrap();
 
-    assert_eq!(db.get(&b"k".to_vec()).unwrap(), Some(b"v".to_vec()));
-    let deadline = db
-        .expiry(&b"k".to_vec())
-        .unwrap()
-        .flatten()
-        .expect("a deadline");
+    assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
+    let deadline = db.expiry(b"k").unwrap().flatten().expect("a deadline");
     assert!(
         deadline >= now_ms(),
         "a duration must resolve to a deadline in the future"
@@ -433,8 +426,8 @@ fn a_ttl_expires_on_the_real_clock() {
         .unwrap();
     sleep(PAST_DUE);
 
-    assert_eq!(db.get(&b"k".to_vec()).unwrap(), None);
-    assert_eq!(db.expiry(&b"k".to_vec()).unwrap(), None);
+    assert_eq!(db.get(b"k").unwrap(), None);
+    assert_eq!(db.expiry(b"k").unwrap(), None);
 }
 
 #[test]
@@ -450,11 +443,11 @@ fn shared_storage_exposes_the_same_api() {
     db.put_with_ttl(b"ttl".to_vec(), b"v".to_vec(), Duration::from_secs(3600))
         .unwrap();
 
-    assert_eq!(db.get(&b"live".to_vec()).unwrap(), Some(b"v".to_vec()));
-    assert_eq!(db.get(&b"dead".to_vec()).unwrap(), None);
-    assert_eq!(db.expiry(&b"live".to_vec()).unwrap(), Some(Some(deadline)));
-    assert_eq!(db.expiry(&b"dead".to_vec()).unwrap(), None);
-    assert!(db.expiry(&b"ttl".to_vec()).unwrap().unwrap().is_some());
+    assert_eq!(db.get(b"live").unwrap(), Some(b"v".to_vec()));
+    assert_eq!(db.get(b"dead").unwrap(), None);
+    assert_eq!(db.expiry(b"live").unwrap(), Some(Some(deadline)));
+    assert_eq!(db.expiry(b"dead").unwrap(), None);
+    assert!(db.expiry(b"ttl").unwrap().unwrap().is_some());
 }
 
 #[test]
@@ -464,10 +457,10 @@ fn a_deleted_key_stays_deleted_regardless_of_deadlines() {
 
     db.put_with_expiry(b"k".to_vec(), b"v".to_vec(), future())
         .unwrap();
-    db.delete(&b"k".to_vec()).unwrap();
+    db.delete(b"k").unwrap();
 
-    assert_eq!(db.get(&b"k".to_vec()).unwrap(), None);
-    assert_eq!(db.expiry(&b"k".to_vec()).unwrap(), None);
+    assert_eq!(db.get(b"k").unwrap(), None);
+    assert_eq!(db.expiry(b"k").unwrap(), None);
 }
 
 #[test]
@@ -482,9 +475,9 @@ fn a_permanent_write_over_an_expiring_one_clears_the_deadline() {
     sleep(Duration::from_millis(120));
 
     assert_eq!(
-        db.get(&b"k".to_vec()).unwrap(),
+        db.get(b"k").unwrap(),
         Some(b"v2".to_vec()),
         "the newer permanent write must not inherit the old deadline"
     );
-    assert_eq!(db.expiry(&b"k".to_vec()).unwrap(), Some(None));
+    assert_eq!(db.expiry(b"k").unwrap(), Some(None));
 }

@@ -173,10 +173,7 @@ fn concurrent_clients_and_persistence() {
 
     // Data written over the wire survives a restart of the store
     let storage = SharedStorage::new(temp_dir.path(), false).unwrap();
-    assert_eq!(
-        storage.get(&b"c0:key0".to_vec()).unwrap(),
-        Some(b"v".to_vec())
-    );
+    assert_eq!(storage.get(b"c0:key0").unwrap(), Some(b"v".to_vec()));
 }
 
 #[test]

@@ -172,38 +172,44 @@ impl Transaction {
 
     /// Read `key`, seeing this transaction's own uncommitted writes first and
     /// otherwise the snapshot it began at.
-    pub fn get(&mut self, key: &Key) -> crate::Result<Option<Value>> {
+    pub fn get(&mut self, key: impl AsRef<[u8]>) -> crate::Result<Option<Value>> {
+        let key = key.as_ref();
         if let Some(buffered) = self.writes.get(key) {
             // Read-your-own-writes; a buffered delete — or a buffered write
             // whose deadline has already passed — reads back as absent.
             return Ok(buffered.visible_at(crate::version::now_ms()).cloned());
         }
-        self.reads.insert(key.clone());
+        self.reads.insert(key.to_vec());
         self.db.get_at(&self.snapshot, key)
     }
 
     /// Buffer a put. Nothing is written until [`Transaction::commit`].
-    pub fn put(&mut self, key: Key, value: Value) {
-        self.writes.insert(key, Version::live(value));
+    pub fn put(&mut self, key: impl Into<Key>, value: impl Into<Value>) {
+        self.writes.insert(key.into(), Version::live(value.into()));
     }
 
     /// Buffer a put that expires after `ttl`. Nothing is written until
     /// [`Transaction::commit`]; the deadline is resolved when this is called,
     /// not when the transaction commits.
-    pub fn put_with_ttl(&mut self, key: Key, value: Value, ttl: Duration) {
+    pub fn put_with_ttl(&mut self, key: impl Into<Key>, value: impl Into<Value>, ttl: Duration) {
         self.put_with_expiry(key, value, crate::version::ttl_to_expiry(ttl));
     }
 
     /// Buffer a put that expires at `expires_at`, an absolute deadline in
     /// milliseconds since the Unix epoch.
-    pub fn put_with_expiry(&mut self, key: Key, value: Value, expires_at: Expiry) {
+    pub fn put_with_expiry(
+        &mut self,
+        key: impl Into<Key>,
+        value: impl Into<Value>,
+        expires_at: Expiry,
+    ) {
         self.writes
-            .insert(key, Version::expiring(value, expires_at));
+            .insert(key.into(), Version::expiring(value.into(), expires_at));
     }
 
     /// Buffer a delete. Nothing is written until [`Transaction::commit`].
-    pub fn delete(&mut self, key: Key) {
-        self.writes.insert(key, Version::tombstone());
+    pub fn delete(&mut self, key: impl Into<Key>) {
+        self.writes.insert(key.into(), Version::tombstone());
     }
 
     /// Range scan (`start <= key < end`) over the snapshot, merged with this
