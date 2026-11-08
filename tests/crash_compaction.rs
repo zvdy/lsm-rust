@@ -54,7 +54,7 @@ fn capture(dir: &Path) -> Snapshot {
     let mut files = Vec::new();
     for entry in fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
-        if path.is_file() {
+        if path.is_file() && path.file_name().unwrap() != "LOCK" {
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
             files.push((name, fs::read(&path).unwrap()));
         }

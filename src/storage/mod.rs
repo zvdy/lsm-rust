@@ -44,6 +44,27 @@ use crate::{Expiry, Key, Seq, Value, Version};
 /// Name of the write-ahead log inside the data directory.
 const WAL_FILE: &str = "wal";
 
+/// Name of the file whose lock marks a data directory as in use.
+const LOCK_FILE: &str = "LOCK";
+
+/// Take an exclusive advisory lock on `dir`, held until the file is dropped.
+fn lock_data_dir(dir: &Path) -> crate::Result<fs::File> {
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(LOCK_FILE))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(fs::TryLockError::WouldBlock) => Err(std::io::Error::new(
+            std::io::ErrorKind::ResourceBusy,
+            format!("data directory {:?} is already open", dir),
+        )
+        .into()),
+        Err(fs::TryLockError::Error(e)) => Err(e.into()),
+    }
+}
+
 /// Smallest byte string strictly greater than every string with this
 /// prefix, or `None` if no such bound exists (prefix is empty or all 0xFF).
 fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
@@ -232,6 +253,9 @@ pub struct Storage {
     /// writes can land while it runs. This keeps a second compaction from
     /// starting underneath it and pulling the input tables away mid-merge.
     compacting_detached: bool,
+    /// Held for the life of the store; declared last so it is released after
+    /// everything else has been dropped.
+    _lock: fs::File,
 }
 
 /// A merge chosen under the write lock and run without it.
@@ -296,12 +320,17 @@ impl Storage {
     }
 
     /// Open (or create) a store at `data_dir` with explicit tuning options.
+    ///
+    /// The directory is locked for as long as the store lives. Opening one
+    /// that is already open, in this process or another, fails with an
+    /// [`Error::Io`](crate::Error::Io) of kind `ResourceBusy`.
     pub fn with_config<P: AsRef<Path>>(data_dir: P, config: StorageConfig) -> crate::Result<Self> {
         let verbose = config.verbose;
         if verbose {
             println!("Initializing storage at {:?}", data_dir.as_ref());
         }
         fs::create_dir_all(&data_dir)?;
+        let lock = lock_data_dir(data_dir.as_ref())?;
 
         let block_cache = (config.block_cache_size > 0)
             .then(|| Arc::new(BlockCache::new(config.block_cache_size)));
@@ -455,6 +484,7 @@ impl Storage {
             manifest,
             config,
             compacting_detached: false,
+            _lock: lock,
         };
 
         // Give legacy directories a manifest so the next startup (and any
