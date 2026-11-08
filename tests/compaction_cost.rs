@@ -68,7 +68,7 @@ fn an_append_only_workload_is_promoted_rather_than_rewritten() {
 
     // Every value is still readable and correct.
     for i in 0..2000 {
-        assert_eq!(db.get(&key(i)).unwrap(), Some(value(i)), "key {i}");
+        assert_eq!(db.get(key(i)).unwrap(), Some(value(i)), "key {i}");
     }
 }
 
@@ -94,7 +94,7 @@ fn an_overwriting_workload_is_still_merged() {
     );
 
     for i in 0..50 {
-        assert_eq!(db.get(&key(i)).unwrap(), Some(value(39 * 1000 + i)));
+        assert_eq!(db.get(key(i)).unwrap(), Some(value(39 * 1000 + i)));
     }
 }
 
@@ -124,7 +124,7 @@ fn a_promoted_table_still_shadows_older_data_at_its_new_level() {
 
     for i in 0..400 {
         assert_eq!(
-            db.get(&key(i)).unwrap(),
+            db.get(key(i)).unwrap(),
             Some("third".repeat(16).into_bytes()),
             "key {i} read a stale version after promotion"
         );
@@ -175,7 +175,7 @@ fn promotion_into_a_populated_level_keeps_the_newest_version() {
     // everything already at the destination and must be consulted first.
     for i in 0..300 {
         assert_eq!(
-            db.get(&key(i)).unwrap(),
+            db.get(key(i)).unwrap(),
             Some("third".repeat(8).into_bytes()),
             "key {i} read a version shadowed by a later promotion"
         );
@@ -193,13 +193,13 @@ fn deletes_survive_promotion() {
     db.compact_now().unwrap();
 
     for i in (0..600).step_by(3) {
-        db.delete(&key(i)).unwrap();
+        db.delete(key(i)).unwrap();
     }
     db.compact_now().unwrap();
 
     for i in 0..600 {
         let expected = if i % 3 == 0 { None } else { Some(value(i)) };
-        assert_eq!(db.get(&key(i)).unwrap(), expected, "key {i}");
+        assert_eq!(db.get(key(i)).unwrap(), expected, "key {i}");
     }
 }
 
@@ -264,7 +264,7 @@ fn a_promoted_store_reopens_with_all_of_its_data() {
     // restart must find every table where the manifest says it is.
     let reopened = Storage::with_config(dir.path(), config()).unwrap();
     for i in 0..2000 {
-        assert_eq!(reopened.get(&key(i)).unwrap(), Some(value(i)), "key {i}");
+        assert_eq!(reopened.get(key(i)).unwrap(), Some(value(i)), "key {i}");
     }
 }
 
@@ -312,7 +312,7 @@ fn snapshots_taken_before_promotion_still_read_their_own_version() {
     // snapshot's versions are still there to be found.
     for i in 0..300 {
         assert_eq!(
-            db.get_at(&snap, &key(i)).unwrap(),
+            db.get_at(&snap, key(i)).unwrap(),
             Some(b"before".repeat(8).to_vec()),
             "snapshot lost key {i} across promotion"
         );

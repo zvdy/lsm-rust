@@ -33,11 +33,11 @@
 //! fn main() -> lsm_rust::Result<()> {
 //!     let mut db = Storage::new("./data", false)?;
 //!
-//!     db.put(b"name".to_vec(), b"Jane Doe".to_vec())?;
-//!     assert_eq!(db.get(&b"name".to_vec())?, Some(b"Jane Doe".to_vec()));
+//!     db.put("name", "Jane Doe")?;
+//!     assert_eq!(db.get("name")?, Some(b"Jane Doe".to_vec()));
 //!
-//!     db.delete(&b"name".to_vec())?;
-//!     assert_eq!(db.get(&b"name".to_vec())?, None);
+//!     db.delete("name")?;
+//!     assert_eq!(db.get("name")?, None);
 //!     Ok(())
 //! }
 //! ```

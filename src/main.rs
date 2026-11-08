@@ -272,21 +272,21 @@ fn basic_operations_test(db: &mut Storage) -> lsm_rust::Result<()> {
     db.put(b"city".to_vec(), b"New York".to_vec())?;
 
     println!("\nRetrieving data:");
-    if let Ok(Some(name)) = db.get(&b"name".to_vec()) {
+    if let Ok(Some(name)) = db.get(b"name") {
         println!("name: {}", String::from_utf8_lossy(&name));
     }
-    if let Ok(Some(age)) = db.get(&b"age".to_vec()) {
+    if let Ok(Some(age)) = db.get(b"age") {
         println!("age: {}", String::from_utf8_lossy(&age));
     }
-    if let Ok(Some(city)) = db.get(&b"city".to_vec()) {
+    if let Ok(Some(city)) = db.get(b"city") {
         println!("city: {}", String::from_utf8_lossy(&city));
     }
 
     println!("\nDeleting 'age' entry...");
-    db.delete(&b"age".to_vec())?;
+    db.delete(b"age")?;
 
     println!("\nTrying to retrieve deleted data:");
-    match db.get(&b"age".to_vec()) {
+    match db.get(b"age") {
         Ok(Some(_)) => println!("age: still exists"),
         Ok(None) => println!("age: was deleted"),
         Err(e) => println!("Error: {}", e),

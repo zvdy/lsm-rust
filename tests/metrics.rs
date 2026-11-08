@@ -10,9 +10,9 @@ fn stats_reflect_operations() {
 
     db.put(b"a".to_vec(), b"1".to_vec()).unwrap();
     db.put(b"b".to_vec(), b"2".to_vec()).unwrap();
-    db.delete(&b"a".to_vec()).unwrap();
-    let _ = db.get(&b"b".to_vec()).unwrap();
-    let _ = db.get(&b"missing".to_vec()).unwrap();
+    db.delete(b"a").unwrap();
+    let _ = db.get(b"b").unwrap();
+    let _ = db.get(b"missing").unwrap();
     let _ = db.scan(b"a", b"z").unwrap();
 
     let stats = db.stats();

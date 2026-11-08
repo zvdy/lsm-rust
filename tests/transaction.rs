@@ -17,21 +17,21 @@ fn commit_makes_writes_visible_and_rollback_does_not() {
     let mut tx = db.begin().unwrap();
     tx.put(b"a".to_vec(), b"1".to_vec());
     // Nothing is visible outside the transaction before it commits.
-    assert_eq!(db.get(&b"a".to_vec()).unwrap(), None);
+    assert_eq!(db.get(b"a").unwrap(), None);
     tx.commit().unwrap();
-    assert_eq!(db.get(&b"a".to_vec()).unwrap(), Some(b"1".to_vec()));
+    assert_eq!(db.get(b"a").unwrap(), Some(b"1".to_vec()));
 
     let mut tx = db.begin().unwrap();
     tx.put(b"b".to_vec(), b"2".to_vec());
     tx.rollback();
-    assert_eq!(db.get(&b"b".to_vec()).unwrap(), None);
+    assert_eq!(db.get(b"b").unwrap(), None);
 
     // Dropping without committing rolls back too.
     {
         let mut tx = db.begin().unwrap();
         tx.put(b"c".to_vec(), b"3".to_vec());
     }
-    assert_eq!(db.get(&b"c".to_vec()).unwrap(), None);
+    assert_eq!(db.get(b"c").unwrap(), None);
 }
 
 #[test]
@@ -42,15 +42,15 @@ fn transaction_reads_its_own_writes() {
 
     let mut tx = db.begin().unwrap();
     tx.put(b"k".to_vec(), b"new".to_vec());
-    assert_eq!(tx.get(&b"k".to_vec()).unwrap(), Some(b"new".to_vec()));
+    assert_eq!(tx.get(b"k").unwrap(), Some(b"new".to_vec()));
 
     tx.delete(b"k".to_vec());
-    assert_eq!(tx.get(&b"k".to_vec()).unwrap(), None);
+    assert_eq!(tx.get(b"k").unwrap(), None);
 
     // ...while the outside world still sees the committed value.
-    assert_eq!(db.get(&b"k".to_vec()).unwrap(), Some(b"old".to_vec()));
+    assert_eq!(db.get(b"k").unwrap(), Some(b"old".to_vec()));
     tx.commit().unwrap();
-    assert_eq!(db.get(&b"k".to_vec()).unwrap(), None);
+    assert_eq!(db.get(b"k").unwrap(), None);
 }
 
 #[test]
@@ -60,13 +60,13 @@ fn reads_are_isolated_from_concurrent_commits() {
     db.put(b"k".to_vec(), b"v1".to_vec()).unwrap();
 
     let mut tx = db.begin().unwrap();
-    assert_eq!(tx.get(&b"k".to_vec()).unwrap(), Some(b"v1".to_vec()));
+    assert_eq!(tx.get(b"k").unwrap(), Some(b"v1".to_vec()));
 
     // Someone else commits a new value mid-transaction.
     db.put(b"k".to_vec(), b"v2".to_vec()).unwrap();
 
     // The transaction keeps reading its snapshot.
-    assert_eq!(tx.get(&b"k".to_vec()).unwrap(), Some(b"v1".to_vec()));
+    assert_eq!(tx.get(b"k").unwrap(), Some(b"v1".to_vec()));
 }
 
 #[test]
@@ -88,10 +88,7 @@ fn write_write_conflict_aborts_the_loser() {
     assert!(matches!(err, Error::Conflict { .. }));
 
     // The loser had no effect at all.
-    assert_eq!(
-        db.get(&b"k".to_vec()).unwrap(),
-        Some(b"from-first".to_vec())
-    );
+    assert_eq!(db.get(b"k").unwrap(), Some(b"from-first".to_vec()));
 }
 
 #[test]
@@ -108,8 +105,8 @@ fn disjoint_writes_commit_concurrently() {
     a.commit().unwrap();
     b.commit().unwrap();
 
-    assert_eq!(db.get(&b"a".to_vec()).unwrap(), Some(b"1".to_vec()));
-    assert_eq!(db.get(&b"b".to_vec()).unwrap(), Some(b"2".to_vec()));
+    assert_eq!(db.get(b"a").unwrap(), Some(b"1".to_vec()));
+    assert_eq!(db.get(b"b").unwrap(), Some(b"2".to_vec()));
 }
 
 #[test]
@@ -129,8 +126,8 @@ fn serializable_detects_write_skew_but_snapshot_isolation_allows_it() {
         let mut t1 = db.begin_with(isolation).unwrap();
         let mut t2 = db.begin_with(isolation).unwrap();
 
-        t1.get(&b"y".to_vec()).unwrap();
-        t2.get(&b"x".to_vec()).unwrap();
+        t1.get(b"y").unwrap();
+        t2.get(b"x").unwrap();
         t1.put(b"x".to_vec(), b"2".to_vec());
         t2.put(b"y".to_vec(), b"2".to_vec());
 
@@ -192,7 +189,7 @@ fn read_only_transactions_never_conflict() {
     db.put(b"k".to_vec(), b"v".to_vec()).unwrap();
 
     let mut tx = db.begin().unwrap();
-    tx.get(&b"k".to_vec()).unwrap();
+    tx.get(b"k").unwrap();
     db.put(b"k".to_vec(), b"changed".to_vec()).unwrap();
 
     // Nothing was written, so there is nothing to conflict over.
@@ -219,7 +216,7 @@ fn retry_helper_serializes_concurrent_increments() {
                 barrier.wait();
                 for _ in 0..PER_THREAD {
                     db.transaction(1000, |tx| {
-                        let current = tx.get(&b"counter".to_vec())?.unwrap_or_default();
+                        let current = tx.get(b"counter")?.unwrap_or_default();
                         let n: u64 = String::from_utf8_lossy(&current).parse().unwrap_or(0);
                         tx.put(b"counter".to_vec(), (n + 1).to_string().into_bytes());
                         Ok(())
@@ -233,7 +230,7 @@ fn retry_helper_serializes_concurrent_increments() {
         h.join().unwrap();
     }
 
-    let final_value = db.get(&b"counter".to_vec()).unwrap().unwrap();
+    let final_value = db.get(b"counter").unwrap().unwrap();
     let total: u64 = String::from_utf8_lossy(&final_value).parse().unwrap();
     assert_eq!(
         total,
@@ -272,7 +269,7 @@ fn concurrent_disjoint_transactions_all_commit() {
     for t in 0..THREADS {
         for i in 0..PER_THREAD {
             assert_eq!(
-                db.get(&format!("t{t}:k{i:03}").into_bytes()).unwrap(),
+                db.get(format!("t{t}:k{i:03}").into_bytes()).unwrap(),
                 Some(format!("v{i}").into_bytes())
             );
         }
@@ -295,9 +292,9 @@ fn committed_transactions_survive_restart() {
     }
 
     let db = SharedStorage::new(temp.path(), false).unwrap();
-    assert_eq!(db.get(&b"durable".to_vec()).unwrap(), Some(b"yes".to_vec()));
-    assert_eq!(db.get(&b"also".to_vec()).unwrap(), Some(b"yes".to_vec()));
-    assert_eq!(db.get(&b"ghost".to_vec()).unwrap(), None);
+    assert_eq!(db.get(b"durable").unwrap(), Some(b"yes".to_vec()));
+    assert_eq!(db.get(b"also").unwrap(), Some(b"yes".to_vec()));
+    assert_eq!(db.get(b"ghost").unwrap(), None);
 }
 
 #[test]

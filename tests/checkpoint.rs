@@ -86,7 +86,7 @@ fn a_checkpoint_survives_destruction_of_the_original() {
 
     let restored = Storage::with_config(&target, config()).unwrap();
     assert_eq!(
-        restored.get(&b"key0150".to_vec()).unwrap(),
+        restored.get(b"key0150").unwrap(),
         Some(b"value-0150".repeat(4).to_vec())
     );
 }
@@ -108,7 +108,7 @@ fn a_checkpoint_is_unaffected_by_later_writes_and_compaction() {
             .unwrap();
     }
     for i in 0..50 {
-        db.delete(&format!("key{:04}", i).into_bytes()).unwrap();
+        db.delete(format!("key{:04}", i).into_bytes()).unwrap();
     }
     seed(&mut db, 300..600);
     db.compact_now().unwrap();
@@ -117,28 +117,25 @@ fn a_checkpoint_is_unaffected_by_later_writes_and_compaction() {
 
     // The checkpoint still reads as of its own sequence.
     assert_eq!(
-        restored.get(&b"key0000".to_vec()).unwrap(),
+        restored.get(b"key0000").unwrap(),
         Some(b"value-0000".repeat(4).to_vec()),
         "a key deleted after the checkpoint must still be present in it"
     );
     assert_eq!(
-        restored.get(&b"key0299".to_vec()).unwrap(),
+        restored.get(b"key0299").unwrap(),
         Some(b"value-0299".repeat(4).to_vec()),
         "a key overwritten after the checkpoint must hold its old value"
     );
     assert_eq!(
-        restored.get(&b"key0400".to_vec()).unwrap(),
+        restored.get(b"key0400").unwrap(),
         None,
         "a key written after the checkpoint must not appear in it"
     );
     assert_eq!(restored.current_sequence(), info.sequence);
 
     // And the live store is unharmed by the checkpoint's existence.
-    assert_eq!(
-        db.get(&b"key0299".to_vec()).unwrap(),
-        Some(b"CHANGED".to_vec())
-    );
-    assert_eq!(db.get(&b"key0000".to_vec()).unwrap(), None);
+    assert_eq!(db.get(b"key0299").unwrap(), Some(b"CHANGED".to_vec()));
+    assert_eq!(db.get(b"key0000").unwrap(), None);
 }
 
 #[test]
@@ -161,7 +158,7 @@ fn unflushed_writes_are_captured_through_the_wal() {
 
     let restored = Storage::with_config(&target, config()).unwrap();
     assert_eq!(
-        restored.get(&b"only-in-memtable".to_vec()).unwrap(),
+        restored.get(b"only-in-memtable").unwrap(),
         Some(b"present".to_vec())
     );
 }
@@ -181,12 +178,9 @@ fn the_wal_is_copied_not_linked_so_later_writes_cannot_leak_in() {
     db.put(b"after".to_vec(), b"2".to_vec()).unwrap();
 
     let restored = Storage::with_config(&target, config()).unwrap();
+    assert_eq!(restored.get(b"before").unwrap(), Some(b"1".to_vec()));
     assert_eq!(
-        restored.get(&b"before".to_vec()).unwrap(),
-        Some(b"1".to_vec())
-    );
-    assert_eq!(
-        restored.get(&b"after".to_vec()).unwrap(),
+        restored.get(b"after").unwrap(),
         None,
         "a write made after the checkpoint leaked into it"
     );
@@ -262,9 +256,9 @@ fn checkpoints_can_be_chained_and_each_holds_its_own_instant() {
     let a = Storage::with_config(&first.path, config()).unwrap();
     let b = Storage::with_config(&second.path, config()).unwrap();
 
-    assert_eq!(a.get(&b"key0150".to_vec()).unwrap(), None);
+    assert_eq!(a.get(b"key0150").unwrap(), None);
     assert_eq!(
-        b.get(&b"key0150".to_vec()).unwrap(),
+        b.get(b"key0150").unwrap(),
         Some(b"value-0150".repeat(4).to_vec())
     );
 }
@@ -289,13 +283,13 @@ fn shared_storage_checkpoints_under_the_write_lock() {
 
     let restored = Storage::with_config(&target, config()).unwrap();
     assert_eq!(
-        restored.get(&b"key0200".to_vec()).unwrap(),
+        restored.get(b"key0200").unwrap(),
         Some(b"value-0200".repeat(4).to_vec())
     );
 
     // The store keeps working afterwards.
     db.put(b"after".to_vec(), b"ok".to_vec()).unwrap();
-    assert_eq!(db.get(&b"after".to_vec()).unwrap(), Some(b"ok".to_vec()));
+    assert_eq!(db.get(b"after").unwrap(), Some(b"ok".to_vec()));
 }
 
 #[test]
@@ -348,7 +342,7 @@ fn the_restored_sequence_matches_the_captured_one() {
     // And a snapshot at the captured sequence still sees the whole capture.
     let snap = restored.snapshot_at(info.sequence).unwrap();
     assert_eq!(
-        restored.get_at(&snap, &b"unflushed".to_vec()).unwrap(),
+        restored.get_at(&snap, b"unflushed").unwrap(),
         Some(b"x".to_vec())
     );
 }
