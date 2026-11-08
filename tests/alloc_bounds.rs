@@ -211,7 +211,7 @@ fn a_corrupt_wal_batch_count_does_not_abort_the_process() {
     // The frame has no entries after it, so it is an incomplete tail: the
     // documented behaviour is to drop it and recover what came before.
     let db = result.expect("a truncated batch tail is dropped, not fatal");
-    assert_eq!(db.get(&b"anything".to_vec()).unwrap(), None);
+    assert_eq!(db.get(b"anything").unwrap(), None);
 }
 
 #[test]
@@ -223,7 +223,7 @@ fn an_undamaged_store_still_round_trips() {
     let db = Storage::with_config(temp.path(), config()).unwrap();
     for i in 0..200 {
         assert_eq!(
-            db.get(&format!("key{:04}", i).into_bytes()).unwrap(),
+            db.get(format!("key{:04}", i).into_bytes()).unwrap(),
             Some(vec![b'v'; 40]),
             "key{:04} should survive",
             i
@@ -283,7 +283,7 @@ fn no_single_header_bit_flip_can_inflate_an_allocation() {
         // lose a key. What it must never do is hand back a value that was
         // never written.
         if let Ok(db) = result {
-            if let Ok(Some(got)) = db.get(&b"key0000".to_vec()) {
+            if let Ok(Some(got)) = db.get(b"key0000") {
                 assert_eq!(
                     got,
                     vec![b'v'; 40],

@@ -59,17 +59,17 @@ impl SharedStorage {
     }
 
     /// Look up the current value for `key`. Concurrent with other reads.
-    pub fn get(&self, key: &Key) -> crate::Result<Option<Value>> {
+    pub fn get(&self, key: impl AsRef<[u8]>) -> crate::Result<Option<Value>> {
         self.inner.read().map_err(|_| poisoned())?.get(key)
     }
 
     /// Insert or update `key`, durable once this returns.
-    pub fn put(&self, key: Key, value: Value) -> crate::Result<()> {
+    pub fn put(&self, key: impl Into<Key>, value: impl Into<Value>) -> crate::Result<()> {
         self.inner.write().map_err(|_| poisoned())?.put(key, value)
     }
 
     /// Delete `key`, durable once this returns.
-    pub fn delete(&self, key: &Key) -> crate::Result<()> {
+    pub fn delete(&self, key: impl AsRef<[u8]>) -> crate::Result<()> {
         self.inner.write().map_err(|_| poisoned())?.delete(key)
     }
 
@@ -160,7 +160,11 @@ impl SharedStorage {
     }
 
     /// Look up `key` as seen by `snapshot`. Concurrent with other reads.
-    pub fn get_at(&self, snapshot: &Snapshot, key: &Key) -> crate::Result<Option<Value>> {
+    pub fn get_at(
+        &self,
+        snapshot: &Snapshot,
+        key: impl AsRef<[u8]>,
+    ) -> crate::Result<Option<Value>> {
         self.inner
             .read()
             .map_err(|_| poisoned())?
@@ -276,8 +280,8 @@ impl SharedStorage {
     /// restarts without being refreshed.
     pub fn put_with_ttl(
         &self,
-        key: crate::Key,
-        value: crate::Value,
+        key: impl Into<Key>,
+        value: impl Into<Value>,
         ttl: Duration,
     ) -> crate::Result<()> {
         self.inner
@@ -290,8 +294,8 @@ impl SharedStorage {
     /// absolute deadline in milliseconds since the Unix epoch.
     pub fn put_with_expiry(
         &self,
-        key: crate::Key,
-        value: crate::Value,
+        key: impl Into<Key>,
+        value: impl Into<Value>,
         expires_at: Expiry,
     ) -> crate::Result<()> {
         self.inner
@@ -302,7 +306,7 @@ impl SharedStorage {
 
     /// When `key`'s visible version expires: `None` if there is no visible
     /// version, `Some(None)` if it has no deadline, `Some(Some(ms))` otherwise.
-    pub fn expiry(&self, key: &crate::Key) -> crate::Result<Option<Option<Expiry>>> {
+    pub fn expiry(&self, key: impl AsRef<[u8]>) -> crate::Result<Option<Option<Expiry>>> {
         self.inner.read().map_err(|_| poisoned())?.expiry(key)
     }
 
@@ -550,7 +554,7 @@ mod tests {
                 thread::spawn(move || {
                     for i in (half * 50)..((half + 1) * 50) {
                         if i % 2 == 0 {
-                            db.delete(&format!("key{:03}", i).into_bytes()).unwrap();
+                            db.delete(format!("key{:03}", i).into_bytes()).unwrap();
                         }
                     }
                 })
@@ -567,7 +571,7 @@ mod tests {
                 Some(b"value".to_vec())
             };
             assert_eq!(
-                db.get(&format!("key{:03}", i).into_bytes()).unwrap(),
+                db.get(format!("key{:03}", i).into_bytes()).unwrap(),
                 expected
             );
         }

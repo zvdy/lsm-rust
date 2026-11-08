@@ -118,27 +118,42 @@ impl WriteBatch {
     }
 
     /// Queue a put of `key` = `value`, with no expiry.
-    pub fn put(&mut self, key: Key, value: Value) -> &mut Self {
-        self.ops.push((Operation::Put, key, Some(value), None));
+    pub fn put(&mut self, key: impl Into<Key>, value: impl Into<Value>) -> &mut Self {
+        self.ops
+            .push((Operation::Put, key.into(), Some(value.into()), None));
         self
     }
 
     /// Queue a put of `key` = `value` that expires after `ttl`.
-    pub fn put_with_ttl(&mut self, key: Key, value: Value, ttl: Duration) -> &mut Self {
+    pub fn put_with_ttl(
+        &mut self,
+        key: impl Into<Key>,
+        value: impl Into<Value>,
+        ttl: Duration,
+    ) -> &mut Self {
         self.put_with_expiry(key, value, crate::version::ttl_to_expiry(ttl))
     }
 
     /// Queue a put of `key` = `value` that expires at `expires_at`, an
     /// absolute deadline in Unix milliseconds.
-    pub fn put_with_expiry(&mut self, key: Key, value: Value, expires_at: Expiry) -> &mut Self {
-        self.ops
-            .push((Operation::Put, key, Some(value), Some(expires_at)));
+    pub fn put_with_expiry(
+        &mut self,
+        key: impl Into<Key>,
+        value: impl Into<Value>,
+        expires_at: Expiry,
+    ) -> &mut Self {
+        self.ops.push((
+            Operation::Put,
+            key.into(),
+            Some(value.into()),
+            Some(expires_at),
+        ));
         self
     }
 
     /// Queue a delete of `key`.
-    pub fn delete(&mut self, key: Key) -> &mut Self {
-        self.ops.push((Operation::Delete, key, None, None));
+    pub fn delete(&mut self, key: impl Into<Key>) -> &mut Self {
+        self.ops.push((Operation::Delete, key.into(), None, None));
         self
     }
 
@@ -583,14 +598,18 @@ impl Storage {
 
     /// Look up the current value for `key`, or `None` if the key does not
     /// exist or has been deleted.
-    pub fn get(&self, key: &Key) -> crate::Result<Option<Value>> {
-        self.get_at_seq(key, self.seq_counter)
+    pub fn get(&self, key: impl AsRef<[u8]>) -> crate::Result<Option<Value>> {
+        self.get_at_seq(key.as_ref(), self.seq_counter)
     }
 
     /// Look up `key` as seen by `snapshot`, ignoring any writes that
     /// committed after the snapshot was taken.
-    pub fn get_at(&self, snapshot: &Snapshot, key: &Key) -> crate::Result<Option<Value>> {
-        self.get_at_seq(key, snapshot.sequence())
+    pub fn get_at(
+        &self,
+        snapshot: &Snapshot,
+        key: impl AsRef<[u8]>,
+    ) -> crate::Result<Option<Value>> {
+        self.get_at_seq(key.as_ref(), snapshot.sequence())
     }
 
     /// Read the newest version of `key` with sequence `<= snapshot_seq`.
@@ -599,7 +618,7 @@ impl Storage {
     /// a higher sequence number always lives in a newer (shallower) table, so
     /// scanning newest-to-oldest and returning at the first visible version
     /// yields the newest version the snapshot can see.
-    fn get_at_seq(&self, key: &Key, snapshot_seq: Seq) -> crate::Result<Option<Value>> {
+    fn get_at_seq(&self, key: &[u8], snapshot_seq: Seq) -> crate::Result<Option<Value>> {
         Metrics::incr(&self.metrics.gets);
         if self.config.verbose {
             println!("GET {:?} @ {}", String::from_utf8_lossy(key), snapshot_seq);
@@ -744,8 +763,8 @@ impl Storage {
 
     /// Insert or update `key` with `value`. The write is durable (recorded
     /// in the write-ahead log) once this returns.
-    pub fn put(&mut self, key: Key, value: Value) -> crate::Result<()> {
-        self.put_inner(key, value, None)
+    pub fn put(&mut self, key: impl Into<Key>, value: impl Into<Value>) -> crate::Result<()> {
+        self.put_inner(key.into(), value.into(), None)
     }
 
     /// Insert or update `key` with `value`, hiding it once `ttl` has elapsed.
@@ -753,7 +772,12 @@ impl Storage {
     /// The TTL is resolved to an absolute deadline immediately and stored that
     /// way, so it survives restarts without being refreshed and does not
     /// restart if the store is reopened.
-    pub fn put_with_ttl(&mut self, key: Key, value: Value, ttl: Duration) -> crate::Result<()> {
+    pub fn put_with_ttl(
+        &mut self,
+        key: impl Into<Key>,
+        value: impl Into<Value>,
+        ttl: Duration,
+    ) -> crate::Result<()> {
         self.put_with_expiry(key, value, crate::version::ttl_to_expiry(ttl))
     }
 
@@ -765,11 +789,11 @@ impl Storage {
     /// older version of itself.
     pub fn put_with_expiry(
         &mut self,
-        key: Key,
-        value: Value,
+        key: impl Into<Key>,
+        value: impl Into<Value>,
         expires_at: Expiry,
     ) -> crate::Result<()> {
-        self.put_inner(key, value, Some(expires_at))
+        self.put_inner(key.into(), value.into(), Some(expires_at))
     }
 
     /// When `key`'s visible version expires.
@@ -778,11 +802,15 @@ impl Storage {
     /// - `None` — no visible version of the key (absent, deleted or expired)
     /// - `Some(None)` — the key is present and has no deadline
     /// - `Some(Some(deadline))` — the key expires at that Unix millisecond
-    pub fn expiry(&self, key: &Key) -> crate::Result<Option<Option<Expiry>>> {
-        self.expiry_at_seq(key, self.seq_counter)
+    pub fn expiry(&self, key: impl AsRef<[u8]>) -> crate::Result<Option<Option<Expiry>>> {
+        self.expiry_at_seq(key.as_ref(), self.seq_counter)
     }
 
-    fn expiry_at_seq(&self, key: &Key, snapshot_seq: Seq) -> crate::Result<Option<Option<Expiry>>> {
+    fn expiry_at_seq(
+        &self,
+        key: &[u8],
+        snapshot_seq: Seq,
+    ) -> crate::Result<Option<Option<Expiry>>> {
         let now = crate::version::now_ms();
         if let Some(version) = self.memtable.get_at(key, snapshot_seq) {
             return Ok(version
@@ -859,7 +887,8 @@ impl Storage {
 
     /// Delete `key`. The deletion is durable once this returns and shadows
     /// any older value still stored in SSTables.
-    pub fn delete(&mut self, key: &Key) -> crate::Result<()> {
+    pub fn delete(&mut self, key: impl AsRef<[u8]>) -> crate::Result<()> {
+        let key = key.as_ref();
         if self.config.verbose {
             println!("DELETE {:?}", String::from_utf8_lossy(key));
         }
@@ -872,9 +901,9 @@ impl Storage {
         // and is flushed to disk alongside regular entries.
         self.seq_counter += 1;
         let seq = self.seq_counter;
-        self.memtable.delete(key.clone(), seq);
+        self.memtable.delete(key.to_vec(), seq);
         Metrics::incr(&self.metrics.deletes);
-        self.note_commit(seq, HashSet::from([key.clone()]));
+        self.note_commit(seq, HashSet::from([key.to_vec()]));
 
         self.maybe_flush_memtable()
     }
@@ -1792,10 +1821,7 @@ mod tests {
         // A single 2KB write exceeds the threshold and must trigger a flush
         storage.put(b"key".to_vec(), vec![b'x'; 2048]).unwrap();
         assert_eq!(count_sst_files(temp_dir.path()), 1);
-        assert_eq!(
-            storage.get(&b"key".to_vec()).unwrap(),
-            Some(vec![b'x'; 2048])
-        );
+        assert_eq!(storage.get(b"key").unwrap(), Some(vec![b'x'; 2048]));
     }
 
     #[test]
@@ -1813,23 +1839,23 @@ mod tests {
             let value = format!("value{}", i).repeat(20).into_bytes();
             storage.put(key, value).unwrap();
         }
-        storage.delete(&b"key0100".to_vec()).unwrap();
+        storage.delete(b"key0100").unwrap();
 
         // Everything readable through compressed SSTables
         assert_eq!(
-            storage.get(&b"key0000".to_vec()).unwrap(),
+            storage.get(b"key0000").unwrap(),
             Some(b"value0".repeat(20).to_vec())
         );
-        assert_eq!(storage.get(&b"key0100".to_vec()).unwrap(), None);
+        assert_eq!(storage.get(b"key0100").unwrap(), None);
 
         // And after a restart (compression flag read back from headers)
         drop(storage);
         let recovered = Storage::with_config(temp_dir.path(), config).unwrap();
         assert_eq!(
-            recovered.get(&b"key0499".to_vec()).unwrap(),
+            recovered.get(b"key0499").unwrap(),
             Some(format!("value{}", 499).repeat(20).into_bytes())
         );
-        assert_eq!(recovered.get(&b"key0100".to_vec()).unwrap(), None);
+        assert_eq!(recovered.get(b"key0100").unwrap(), None);
     }
 
     #[test]
@@ -1853,7 +1879,7 @@ mod tests {
 
         // ...then get overwritten/deleted in the memtable
         storage.put(b"user:1".to_vec(), b"new1".to_vec()).unwrap();
-        storage.delete(&b"user:2".to_vec()).unwrap();
+        storage.delete(b"user:2").unwrap();
         storage.put(b"user:4".to_vec(), b"v4".to_vec()).unwrap();
 
         let result = storage.scan_prefix(b"user:").unwrap();
@@ -1882,7 +1908,7 @@ mod tests {
                 .put(format!("k{:03}", i).into_bytes(), vec![b'v'; 64])
                 .unwrap();
         }
-        storage.delete(&b"k025".to_vec()).unwrap();
+        storage.delete(b"k025").unwrap();
         // Several flushes to spread data over levels and trigger compaction
         for round in 0..5 {
             force_flush(&mut storage, &format!("scanr{}", round));
@@ -1911,16 +1937,13 @@ mod tests {
                 .put(format!("key{}", i).into_bytes(), b"value".to_vec())
                 .unwrap();
         }
-        storage.delete(&b"key5".to_vec()).unwrap();
+        storage.delete(b"key5").unwrap();
 
         // Clean shutdown syncs the batched tail; everything replays
         drop(storage);
         let recovered = Storage::with_config(temp_dir.path(), config).unwrap();
-        assert_eq!(
-            recovered.get(&b"key39".to_vec()).unwrap(),
-            Some(b"value".to_vec())
-        );
-        assert_eq!(recovered.get(&b"key5".to_vec()).unwrap(), None);
+        assert_eq!(recovered.get(b"key39").unwrap(), Some(b"value".to_vec()));
+        assert_eq!(recovered.get(b"key5").unwrap(), None);
     }
 
     #[test]
@@ -2043,11 +2066,8 @@ mod tests {
         let recovered = Storage::new(temp_dir.path(), false).unwrap();
         assert!(!temp_dir.path().join("L0_9998.sst").exists());
         assert!(!temp_dir.path().join("L9_9999.sst").exists());
-        assert_eq!(recovered.get(&b"ghost".to_vec()).unwrap(), None);
-        assert_eq!(
-            recovered.get(&b"real".to_vec()).unwrap(),
-            Some(b"data".to_vec())
-        );
+        assert_eq!(recovered.get(b"ghost").unwrap(), None);
+        assert_eq!(recovered.get(b"real").unwrap(), Some(b"data".to_vec()));
     }
 
     #[test]
@@ -2061,10 +2081,7 @@ mod tests {
         fs::remove_file(temp_dir.path().join("MANIFEST")).unwrap();
 
         let recovered = Storage::new(temp_dir.path(), false).unwrap();
-        assert_eq!(
-            recovered.get(&b"key".to_vec()).unwrap(),
-            Some(b"value".to_vec())
-        );
+        assert_eq!(recovered.get(b"key").unwrap(), Some(b"value".to_vec()));
         // The fallback scan writes a fresh manifest
         assert!(temp_dir.path().join("MANIFEST").exists());
     }

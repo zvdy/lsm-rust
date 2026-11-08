@@ -103,6 +103,13 @@ crates.io yet.
 
 ### Changed
 
+- **Keys and values can be passed as `&str`, `&[u8]`, arrays or `Vec<u8>`.**
+  Reads and deletes (`get`, `get_at`, `delete`, `expiry`) take
+  `impl AsRef<[u8]>` and writes (`put`, `put_with_ttl`, `put_with_expiry`, and
+  the matching `WriteBatch` and `Transaction` methods) take `impl Into<Vec<u8>>`,
+  so `db.put("name", "Jane")` and `db.get("name")` work without `.to_vec()`.
+  Existing calls such as `db.get(&key)` with a `Vec<u8>` still compile.
+
 - **Breaking:** the public API returns `lsm_rust::Result<T>` instead of
   `std::io::Result<T>`, and `TransactionError` is gone; its `Conflict` variant
   is now `Error::Conflict` and its `Io` variant is now `Error::Io`.

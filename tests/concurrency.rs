@@ -57,7 +57,7 @@ fn concurrent_increments_never_lose_an_update() {
 
     let total: u64 = (0..COUNTERS)
         .map(|c| {
-            let v = db.get(&format!("ctr{c}").into_bytes()).unwrap().unwrap();
+            let v = db.get(format!("ctr{c}").into_bytes()).unwrap().unwrap();
             String::from_utf8_lossy(&v).parse::<u64>().unwrap()
         })
         .sum();
@@ -136,7 +136,7 @@ fn concurrent_readers_writers_and_checkpoints() {
     for t in 0..4 {
         for i in 0..300 {
             assert_eq!(
-                db.get(&format!("k{t}_{i:04}").into_bytes()).unwrap(),
+                db.get(format!("k{t}_{i:04}").into_bytes()).unwrap(),
                 Some(vec![b'v'; 48]),
                 "lost k{t}_{i:04}"
             );

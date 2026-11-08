@@ -37,7 +37,7 @@ fn multi_level_store(dir: &TempDir) -> (Storage, Entries) {
     }
     // Delete some keys.
     for i in (0..600).step_by(11) {
-        db.delete(&format!("key{i:04}").into_bytes()).unwrap();
+        db.delete(format!("key{i:04}").into_bytes()).unwrap();
     }
     let expected: Entries = expected
         .into_iter()
@@ -147,7 +147,7 @@ fn scan_iter_at_snapshot_ignores_later_writes() {
 
     let snap = db.snapshot();
     db.put(b"a".to_vec(), b"2".to_vec()).unwrap();
-    db.delete(&b"b".to_vec()).unwrap();
+    db.delete(b"b").unwrap();
     db.put(b"c".to_vec(), b"1".to_vec()).unwrap();
 
     let seen: Vec<_> = db

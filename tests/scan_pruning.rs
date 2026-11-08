@@ -202,7 +202,7 @@ fn expired_and_deleted_keys_are_unaffected_by_pruning() {
     let mut db = seeded(&dir, 1200);
 
     for i in (0..1200).step_by(4) {
-        db.delete(&key(i)).unwrap();
+        db.delete(key(i)).unwrap();
     }
 
     // The deletes live in newer tables than the values they shadow, so a
