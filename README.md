@@ -147,6 +147,10 @@ A `SharedStorage` handle (via `Storage::into_shared()` or `SharedStorage::new`)
 is `Clone + Send + Sync` for concurrent use, and exposes the same API plus
 `spawn_compactor()` for background compaction.
 
+Runnable versions of these snippets live in [`examples/`](examples), each
+with `cargo run --example <name>`: `basic`, `transactions`, `checkpoint`,
+`ttl` and `resp_server`.
+
 ### Transactions
 
 Transactions are optimistic: they never block each other while running, and

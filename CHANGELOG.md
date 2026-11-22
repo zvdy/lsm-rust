@@ -12,6 +12,10 @@ crates.io yet.
 
 ### Added
 
+- **Runnable examples.** `examples/` has `basic`, `transactions`, `checkpoint`,
+  `ttl` and `resp_server`, run with `cargo run --example <name>`. They are built
+  by `cargo test` and linted by CI.
+
 - **Scans skip tables they cannot match.** A scan opened a cursor over every
   SSTable in the store; it now compares each table's first and last key against
   the requested range and skips those that cannot intersect it, saving a cursor,
