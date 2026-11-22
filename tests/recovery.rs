@@ -131,10 +131,10 @@ fn writes_after_recovering_a_torn_wal_tail_survive_the_next_restart() {
 
     let recovered = Storage::new(temp_dir.path(), false).unwrap();
     for i in 0..9 {
-        assert_eq!(recovered.get(&key(i)).unwrap(), Some(value(i)), "key {}", i);
+        assert_eq!(recovered.get(key(i)).unwrap(), Some(value(i)), "key {}", i);
     }
-    assert_eq!(recovered.get(&key(9)).unwrap(), None);
-    assert_eq!(recovered.get(&key(100)).unwrap(), Some(value(100)));
+    assert_eq!(recovered.get(key(9)).unwrap(), None);
+    assert_eq!(recovered.get(key(100)).unwrap(), Some(value(100)));
 }
 
 #[test]
@@ -155,15 +155,15 @@ fn writes_after_recovering_a_torn_batch_survive_the_next_restart() {
     drop(file);
 
     let mut storage = Storage::new(temp_dir.path(), false).unwrap();
-    assert_eq!(storage.get(&key(2)).unwrap(), None);
-    assert_eq!(storage.get(&key(3)).unwrap(), None);
+    assert_eq!(storage.get(key(2)).unwrap(), None);
+    assert_eq!(storage.get(key(3)).unwrap(), None);
     storage.put(key(4), value(4)).unwrap();
     drop(storage);
 
     let recovered = Storage::new(temp_dir.path(), false).unwrap();
-    assert_eq!(recovered.get(&key(1)).unwrap(), Some(value(1)));
-    assert_eq!(recovered.get(&key(2)).unwrap(), None);
-    assert_eq!(recovered.get(&key(4)).unwrap(), Some(value(4)));
+    assert_eq!(recovered.get(key(1)).unwrap(), Some(value(1)));
+    assert_eq!(recovered.get(key(2)).unwrap(), None);
+    assert_eq!(recovered.get(key(4)).unwrap(), Some(value(4)));
 }
 
 #[test]
