@@ -19,11 +19,11 @@ fn second_open_of_a_live_directory_is_refused() {
 fn directory_can_be_reopened_after_the_store_is_dropped() {
     let dir = TempDir::new().unwrap();
     let mut first = Storage::new(dir.path(), false).unwrap();
-    first.put(b"k".to_vec(), b"v".to_vec()).unwrap();
+    first.put(b"k", b"v").unwrap();
     drop(first);
 
     let second = Storage::new(dir.path(), false).unwrap();
-    assert_eq!(second.get(&b"k".to_vec()).unwrap(), Some(b"v".to_vec()));
+    assert_eq!(second.get(b"k").unwrap(), Some(b"v".to_vec()));
 }
 
 #[test]
@@ -45,9 +45,9 @@ fn a_checkpoint_does_not_carry_the_lock_with_it() {
     let target = backup.path().join("snap");
 
     let mut db = Storage::new(dir.path(), false).unwrap();
-    db.put(b"k".to_vec(), b"v".to_vec()).unwrap();
+    db.put(b"k", b"v").unwrap();
     db.checkpoint(&target).unwrap();
 
     let restored = Storage::new(&target, false).unwrap();
-    assert_eq!(restored.get(&b"k".to_vec()).unwrap(), Some(b"v".to_vec()));
+    assert_eq!(restored.get(b"k").unwrap(), Some(b"v".to_vec()));
 }

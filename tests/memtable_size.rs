@@ -43,7 +43,7 @@ fn batches_that_rewrite_one_key_still_flush() {
         "memtable grew past its threshold unnoticed: {stats:?}"
     );
     // The last write still wins.
-    assert_eq!(db.get(&b"k".to_vec()).unwrap(), Some(vec![b'b'; 4096]));
+    assert_eq!(db.get(b"k").unwrap(), Some(vec![b'b'; 4096]));
 }
 
 #[test]

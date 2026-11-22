@@ -42,7 +42,7 @@ fn restart_preserves_multi_level_data() {
 
     let recovered = Storage::with_config(temp_dir.path(), small_config()).unwrap();
     for i in 0..1000 {
-        assert_eq!(recovered.get(&key(i)).unwrap(), Some(value(i)), "key {}", i);
+        assert_eq!(recovered.get(key(i)).unwrap(), Some(value(i)), "key {}", i);
     }
 }
 
@@ -79,7 +79,7 @@ fn sequence_numbers_continue_after_restart() {
 
     let recovered = Storage::with_config(temp_dir.path(), small_config()).unwrap();
     for i in 0..400 {
-        assert_eq!(recovered.get(&key(i)).unwrap(), Some(value(i)), "key {}", i);
+        assert_eq!(recovered.get(key(i)).unwrap(), Some(value(i)), "key {}", i);
     }
 }
 
@@ -104,9 +104,9 @@ fn truncated_wal_tail_recovers_complete_prefix() {
     // Recovery keeps every complete entry and drops only the torn tail
     let recovered = Storage::new(temp_dir.path(), false).unwrap();
     for i in 0..9 {
-        assert_eq!(recovered.get(&key(i)).unwrap(), Some(value(i)), "key {}", i);
+        assert_eq!(recovered.get(key(i)).unwrap(), Some(value(i)), "key {}", i);
     }
-    assert_eq!(recovered.get(&key(9)).unwrap(), None);
+    assert_eq!(recovered.get(key(9)).unwrap(), None);
 }
 
 #[test]
@@ -131,10 +131,10 @@ fn writes_after_recovering_a_torn_wal_tail_survive_the_next_restart() {
 
     let recovered = Storage::new(temp_dir.path(), false).unwrap();
     for i in 0..9 {
-        assert_eq!(recovered.get(&key(i)).unwrap(), Some(value(i)), "key {}", i);
+        assert_eq!(recovered.get(key(i)).unwrap(), Some(value(i)), "key {}", i);
     }
-    assert_eq!(recovered.get(&key(9)).unwrap(), None);
-    assert_eq!(recovered.get(&key(100)).unwrap(), Some(value(100)));
+    assert_eq!(recovered.get(key(9)).unwrap(), None);
+    assert_eq!(recovered.get(key(100)).unwrap(), Some(value(100)));
 }
 
 #[test]
@@ -155,15 +155,15 @@ fn writes_after_recovering_a_torn_batch_survive_the_next_restart() {
     drop(file);
 
     let mut storage = Storage::new(temp_dir.path(), false).unwrap();
-    assert_eq!(storage.get(&key(2)).unwrap(), None);
-    assert_eq!(storage.get(&key(3)).unwrap(), None);
+    assert_eq!(storage.get(key(2)).unwrap(), None);
+    assert_eq!(storage.get(key(3)).unwrap(), None);
     storage.put(key(4), value(4)).unwrap();
     drop(storage);
 
     let recovered = Storage::new(temp_dir.path(), false).unwrap();
-    assert_eq!(recovered.get(&key(1)).unwrap(), Some(value(1)));
-    assert_eq!(recovered.get(&key(2)).unwrap(), None);
-    assert_eq!(recovered.get(&key(4)).unwrap(), Some(value(4)));
+    assert_eq!(recovered.get(key(1)).unwrap(), Some(value(1)));
+    assert_eq!(recovered.get(key(2)).unwrap(), None);
+    assert_eq!(recovered.get(key(4)).unwrap(), Some(value(4)));
 }
 
 #[test]
@@ -174,20 +174,20 @@ fn deletes_survive_restart_at_every_stage() {
 
     // Stage 1: delete while the value is only in the memtable/WAL
     storage.put(key(1), value(1)).unwrap();
-    storage.delete(&key(1)).unwrap();
+    storage.delete(key(1)).unwrap();
 
     // Stage 2: delete after the value was flushed into an SSTable
     storage.put(key(2), value(2)).unwrap();
     for i in 100..300 {
         storage.put(key(i), value(i)).unwrap(); // force flushes
     }
-    storage.delete(&key(2)).unwrap();
+    storage.delete(key(2)).unwrap();
 
     drop(storage);
     let recovered = Storage::with_config(temp_dir.path(), small_config()).unwrap();
-    assert_eq!(recovered.get(&key(1)).unwrap(), None);
-    assert_eq!(recovered.get(&key(2)).unwrap(), None);
-    assert_eq!(recovered.get(&key(100)).unwrap(), Some(value(100)));
+    assert_eq!(recovered.get(key(1)).unwrap(), None);
+    assert_eq!(recovered.get(key(2)).unwrap(), None);
+    assert_eq!(recovered.get(key(100)).unwrap(), Some(value(100)));
 }
 
 #[test]
@@ -202,13 +202,13 @@ fn recovery_with_compressed_sstables() {
     for i in 0..500 {
         storage.put(key(i), value(i)).unwrap();
     }
-    storage.delete(&key(250)).unwrap();
+    storage.delete(key(250)).unwrap();
     drop(storage);
 
     let recovered = Storage::with_config(temp_dir.path(), config).unwrap();
-    assert_eq!(recovered.get(&key(0)).unwrap(), Some(value(0)));
-    assert_eq!(recovered.get(&key(499)).unwrap(), Some(value(499)));
-    assert_eq!(recovered.get(&key(250)).unwrap(), None);
+    assert_eq!(recovered.get(key(0)).unwrap(), Some(value(0)));
+    assert_eq!(recovered.get(key(499)).unwrap(), Some(value(499)));
+    assert_eq!(recovered.get(key(250)).unwrap(), None);
 }
 
 /// Tiny deterministic PRNG (xorshift) so the model-based test is

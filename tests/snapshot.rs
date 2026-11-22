@@ -42,24 +42,18 @@ fn snapshot_hides_later_writes_and_deletes() {
 
     // Mutate everything after the snapshot
     storage.put(b"a".to_vec(), b"a2".to_vec()).unwrap();
-    storage.delete(&b"b".to_vec()).unwrap();
+    storage.delete(b"b").unwrap();
     storage.put(b"c".to_vec(), b"c1".to_vec()).unwrap();
 
     // The snapshot still sees the original committed state
-    assert_eq!(
-        storage.get_at(&snap, &b"a".to_vec()).unwrap(),
-        Some(b"a1".to_vec())
-    );
-    assert_eq!(
-        storage.get_at(&snap, &b"b".to_vec()).unwrap(),
-        Some(b"b1".to_vec())
-    );
-    assert_eq!(storage.get_at(&snap, &b"c".to_vec()).unwrap(), None);
+    assert_eq!(storage.get_at(&snap, b"a").unwrap(), Some(b"a1".to_vec()));
+    assert_eq!(storage.get_at(&snap, b"b").unwrap(), Some(b"b1".to_vec()));
+    assert_eq!(storage.get_at(&snap, b"c").unwrap(), None);
 
     // Latest reads see the new state
-    assert_eq!(storage.get(&b"a".to_vec()).unwrap(), Some(b"a2".to_vec()));
-    assert_eq!(storage.get(&b"b".to_vec()).unwrap(), None);
-    assert_eq!(storage.get(&b"c".to_vec()).unwrap(), Some(b"c1".to_vec()));
+    assert_eq!(storage.get(b"a").unwrap(), Some(b"a2".to_vec()));
+    assert_eq!(storage.get(b"b").unwrap(), None);
+    assert_eq!(storage.get(b"c").unwrap(), Some(b"c1".to_vec()));
 }
 
 #[test]
@@ -70,8 +64,8 @@ fn snapshot_taken_before_a_key_exists_never_sees_it() {
     let snap = storage.snapshot(); // empty store
     storage.put(b"k".to_vec(), b"v".to_vec()).unwrap();
 
-    assert_eq!(storage.get_at(&snap, &b"k".to_vec()).unwrap(), None);
-    assert_eq!(storage.get(&b"k".to_vec()).unwrap(), Some(b"v".to_vec()));
+    assert_eq!(storage.get_at(&snap, b"k").unwrap(), None);
+    assert_eq!(storage.get(b"k").unwrap(), Some(b"v".to_vec()));
 }
 
 #[test]
@@ -93,11 +87,11 @@ fn snapshot_reads_old_value_across_flush_and_compaction() {
     }
 
     assert_eq!(
-        storage.get_at(&snap, &b"key".to_vec()).unwrap(),
+        storage.get_at(&snap, b"key").unwrap(),
         Some(b"original".to_vec()),
         "snapshot must still read the version pinned at creation"
     );
-    assert_eq!(storage.get(&b"key".to_vec()).unwrap(), Some(b"v7".to_vec()));
+    assert_eq!(storage.get(b"key").unwrap(), Some(b"v7".to_vec()));
 }
 
 #[test]
@@ -108,17 +102,17 @@ fn snapshot_sees_deleted_key_that_was_alive_at_capture() {
     storage.put(b"doomed".to_vec(), b"alive".to_vec()).unwrap();
     let snap = storage.snapshot();
 
-    storage.delete(&b"doomed".to_vec()).unwrap();
+    storage.delete(b"doomed").unwrap();
     for round in 0..6 {
         force_flush(&mut storage, &format!("d{}", round));
     }
 
     // The delete (and its GC) must not reach back into the snapshot
     assert_eq!(
-        storage.get_at(&snap, &b"doomed".to_vec()).unwrap(),
+        storage.get_at(&snap, b"doomed").unwrap(),
         Some(b"alive".to_vec())
     );
-    assert_eq!(storage.get(&b"doomed".to_vec()).unwrap(), None);
+    assert_eq!(storage.get(b"doomed").unwrap(), None);
 }
 
 #[test]
@@ -136,7 +130,7 @@ fn scan_at_snapshot_is_consistent() {
     // Change the keyspace after the snapshot, with flushes/compaction
     for i in 0..20 {
         if i % 2 == 0 {
-            storage.delete(&format!("k{:02}", i).into_bytes()).unwrap();
+            storage.delete(format!("k{:02}", i).into_bytes()).unwrap();
         } else {
             storage
                 .put(format!("k{:02}", i).into_bytes(), b"changed".to_vec())
@@ -175,15 +169,9 @@ fn multiple_snapshots_are_independent() {
     let s2 = storage.snapshot();
     storage.put(b"k".to_vec(), b"v3".to_vec()).unwrap();
 
-    assert_eq!(
-        storage.get_at(&s1, &b"k".to_vec()).unwrap(),
-        Some(b"v1".to_vec())
-    );
-    assert_eq!(
-        storage.get_at(&s2, &b"k".to_vec()).unwrap(),
-        Some(b"v2".to_vec())
-    );
-    assert_eq!(storage.get(&b"k".to_vec()).unwrap(), Some(b"v3".to_vec()));
+    assert_eq!(storage.get_at(&s1, b"k").unwrap(), Some(b"v1".to_vec()));
+    assert_eq!(storage.get_at(&s2, b"k").unwrap(), Some(b"v2".to_vec()));
+    assert_eq!(storage.get(b"k").unwrap(), Some(b"v3".to_vec()));
 }
 
 #[test]
@@ -217,8 +205,7 @@ fn shared_storage_snapshot_is_stable_under_concurrent_writes() {
     for _ in 0..200 {
         for i in [0usize, 17, 49] {
             assert_eq!(
-                db.get_at(&snap, &format!("k{:03}", i).into_bytes())
-                    .unwrap(),
+                db.get_at(&snap, format!("k{:03}", i).into_bytes()).unwrap(),
                 Some(b"orig".to_vec())
             );
         }
@@ -229,13 +216,6 @@ fn shared_storage_snapshot_is_stable_under_concurrent_writes() {
     }
 
     // Snapshot unchanged; latest reflects the writers
-    assert_eq!(
-        db.get_at(&snap, &b"k000".to_vec()).unwrap(),
-        Some(b"orig".to_vec())
-    );
-    assert!(db
-        .get(&b"k000".to_vec())
-        .unwrap()
-        .unwrap()
-        .starts_with(b"w"));
+    assert_eq!(db.get_at(&snap, b"k000").unwrap(), Some(b"orig".to_vec()));
+    assert!(db.get(b"k000").unwrap().unwrap().starts_with(b"w"));
 }

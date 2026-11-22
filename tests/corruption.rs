@@ -214,12 +214,12 @@ fn wal_torn_final_record_is_dropped_not_rejected() {
     let db = Storage::new(temp.path(), false).expect("torn tail should not block recovery");
     for i in 0..4 {
         assert_eq!(
-            db.get(&format!("k{i}").into_bytes()).unwrap(),
+            db.get(format!("k{i}").into_bytes()).unwrap(),
             Some(b"value".to_vec()),
             "earlier writes must survive"
         );
     }
-    assert_eq!(db.get(&b"k4".to_vec()).unwrap(), None, "torn write is lost");
+    assert_eq!(db.get(b"k4").unwrap(), None, "torn write is lost");
 }
 
 #[test]

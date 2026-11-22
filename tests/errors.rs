@@ -127,7 +127,7 @@ fn errors_convert_into_io_error_for_callers_that_have_not_migrated() {
     fn legacy_caller(dir: &Path) -> io::Result<Option<Vec<u8>>> {
         let mut db = Storage::new(dir, false)?;
         db.put(b"k".to_vec(), b"v".to_vec())?;
-        Ok(db.get(&b"k".to_vec())?)
+        Ok(db.get(b"k")?)
     }
 
     let temp = TempDir::new().unwrap();
@@ -148,7 +148,7 @@ fn the_retry_helper_reports_the_conflict_it_gave_up_on() {
     // so the helper exhausts its retries and surfaces the conflict.
     let err = db
         .transaction(2, |tx| {
-            let _ = tx.get(&b"k".to_vec())?;
+            let _ = tx.get(b"k")?;
             db.put(b"k".to_vec(), b"interfering".to_vec())?;
             tx.put(b"k".to_vec(), b"never".to_vec());
             Ok(())
@@ -184,7 +184,7 @@ fn isolation_levels_still_classify_their_aborts_as_conflicts() {
     db.put(b"a".to_vec(), b"1".to_vec()).unwrap();
 
     let mut tx = db.begin_with(Isolation::Serializable).unwrap();
-    tx.get(&b"a".to_vec()).unwrap();
+    tx.get(b"a").unwrap();
     tx.put(b"b".to_vec(), b"2".to_vec());
 
     // Someone else writes the key we read: a read-write conflict.
