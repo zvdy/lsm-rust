@@ -168,11 +168,21 @@ fn concurrent_clients_and_persistence() {
         client.send(&[b"KEYS", b"c2:*"]);
         assert_eq!(client.read_reply().len(), 50);
 
+        drop(client);
         drop(server); // clean shutdown
     }
 
+    // Connection threads outlive the server handle until their client hangs
+    // up, and each holds the store (and its directory lock) until then.
+    let storage = (0..100)
+        .find_map(|_| {
+            SharedStorage::new(temp_dir.path(), false).ok().or_else(|| {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                None
+            })
+        })
+        .expect("store was never released");
     // Data written over the wire survives a restart of the store
-    let storage = SharedStorage::new(temp_dir.path(), false).unwrap();
     assert_eq!(
         storage.get(&b"c0:key0".to_vec()).unwrap(),
         Some(b"v".to_vec())

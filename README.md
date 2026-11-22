@@ -351,6 +351,11 @@ depend on it.
   crash can lose up to `every_n_writes - 1` acknowledged writes. That is the
   point of the setting, but it is a real loss of the guarantee the default
   gives you.
+- **One process per data directory.** Opening a directory that is already open
+  fails with `ResourceBusy`. The lock is advisory, so it protects against
+  another `lsm-rust`, not against something else writing into the directory.
+  On Windows the lock is enforced by the OS, so `LOCK` cannot be read while the
+  store is open: tools that copy the directory should skip it.
 - **Single node.** No replication, no failover, no clustering. `checkpoint()`
   is the backup primitive; getting a copy off the machine is your job.
 - **The on-disk format is still moving.** It has reached v5 and older versions
